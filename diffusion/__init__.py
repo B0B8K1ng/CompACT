@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 def create_gaussian_diffusion(
     timestep_respacing,
     for_eval=False,
+    eval_timestep_respacing=250,
     noise_schedule="linear",
     use_kl=False,
     sigma_small=False,
@@ -30,8 +31,10 @@ def create_gaussian_diffusion(
     diffusion_steps=1000,
 ):
     if for_eval:
-        timestep_respacing = "250"
-        logger.info("Using 250 diffusion steps for evaluation")
+        timestep_respacing = str(eval_timestep_respacing)
+        logger.info(
+            "Using %s diffusion steps for evaluation", eval_timestep_respacing
+        )
     betas = gd.get_named_beta_schedule(noise_schedule, diffusion_steps)
     if use_kl:
         loss_type = gd.LossType.RESCALED_KL

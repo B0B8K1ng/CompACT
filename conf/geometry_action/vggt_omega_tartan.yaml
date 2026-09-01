@@ -1,0 +1,182 @@
+# Reproducible offline VGGT-Omega pose/action extraction for processed TartanDrive.
+# Run commands from the CompACT repository root so the relative split path is stable.
+geometry_action:
+  schema_version: 1
+  run_name: vggt_omega_1b_512_tartandrive_r384_full_trajectory
+  seed: 0
+
+  project:
+    root: ${oc.env:COMPACT_ROOT,/file_system/vepfs/algorithm/dujun.nie/code/CompACT}
+
+  model:
+    name: VGGT-Omega-1B-512
+    third_party_root: ${geometry_action.project.root}/third_party/vggt_omega
+    repository: https://github.com/facebookresearch/vggt-omega.git
+    commit: 282ec70363edeff59424bf43731658092fba3d37
+    checkpoint_dir: /file_system/nas/algorithm/dujun.nie/models/VGGT-Omega-1B-512
+    checkpoint: ${geometry_action.model.checkpoint_dir}/vggt_omega_1b_512.pt
+    checkpoint_manifest: ${geometry_action.model.checkpoint_dir}/checkpoint_manifest.json
+    hf_repo_id: facebook/VGGT-Omega
+    hf_revision: ba9db085d6b7349b738fa2e37d198bb4dd077954
+    hf_endpoint: https://huggingface.co
+    expected_checkpoint_sha256: c02da418b18bb01d0392598d3f6147366bcde1bb70fd08a5e3bf7925b0667934
+
+  data:
+    dataset_name: tartan_drive
+    root: /file_system/nas/algorithm/dujun.nie/nwm/data/tartan
+    split_root: ${geometry_action.project.root}/data_splits/tartan_drive
+    splits: [train, test]
+    split_filename: traj_names.txt
+    image_pattern: "{trajectory}/{frame}.jpg"
+    trajectory_metadata: "{trajectory}/traj_data.pkl"
+
+  output:
+    # Training-ready geometry files live under geometry_motion/tartan_drive/*.pt.
+    root: /file_system/nas/algorithm/dujun.nie/nwm/geometry_actions/vggt_omega_tartan
+    raw_pose_root: ${geometry_action.output.root}/raw_pose
+    geometry_root: ${geometry_action.output.root}/geometry_motion
+    validation_root: ${geometry_action.output.root}/validation
+    log_root: ${geometry_action.output.root}/logs
+    atomic_write: true
+    resume: true
+
+  cache:
+    # Build once with extractor's manifest subcommand; extraction must not rescan NAS.
+    manifest_path: ${geometry_action.output.root}/manifests/tartan_frames.json
+    manifest_workers: 32
+    reuse_manifest: true
+    verify_frame_fingerprints: true
+
+  inference:
+    # Selected by the recorded 16-trajectory/2,569-frame stratified pilot.
+    resolution: 384
+    resize_mode: max_size
+    max_size: 384
+    dtype: bfloat16
+    device: cuda
+    inference_mode: true
+    inference_path: fast
+    camera_pose_only: true
+    retain_dense_head: false
+    allow_tf32: true
+    deterministic_algorithms: false
+    cudnn_benchmark: true
+    # The official cache must keep every trajectory in one joint Omega gauge.
+    # The tested 256/64 window mode failed strict overlap validation and is
+    # prohibited for formal extraction rather than an OOM fallback.
+    window_size: 0
+    # Kept at 64 to match the launched CLI and artifact descriptor exactly.
+    # With window_size=0 the extractor runs the full trajectory, so overlap is
+    # a recorded compatibility value and does not participate in windowing.
+    overlap: 64
+    # Camera-only fast-path parity was established separately by smoke/pilot.
+    # Formal ranks used 0 so they never execute the dense heads or duplicate
+    # full-model inference while producing the official cache.
+    compare_full_fast_frames: 0
+    verify_input_hashes: true
+
+  selection_receipt:
+    cohort: stratified_16_trajectories
+    trajectories: 16
+    frames: 2569
+    resize_mode: max_size
+    selected: resolution_384_full_trajectory
+    formal_descriptor_overlap: 64
+    overlap_effective_when_window_size_zero: false
+    formal_run:
+      run_log: formal_384_whole_2gpu_20260821T164241Z
+      actual_world_size: 2
+      compare_full_fast_frames: 0
+      rank_bindings:
+        - rank: 0
+          cuda_visible_devices: "2"
+        - rank: 1
+          cuda_visible_devices: "3"
+    resolution_384_full_trajectory:
+      resolution: 384
+      window_size: 0
+      overlap: 64
+      fps: 12.4835
+      elapsed_seconds: 205.791
+      strict_pass: 16
+      strict_total: 16
+      gt_action_direction_cosine: 0.981224
+      gt_action_yaw_mae_degrees: 3.667664
+      gt_action_yaw_sign_agreement: 0.966233
+    resolution_512_full_trajectory:
+      resolution: 512
+      window_size: 0
+      fps: 5.8646
+      elapsed_seconds: 438.052
+      strict_pass: 16
+      strict_total: 16
+      gt_action_direction_cosine: 0.984768
+      gt_action_yaw_mae_degrees: 3.671569
+      gt_action_yaw_sign_agreement: 0.969788
+    rejected:
+      resolution_320_full_trajectory: insufficient_direction_quality
+      resolution_384_window_256_overlap_64: strict_overlap_validation_failed
+    prohibit_windowed_formal_cache: true
+
+  sharding:
+    # Formal artifact: two independent processes bound to physical GPU 2/3.
+    # Keep world_size fixed when resuming this run; never use DataParallel.
+    world_size: 2
+    rank: 0
+    cuda_visible_devices_by_rank: ["2", "3"]
+    assignment: deterministic_lpt_estimated_attention_cost
+    cost_power: 2.0
+
+  coordinates:
+    source_extrinsics: world_to_camera_opencv
+    pair_direction: current_to_goal
+    target_frame: current_navigation_frame
+    components: [delta_x, delta_y, delta_yaw]
+    yaw_unit: radians
+    wrap_yaw: [-3.141592653589793, 3.141592653589793]
+    drop_components: [delta_z, roll, pitch]
+
+    # Image-only TartanDrive policy: assume a forward-facing OpenCV camera,
+    # project cam_z -> nav_x and -cam_x -> nav_y, and normalize each trajectory's
+    # robust median nonzero planar step to one waypoint unit. This does not read
+    # traj_data.pkl. Per-trajectory GT alignment is prohibited because it would
+    # leak real action into the geometry proxy.
+    alignment_policy: tartandrive_forward_camera
+    camera_to_navigation: null
+    meters_per_model_unit: null
+    scale_strategy: per_trajectory_median_nonzero_planar_step_to_one_waypoint_unit
+    degenerate_scale_policy: empty_only
+    nonzero_step_epsilon: 1.0e-6
+    translation_unit: waypoint_spacing_units
+    # Dataset provenance/GT reporting only; the image-only proxy scale above does
+    # not read this value or traj_data.pkl during extraction.
+    waypoint_spacing: 0.72
+
+  pair_generation:
+    min_offset: -64
+    max_offset: 64
+    context_size: 4
+    len_traj_pred: 64
+
+  ground_truth:
+    source_key_position: position
+    source_key_yaw: yaw
+    only_for_validation: true
+    allowed_for_pose_alignment: false
+    allowed_for_scale_fitting: false
+    fail_extraction_if_accessed: true
+
+  validation:
+    strict: true
+    report: ${geometry_action.output.validation_root}/report.json
+    require_all_split_trajectories: true
+    check_finite: true
+    check_so3: true
+    check_frame_fingerprint: true
+    check_window_overlap: true
+    check_identity: true
+    check_inverse: true
+    check_composition: true
+    # GT metrics are diagnostic only unless explicit thresholds are supplied to
+    # the validator. They must never modify, align, or rescale extracted poses.
+    gt_metrics_report_only: true

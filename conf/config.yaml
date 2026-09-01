@@ -29,5 +29,11 @@ eval_every: 5000
 bfloat16: 1
 torch_compile: 0
 
+# Optional controls for short training/debug runs. Null/true preserve the
+# original full-training behavior.
+max_train_steps: null
+eval_at_first_step: true
+log_cuda_memory: false
+
 # Resume from existing experiment directory (optional)
-resume_from_dir: null 
+resume_from_dir: null

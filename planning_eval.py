@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 #
 import logging
+import json
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -29,6 +30,7 @@ from train_utils import (
     print_config,
     cleanup,
     setup_diffusion,
+    validate_model_context_sizes,
 )
 
 ### evo evaluation library ###
@@ -205,6 +207,12 @@ class WM_Planning_Evaluator:
                 f"Experiment file {self.exp_dir} does not exist, using default configuration"
             )
 
+        validate_model_context_sizes(
+            self.config,
+            "eval_context_size",
+            "trajectory_eval_context_size",
+        )
+
         # Print configuration
         if global_rank == 0:
             print_config(self.config)
@@ -247,15 +255,23 @@ class WM_Planning_Evaluator:
                 self.config, dataset_name, predefined_index=True
             )
 
-            if len(dataset_val) % num_tasks != 0:
+            if len(dataset_val) % num_tasks != 0 and not self.config.get(
+                "exact_distributed_eval", True
+            ):
                 self.logger.info(
                     "Warning: Enabling distributed evaluation with an eval dataset not divisible by process number. "
                     "This will slightly alter validation results as extra duplicate entries are added to achieve "
                     "equal num of samples per-process."
                 )
-            sampler_val = torch.utils.data.DistributedSampler(
-                dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=False
-            )
+            if self.config.get("exact_distributed_eval", True):
+                sampler_val = list(range(global_rank, len(dataset_val), num_tasks))
+            else:
+                sampler_val = torch.utils.data.DistributedSampler(
+                    dataset_val,
+                    num_replicas=num_tasks,
+                    rank=global_rank,
+                    shuffle=False,
+                )
 
             curr_data_loader = torch.utils.data.DataLoader(
                 dataset_val,
@@ -309,6 +325,18 @@ class WM_Planning_Evaluator:
         self.action_stats = {}
         for key in self.config.dataset.action_stats:
             self.action_stats[key] = torch.tensor(self.config.dataset.action_stats[key])
+
+        self.motion_condition_enabled = bool(
+            self.config.get("motion_condition", {}).get("enabled", False)
+        )
+
+    def _real_motion_for_model(self, action):
+        """Bridge legacy planner coordinates to adapter-owned normalization."""
+        if not self.motion_condition_enabled:
+            return action
+        action = action.clone()
+        action[..., :2] = unnormalize_data(action[..., :2], self.action_stats)
+        return action
 
     def compute_cost(self, pred_image, goal_image, pred_code, goal_code):
         if self.cost_fn == "lpips":
@@ -399,24 +427,37 @@ class WM_Planning_Evaluator:
                 # WM is stochastic, so we can repeat the evaluation of each trajectory and average to reduce variance
                 if self.num_repeat_eval * self.num_samples > 120:
                     cur_losses = []
+                    microbatch_size = self.config.get(
+                        "planning_microbatch_size", None
+                    ) or self.num_samples
+                    microbatch_size = min(int(microbatch_size), self.num_samples)
                     for r in range(self.num_repeat_eval):
-                        preds, pred_codes = (
-                            self.autoregressive_rollout_without_intermediate_decoding(
-                                cur_obs_image,
-                                deltas,
-                                self.config.rollout_stride,
-                                only_final=True,
-                                return_codes=True,
+                        repeat_losses = []
+                        repeat_preds = []
+                        for start in range(0, self.num_samples, microbatch_size):
+                            stop = min(start + microbatch_size, self.num_samples)
+                            preds, pred_codes = (
+                                self.autoregressive_rollout_without_intermediate_decoding(
+                                    cur_obs_image[start:stop],
+                                    deltas[start:stop],
+                                    self.config.rollout_stride,
+                                    only_final=True,
+                                    return_codes=True,
+                                )
                             )
-                        )
-                        preds = preds[:, -1]  # take the last predicted image
-                        loss = self.compute_cost(
-                            preds.to(self.device),
-                            cur_goal_image.to(self.device),
-                            pred_codes.to(self.device),
-                            cur_goal_code.to(self.device),
-                        )
-                        cur_losses.append(loss)
+                            preds = preds[:, -1]  # take the last predicted image
+                            loss = self.compute_cost(
+                                preds.to(self.device),
+                                cur_goal_image[start:stop].to(self.device),
+                                pred_codes.to(self.device),
+                                cur_goal_code[start:stop].to(self.device),
+                            )
+                            repeat_losses.append(loss)
+                            if r == self.num_repeat_eval - 1:
+                                repeat_preds.append(preds)
+                        cur_losses.append(torch.cat(repeat_losses, dim=0))
+
+                    preds = torch.cat(repeat_preds, dim=0)
 
                     loss = torch.stack(cur_losses).mean(dim=0)
                 else:
@@ -581,15 +622,17 @@ class WM_Planning_Evaluator:
 
         for i in tqdm(range(deltas.shape[1])):
             curr_delta = deltas[:, i : i + 1]
+            model_delta = self._real_motion_for_model(curr_delta)
             all_models = self.model, self.diffusion, self.vae
             x_pred_pixels = model_forward_wrapper(
                 all_models,
                 curr_obs,
-                curr_delta,
+                model_delta,
                 self.config.rollout_stride,
                 self.latent_size,
                 num_cond=self.num_cond,
                 device=self.device,
+                motion_type="real",
             )
             x_pred_pixels = x_pred_pixels.unsqueeze(1)
             curr_obs = torch.cat(
@@ -634,15 +677,17 @@ class WM_Planning_Evaluator:
 
             for i in tqdm(range(batch_deltas.shape[1])):
                 batch_delta = batch_deltas[:, i : i + 1]
+                model_delta = self._real_motion_for_model(batch_delta)
                 all_models = self.model, self.diffusion, self.vae
                 x_pred_latents = model_forward_wrapper(
                     all_models,
                     batch_obs_latents,
-                    batch_delta,
+                    model_delta,
                     self.config.rollout_stride,
                     self.latent_size,
                     num_cond=self.num_cond,
                     device=self.device,
+                    motion_type="real",
                     skip_tokenizer=True,
                 )
                 x_pred_latents = x_pred_latents.unsqueeze(1)
@@ -681,6 +726,11 @@ class WM_Planning_Evaluator:
         self.eval_name = f"CEM_N{self.config.num_samples}_K{self.config.topk}_RS{self.config.rollout_stride}_rep{self.config.num_repeat_eval}_OPT{self.config.opt_steps}_COST-{self.config.cost_fn}-RECON-{self.config.compute_cost_with_recon}"
 
         if override := OmegaConf.select(
+            self.config, "model.diffusion.eval_timestep_respacing", default=None
+        ):
+            if int(override) != 250:
+                self.eval_name += f"_SAMPLING-STEPS{override}"
+        elif override := OmegaConf.select(
             self.config, "model.diffusion.num_timesteps", default=None
         ):
             self.eval_name += f"_SAMPLING-STEPS{override}"
@@ -721,6 +771,11 @@ class WM_Planning_Evaluator:
             os.makedirs(dataset_save_output_dir, exist_ok=True)
             eval_save_output_dir = os.path.join(dataset_save_output_dir, self.eval_name)
             os.makedirs(eval_save_output_dir, exist_ok=True)
+            sample_metrics_dir = os.path.join(
+                eval_save_output_dir, "sample_metrics"
+            )
+            if self.config.get("resume_planning_samples", True):
+                os.makedirs(sample_metrics_dir, exist_ok=True)
 
             curr_data_loader = self.datasets[dataset_name]
             for (
@@ -730,6 +785,21 @@ class WM_Planning_Evaluator:
                 gt_actions,
                 goal_pos,
             ) in metric_logger.log_every(curr_data_loader, 1, header):
+                sample_id = int(idxs.flatten()[0].item())
+                sample_metric_path = os.path.join(
+                    sample_metrics_dir, f"{sample_id:06d}.json"
+                )
+                if self.config.get("resume_planning_samples", True) and os.path.exists(
+                    sample_metric_path
+                ):
+                    with open(sample_metric_path, encoding="utf-8") as metric_file:
+                        sample_metrics = json.load(metric_file)
+                    for metric_name, metric_value in sample_metrics.items():
+                        metric_logger.meters[
+                            f"{dataset_name}_{metric_name}"
+                        ].update(float(metric_value), n=1)
+                    continue
+
                 obs_image = obs_image[:, -self.num_cond :]
                 with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
                     pred_actions, pred_yaw = self.generate_actions(
@@ -767,6 +837,19 @@ class WM_Planning_Evaluator:
                     metric_logger.meters[
                         "{}_yaw_diff_norm".format(dataset_name)
                     ].update(yaw_diff_norm, n=1)
+                    if self.config.get("resume_planning_samples", True):
+                        sample_metrics = {
+                            "ate": float(ate),
+                            "rpe_trans": float(rpe_trans),
+                            "pos_diff_norm": float(pos_diff_norm),
+                            "yaw_diff_norm": float(yaw_diff_norm),
+                        }
+                        tmp_metric_path = (
+                            f"{sample_metric_path}.tmp.{os.getpid()}"
+                        )
+                        with open(tmp_metric_path, "w", encoding="utf-8") as metric_file:
+                            json.dump(sample_metrics, metric_file, indent=2)
+                        os.replace(tmp_metric_path, sample_metric_path)
                     break
 
             output_fn = os.path.join(

@@ -3,6 +3,7 @@ results
 diffusion/__pycache__
 logs
 .vscode
+.venv-vggt-omega/
 .ipynb_checkpoints
 models
 nwm/data

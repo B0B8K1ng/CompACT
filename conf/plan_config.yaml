@@ -25,6 +25,9 @@ batch_size: 1                 # Batch size for planning evaluation
 
 # Planning specific settings
 num_samples: 80                # Number of sampled trajectories
+planning_microbatch_size: null # Optional candidate chunk size; null evaluates all candidates together
+resume_planning_samples: true  # Persist each trajectory metric and resume after interruption
+exact_distributed_eval: true   # Shard without padding/duplicating samples
 rollout_stride: 1              # Rollout stride
 topk: 5                        # Top-k samples to take mean and var for CEM
 opt_steps: 1                  # Number of optimization steps for CEM

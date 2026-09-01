@@ -16,15 +16,23 @@ hydra:
 
 # Input and output paths
 output_dir: ${exp_dir}/results                # Output directory for the results
+prediction_dir: null            # Optional prediction root outside a read-only exp_dir
 exp_dir: null                   # Experiment directory (containing the trained model)
 ckp: "0100000"                  # Checkpoint ID to use
 
 # Evaluation settings
+seed: 0                            # Reproducible diffusion noise across checkpoints
 num_sec_eval: 5                 # Number of seconds for evaluation intervals
 input_fps: 4                    # Input frames per second
 datasets_to_eval: [recon,scand,sacson]           # Comma-separated list of dataset names
+evaluation_datasets:
+  go_stanford:
+    data_folder: ${oc.env:NWM_DATA_ROOT}/go_stanford
+    test: data_splits/go_stanford/test/
+    metric_waypoint_spacing: 0.12
 num_workers: 8                  # Number of workers for data loading
 batch_size: 64                  # Batch size for inference
+pin_memory: true               # Disable when several large evaluation jobs share host memory
 eval_type: null                 # Type of evaluation: 'time' or 'rollout'
 
 # Trajectory evaluation settings
@@ -45,4 +53,4 @@ eval_context_size: 4
 # Rollout settings
 rollout_fps_values: [1,4]      # Comma-separated list of fps values for rollout evaluation
 gt: 0                           # Set to 1 to produce ground truth evaluation set (no model prediction)
-use_efficient_rollout: true     # Use efficient rollout that operates in latent space (faster) 
+use_efficient_rollout: true     # Use efficient rollout that operates in latent space (faster)

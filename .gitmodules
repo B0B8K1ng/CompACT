@@ -1,3 +1,6 @@
 [submodule "dinov3"]
 	path = dinov3
 	url = https://github.com/facebookresearch/dinov3.git
+[submodule "third_party/vggt_omega"]
+	path = third_party/vggt_omega
+	url = https://github.com/facebookresearch/vggt-omega.git

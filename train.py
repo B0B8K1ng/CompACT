@@ -136,6 +136,8 @@ def main(config: DictConfig):
             try:
                 wandb.init(
                     project=config.training.get("wandb_project", "nwm-training"),
+                    entity=config.training.get("wandb_entity", None),
+                    name=config.training.get("run_name", None),
                     notes=config.training.get("wandb_notes", None),
                     tags=config.training.get("wandb_tags", []),
                     config=OmegaConf.to_container(config, resolve=False),
@@ -167,6 +169,28 @@ def main(config: DictConfig):
         logger.info(f"Experiment note saved to {experiment_note_path}")
     else:
         logger = create_logger(None)
+
+    # New two-stage experiments are opt-in.  Keeping the branch here leaves the
+    # complete legacy construction, checkpoint, evaluation, and planning path
+    # below unchanged when training_stage is absent (or explicitly legacy).
+    if str(config.get("training_stage", "legacy")) != "legacy":
+        from two_stage_training import run_two_stage_training
+
+        run_two_stage_training(
+            config,
+            torch_device,
+            rank,
+            local_gpu,
+            experiment_dir,
+            logger,
+        )
+        if rank == 0 and config.training.get("wandb_enabled", False):
+            try:
+                wandb.finish()
+            except Exception as exc:
+                logger.warning(f"Failed to finish WandB run: {exc}")
+        cleanup()
+        return
 
     # Create model using the utility functions
     tokenizer = setup_tokenizer(config, torch_device)
@@ -210,7 +234,15 @@ def main(config: DictConfig):
         model = torch.compile(model)
 
     # Wrap model for DDP using the local GPU index; keep a torch.device for tensor moves
-    model = DDP(model, device_ids=[local_gpu])
+    model = DDP(
+        model,
+        device_ids=[local_gpu],
+        # Single-type and none batches intentionally leave motion adapters out
+        # of the graph, so their unused parameters must be discovered by DDP.
+        find_unused_parameters=bool(
+            config.get("motion_condition", {}).get("enabled", False)
+        ),
+    )
     diffusion = setup_diffusion(config, for_eval=False, device=torch_device)
     logger.info(f"CDiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -243,6 +275,7 @@ def main(config: DictConfig):
     start_time = time()
 
     logger.info(f"Training for {config.epochs} epochs...")
+    stop_training = False
     for epoch in range(start_epoch, config.epochs):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
@@ -285,10 +318,15 @@ def main(config: DictConfig):
                 torch.cuda.synchronize()
                 end_time = time()
                 steps_per_sec = log_steps / (end_time - start_time)
+                batch_video = (
+                    batch.get("video", batch.get("posterior_mean"))
+                    if isinstance(batch, dict)
+                    else batch[0]
+                )
                 samples_per_sec = (
                     dist.get_world_size()
-                    * batch[0].shape[0]
-                    * (batch[0].shape[1] - config.dataset.context_size)
+                    * batch_video.shape[0]
+                    * (batch_video.shape[1] - config.dataset.context_size)
                     * steps_per_sec
                 )
                 # Reduce loss history over all processes:
@@ -298,6 +336,14 @@ def main(config: DictConfig):
                 logger.info(
                     f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}, Samples/Sec: {samples_per_sec:.2f}"
                 )
+                if config.get("log_cuda_memory", False) and rank == 0:
+                    peak_allocated = torch.cuda.max_memory_allocated(torch_device)
+                    peak_reserved = torch.cuda.max_memory_reserved(torch_device)
+                    logger.info(
+                        "CUDA peak memory: "
+                        f"allocated={peak_allocated / 1024**3:.2f} GiB, "
+                        f"reserved={peak_reserved / 1024**3:.2f} GiB"
+                    )
                 gc.collect()
 
                 # Log to WandB (only on rank 0)
@@ -306,6 +352,7 @@ def main(config: DictConfig):
                         wandb.log(
                             {
                                 "train/loss": avg_loss,
+                                "train/learning_rate": opt.param_groups[0]["lr"],
                                 "train/steps_per_sec": steps_per_sec,
                                 "train/samples_per_sec": samples_per_sec,
                                 "train/step": train_steps,
@@ -342,9 +389,15 @@ def main(config: DictConfig):
                     torch.cuda.synchronize()
                 dist.barrier()
 
+            max_train_steps = config.get("max_train_steps", None)
+            if max_train_steps is not None and train_steps >= int(max_train_steps):
+                logger.info(f"Reached max_train_steps={max_train_steps}; stopping.")
+                stop_training = True
+                break
+
             if (
                 train_steps % config.eval_every == 0 and train_steps >= 0
-            ) or train_steps == 1:
+            ) or (train_steps == 1 and config.get("eval_at_first_step", True)):
                 eval_start_time = time()
                 save_dir = os.path.join(experiment_dir, "viz", str(train_steps))
                 sim_score = evaluate(
@@ -384,6 +437,9 @@ def main(config: DictConfig):
                         logger.warning(
                             f"Failed to log evaluation metrics to WandB: {e}"
                         )
+
+        if stop_training:
+            break
 
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...

@@ -13,8 +13,9 @@ import random
 import numpy as np
 import torch
 import os
+from collections import OrderedDict
 from PIL import Image
-from typing import Tuple
+from typing import Any, Dict, Optional, Tuple
 import pickle
 import tqdm
 from torch.utils.data import Dataset
@@ -33,6 +34,14 @@ from torchvision import transforms
 from omegaconf import DictConfig
 import json
 import base64
+
+from motion_condition import (
+    OfflineMotionStore,
+    motion_input_dim,
+    motion_offset_mask,
+    validate_motion_types,
+)
+from two_stage_data import OfflineProxyStore
 
 logger = logging.getLogger(__name__)
 
@@ -191,39 +200,83 @@ class BaseDataset(Dataset):
         self.dataset_name = dataset_name
         self.goals_per_obs = goals_per_obs
         self.missing_trajectories = []
+        self.rebuild_index = os.environ.get("NWM_REBUILD_INDEX", "0") == "1"
+
+        # Split manifests are source-controlled, but generated indexes and
+        # audit files can be large and belong with the dataset on NAS.
+        index_root = os.environ.get("NWM_INDEX_ROOT")
+        if index_root:
+            split_name = os.path.basename(os.path.normpath(self.data_split_folder))
+            self.index_cache_dir = os.path.join(
+                index_root, self.dataset_name, split_name
+            )
+            os.makedirs(self.index_cache_dir, exist_ok=True)
+        else:
+            self.index_cache_dir = self.data_split_folder
 
         traj_names_file = os.path.join(self.data_split_folder, traj_names)
-        with open(traj_names_file, "r") as f:
-            file_lines = f.read()
+        if os.path.isfile(traj_names_file):
+            with open(traj_names_file, "r") as f:
+                file_lines = f.read()
             self.traj_names = file_lines.split("\n")
-        if "" in self.traj_names:
-            self.traj_names.remove("")
-
-        # Scan for existing trajectories
-        self.existing_traj_names = []
-        logger.info(f"Scanning for existing trajectories in {self.dataset_name}...")
-        for traj_name in tqdm.tqdm(self.traj_names):
-            traj_path = os.path.join(self.data_folder, traj_name, "traj_data.pkl")
-            if os.path.exists(traj_path):
-                self.existing_traj_names.append(traj_name)
-            else:
-                self.missing_trajectories.append(traj_name)
-
-        logger.info(
-            f"Found {len(self.existing_traj_names)}/{len(self.traj_names)} trajectories in {self.dataset_name}"
-        )
-
-        # Save missing trajectories to a file
-        if self.missing_trajectories:
-            missing_trajs_file = os.path.join(
-                self.data_split_folder, f"missing_trajectories_{self.dataset_name}.txt"
-            )
-            with open(missing_trajs_file, "w") as f:
-                for traj in self.missing_trajectories:
-                    f.write(f"{traj}\n")
+            if "" in self.traj_names:
+                self.traj_names.remove("")
+        elif predefined_index:
+            # Some official evaluation-only splits (notably Go Stanford) ship
+            # only a predefined pickle. Derive the scan manifest from that
+            # immutable index instead of requiring a redundant text file.
+            with open(predefined_index, "rb") as f:
+                raw_index_to_data = pickle.load(f)
+            self.traj_names = sorted({entry[0] for entry in raw_index_to_data})
             logger.info(
-                f"Saved {len(self.missing_trajectories)} missing trajectories to {missing_trajs_file}"
+                "Derived %d trajectory names from predefined index %s",
+                len(self.traj_names),
+                predefined_index,
             )
+        else:
+            raise FileNotFoundError(
+                f"Trajectory manifest does not exist: {traj_names_file}"
+            )
+
+        self.existing_traj_names = []
+        training_index_cache = os.path.join(
+            self.index_cache_dir,
+            f"dataset_dist_{min_dist_cat}_to_{max_dist_cat}_n{context_size}_len_traj_pred_{len_traj_pred}.pkl",
+        )
+        if (
+            not predefined_index
+            and not self.rebuild_index
+            and os.path.isfile(training_index_cache)
+        ):
+            logger.info(
+                f"Found cached dataset index for {self.dataset_name}; skipping trajectory scan"
+            )
+        else:
+            # Scan for existing trajectories before building or filtering an index.
+            logger.info(f"Scanning for existing trajectories in {self.dataset_name}...")
+            for traj_name in tqdm.tqdm(self.traj_names):
+                traj_path = os.path.join(self.data_folder, traj_name, "traj_data.pkl")
+                if os.path.exists(traj_path):
+                    self.existing_traj_names.append(traj_name)
+                else:
+                    self.missing_trajectories.append(traj_name)
+
+            logger.info(
+                f"Found {len(self.existing_traj_names)}/{len(self.traj_names)} trajectories in {self.dataset_name}"
+            )
+
+            # Save missing trajectories to a file
+            if self.missing_trajectories:
+                missing_trajs_file = os.path.join(
+                    self.index_cache_dir,
+                    f"missing_trajectories_{self.dataset_name}.txt",
+                )
+                with open(missing_trajs_file, "w") as f:
+                    for traj in self.missing_trajectories:
+                        f.write(f"{traj}\n")
+                logger.info(
+                    f"Saved {len(self.missing_trajectories)} missing trajectories to {missing_trajs_file}"
+                )
 
         self.image_size = image_size
         self.distance_categories = list(range(min_dist_cat, max_dist_cat + 1))
@@ -275,7 +328,7 @@ class BaseDataset(Dataset):
             )
             # Save invalid indices to a file
             invalid_indices_file = os.path.join(
-                self.data_split_folder,
+                self.index_cache_dir,
                 f"invalid_indices_in_{os.path.splitext(os.path.basename(predefined_index))[0]}.txt",
             )
             with open(invalid_indices_file, "w") as f:
@@ -287,9 +340,15 @@ class BaseDataset(Dataset):
         else:
             logger.info("****** Evaluating from NON PREDEFINED index... ******")
             index_to_data_path = os.path.join(
-                self.data_split_folder,
+                self.index_cache_dir,
                 f"dataset_dist_{self.min_dist_cat}_to_{self.max_dist_cat}_n{self.context_size}_len_traj_pred_{self.len_traj_pred}.pkl",
             )
+
+            if not self.rebuild_index and os.path.isfile(index_to_data_path):
+                logger.info(f"Loading cached dataset index from {index_to_data_path}")
+                with open(index_to_data_path, "rb") as f:
+                    self.index_to_data, self.goals_index = pickle.load(f)
+                return
 
             self.index_to_data, self.goals_index = self._build_index()
             with open(index_to_data_path, "wb") as f:
@@ -351,12 +410,13 @@ class BaseDataset(Dataset):
             # yaw = np.concatenate([yaw, np.repeat(yaw[-1], const_len)])
             # positions = np.concatenate([positions, np.repeat(positions[-1][None], const_len, axis=0)], axis=0)
 
-        waypoints_pos = to_local_coords(positions, positions[0], yaw[0])
+        # Navigation motion is planar even when a source trajectory stores xyz.
+        waypoints_pos = to_local_coords(positions, positions[0], yaw[0])[..., :2]
         waypoints_yaw = angle_difference(yaw[0], yaw)
         actions = np.concatenate([waypoints_pos, waypoints_yaw.reshape(-1, 1)], axis=-1)
         actions = actions[1:]
 
-        goal_pos = to_local_coords(goal_pos, positions[0], yaw[0])
+        goal_pos = to_local_coords(goal_pos, positions[0], yaw[0])[..., :2]
         goal_yaw = angle_difference(yaw[0], goal_yaw)
 
         if self.normalize:
@@ -386,6 +446,14 @@ class TrainingDataset(BaseDataset):
         normalize: bool = True,
         predefined_index: list = None,
         goals_per_obs: int = 1,
+        precomputed_latent_root: Optional[str] = None,
+        precomputed_latent_cache_size: int = 8,
+        precomputed_latent_metadata: Optional[Dict[str, Any]] = None,
+        precomputed_latent_records: Optional[Dict[str, Dict[str, Any]]] = None,
+        motion_condition: Optional[Any] = None,
+        motion_types: Optional[Sequence[str]] = None,
+        two_stage_config: Optional[Any] = None,
+        finetune_substage: Optional[str] = None,
     ):
         super().__init__(
             data_folder,
@@ -405,6 +473,406 @@ class TrainingDataset(BaseDataset):
             predefined_index,
             goals_per_obs,
         )
+        self.precomputed_latent_root = precomputed_latent_root
+        self.precomputed_latent_cache_size = int(precomputed_latent_cache_size)
+        self.precomputed_latent_metadata = precomputed_latent_metadata
+        self.precomputed_latent_records = precomputed_latent_records or {}
+        self._latent_trajectory_cache = OrderedDict()
+        self.motion_condition = motion_condition
+        self.two_stage_config = two_stage_config
+        self.training_stage = str(
+            (two_stage_config or {}).get("training_stage", "legacy")
+        )
+        self.finetune_config = (two_stage_config or {}).get("finetune", {})
+        raw_finetune_scheme = (
+            str(self.finetune_config.get("scheme", "reset"))
+            .strip()
+            .lower()
+            .replace("-", "_")
+        )
+        self.finetune_scheme = {
+            "align": "embedding_align",
+            "alignment": "embedding_align",
+            "embedding_alignment": "embedding_align",
+        }.get(raw_finetune_scheme, raw_finetune_scheme)
+        self.finetune_substage = finetune_substage
+        self.alignment_warmup = bool(
+            self.training_stage == "real_finetune"
+            and self.finetune_scheme == "embedding_align"
+            and finetune_substage == "warmup"
+        )
+        self.alignment_proxy_store: Optional[OfflineProxyStore] = None
+        self.alignment_latent_dim = 0
+        self.alignment_max_abs_frame_offset = 8
+        if (
+            self.training_stage == "real_finetune"
+            and self.finetune_scheme == "embedding_align"
+        ):
+            proxy_config = (two_stage_config or {}).get("proxy", {})
+            storage_path = proxy_config.get("storage_path")
+            if storage_path is None:
+                raise ValueError(
+                    "embedding_align requires proxy.storage_path for the offline "
+                    "DreamDojo latent teacher cache"
+                )
+            storage_path = os.path.expanduser(str(storage_path))
+            if not os.path.isabs(storage_path):
+                try:
+                    original_cwd = get_original_cwd()
+                except ValueError:
+                    original_cwd = os.getcwd()
+                storage_path = os.path.join(original_cwd, storage_path)
+            self.alignment_latent_dim = int(proxy_config.get("dim", 0))
+            if self.alignment_latent_dim < 1:
+                raise ValueError("embedding_align requires a positive proxy.dim")
+            self.alignment_max_abs_frame_offset = int(
+                proxy_config.get("max_abs_frame_offset", 8)
+            )
+            if self.alignment_max_abs_frame_offset != 8:
+                raise ValueError(
+                    "EmbeddingAlign teacher eligibility is fixed to "
+                    "abs(frame_offset)<=8"
+                )
+            self.alignment_proxy_store = OfflineProxyStore(
+                storage_path=storage_path,
+                proxy_type="latent",
+                dim=self.alignment_latent_dim,
+                strict_loading=bool(proxy_config.get("strict_loading", True)),
+                file_pattern=str(
+                    proxy_config.get(
+                        "file_pattern", "{source_id}/{trajectory_id}"
+                    )
+                ),
+                pairs_key=str(proxy_config.get("pairs_key", "frame_pairs")),
+                values_key=str(proxy_config.get("values_key", "motion")),
+                validity_key=proxy_config.get("validity_key"),
+                cache_size=int(proxy_config.get("cache_size", 8)),
+                max_abs_frame_offset=self.alignment_max_abs_frame_offset,
+            )
+        self.motion_condition_enabled = bool(
+            motion_condition is not None
+            and motion_condition.get("enabled", False)
+        )
+        self.motion_types: tuple[str, ...] = ()
+        self.motion_sampling_strategy = "round_robin"
+        self.offline_motion_stores: Dict[str, OfflineMotionStore] = {}
+        self.motion_max_frame_offsets: Dict[str, int] = {}
+
+        if self.motion_condition_enabled:
+            available_types = validate_motion_types(motion_condition)
+            self.motion_types = tuple(
+                str(value)
+                for value in (
+                    motion_types
+                    if motion_types is not None
+                    else validate_motion_types(motion_condition, training=True)
+                )
+            )
+            if not self.motion_types or not set(self.motion_types).issubset(
+                available_types
+            ):
+                raise ValueError(
+                    f"Invalid dataset motion types {self.motion_types}; "
+                    f"available={available_types}"
+                )
+            self.motion_sampling_strategy = str(
+                motion_condition.get("sampling_strategy", "round_robin")
+            )
+            if self.motion_sampling_strategy != "round_robin":
+                raise ValueError(
+                    "Only deterministic round_robin motion sampling is supported"
+                )
+
+            for motion_type in ("geometry", "latent"):
+                if motion_type not in self.motion_types:
+                    continue
+                type_config = motion_condition[motion_type]
+                max_frame_offset = type_config.get("max_frame_offset")
+                if max_frame_offset is not None:
+                    max_frame_offset = int(max_frame_offset)
+                    if max_frame_offset < 0:
+                        raise ValueError(
+                            f"motion_condition.{motion_type}.max_frame_offset "
+                            "must be non-negative"
+                        )
+                    self.motion_max_frame_offsets[motion_type] = max_frame_offset
+                offline_config = type_config.get("offline", {})
+                root = offline_config.get("root")
+                if root is None:
+                    raise ValueError(
+                        f"motion_condition.{motion_type}.offline.root is required "
+                        f"when training/evaluating with {motion_type} motion"
+                    )
+                root = os.path.expanduser(str(root))
+                if not os.path.isabs(root):
+                    root = os.path.join(get_original_cwd(), root)
+                self.offline_motion_stores[motion_type] = OfflineMotionStore(
+                    root=root,
+                    dataset_name=self.dataset_name,
+                    motion_type=motion_type,
+                    input_dim=motion_input_dim(motion_condition, motion_type),
+                    file_pattern=str(
+                        offline_config.get(
+                            "file_pattern", "{dataset_name}/{trajectory_name}.pt"
+                        )
+                    ),
+                    pairs_key=str(offline_config.get("pairs_key", "frame_pairs")),
+                    values_key=str(offline_config.get("values_key", "motion")),
+                    cache_size=int(offline_config.get("cache_size", 8)),
+                    strict_metadata=bool(
+                        offline_config.get("strict_metadata", True)
+                    ),
+                    translation_unit=(
+                        "waypoint_spacing_units" if self.normalize else "meters"
+                    ),
+                )
+
+        if self.precomputed_latent_root is not None:
+            if self.precomputed_latent_cache_size < 1:
+                raise ValueError(
+                    "precomputed_latent_cache_size must be at least 1 when "
+                    "precomputed latent loading is enabled"
+                )
+            self.precomputed_latent_dataset_root = os.path.realpath(
+                os.path.join(self.precomputed_latent_root, self.dataset_name)
+            )
+        else:
+            self.precomputed_latent_dataset_root = None
+
+    @property
+    def uses_precomputed_latents(self) -> bool:
+        return self.precomputed_latent_root is not None
+
+    def _latent_path(self, trajectory_name: str) -> str:
+        """Resolve a trajectory cache path without allowing path traversal."""
+        path = os.path.realpath(
+            os.path.join(
+                self.precomputed_latent_dataset_root, f"{trajectory_name}.pt"
+            )
+        )
+        root_prefix = self.precomputed_latent_dataset_root + os.sep
+        if not path.startswith(root_prefix):
+            raise ValueError(
+                f"Unsafe trajectory name in latent cache: {trajectory_name!r}"
+            )
+        return path
+
+    def _validate_latent_trajectory(
+        self, payload: Any, trajectory_name: str, path: str
+    ) -> Dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise ValueError(f"Latent cache is not a dictionary: {path}")
+
+        required_keys = {
+            "schema_version",
+            "format",
+            "dataset_name",
+            "trajectory_name",
+            "frame_indices",
+            "posterior_mean",
+            "posterior_logvar",
+            "metadata",
+        }
+        missing_keys = required_keys.difference(payload)
+        if missing_keys:
+            raise ValueError(
+                f"Latent cache {path} is missing keys: {sorted(missing_keys)}"
+            )
+        if payload["schema_version"] != 1:
+            raise ValueError(
+                f"Unsupported latent cache schema_version in {path}: "
+                f"{payload['schema_version']!r} (expected 1)"
+            )
+        if payload["format"] != "sd_vae_posterior_stats":
+            raise ValueError(
+                f"Unsupported latent cache format in {path}: {payload['format']!r}"
+            )
+        if payload["dataset_name"] != self.dataset_name:
+            raise ValueError(
+                f"Latent cache dataset mismatch in {path}: "
+                f"{payload['dataset_name']!r} != {self.dataset_name!r}"
+            )
+        if payload["trajectory_name"] != trajectory_name:
+            raise ValueError(
+                f"Latent cache trajectory mismatch in {path}: "
+                f"{payload['trajectory_name']!r} != {trajectory_name!r}"
+            )
+
+        frame_indices = payload["frame_indices"]
+        mean = payload["posterior_mean"]
+        logvar = payload["posterior_logvar"]
+        if not isinstance(frame_indices, torch.Tensor):
+            raise TypeError(f"frame_indices must be a tensor in {path}")
+        if frame_indices.dtype != torch.int64 or frame_indices.ndim != 1:
+            raise ValueError(
+                f"frame_indices must be int64 [N] in {path}; got "
+                f"dtype={frame_indices.dtype}, shape={tuple(frame_indices.shape)}"
+            )
+        if frame_indices.numel() == 0:
+            raise ValueError(f"Latent cache has no frames: {path}")
+        if torch.any(frame_indices < 0):
+            raise ValueError(f"Latent cache contains negative frame indices: {path}")
+        if frame_indices.numel() > 1 and not torch.all(
+            frame_indices[1:] > frame_indices[:-1]
+        ):
+            raise ValueError(
+                f"frame_indices must be strictly increasing with no duplicates: {path}"
+            )
+        if not torch.equal(
+            frame_indices, torch.arange(frame_indices.numel(), dtype=torch.int64)
+        ):
+            raise ValueError(
+                f"frame_indices must cover the contiguous authoritative range "
+                f"0..N-1 in {path}"
+            )
+
+        latent_hw = int(self.image_size) // 8
+        expected_shape = (frame_indices.numel(), 4, latent_hw, latent_hw)
+        for name, tensor in (("posterior_mean", mean), ("posterior_logvar", logvar)):
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(f"{name} must be a tensor in {path}")
+            if tensor.device.type != "cpu":
+                raise ValueError(f"{name} must be stored on CPU in {path}")
+            if tensor.dtype != torch.bfloat16:
+                raise ValueError(
+                    f"{name} must be bfloat16 in {path}; got {tensor.dtype}"
+                )
+            if tuple(tensor.shape) != expected_shape:
+                raise ValueError(
+                    f"{name} has shape {tuple(tensor.shape)} in {path}; "
+                    f"expected {expected_shape}"
+                )
+        file_metadata = payload["metadata"]
+        if not isinstance(file_metadata, dict):
+            raise TypeError(f"metadata must be a dictionary in {path}")
+        if file_metadata.get("num_frames") != frame_indices.numel():
+            raise ValueError(
+                f"metadata.num_frames mismatch in {path}: "
+                f"{file_metadata.get('num_frames')!r} != {frame_indices.numel()}"
+            )
+        manifest_record = self.precomputed_latent_records.get(trajectory_name)
+        if manifest_record is None:
+            raise ValueError(
+                f"Trajectory {self.dataset_name}/{trajectory_name} is absent "
+                "from the validated latent manifest"
+            )
+        if manifest_record.get("num_frames") != frame_indices.numel():
+            raise ValueError(
+                f"Manifest/file frame count mismatch in {path}: "
+                f"{manifest_record.get('num_frames')!r} != {frame_indices.numel()}"
+            )
+        if file_metadata.get("source_fingerprint") != manifest_record.get(
+            "source_fingerprint"
+        ):
+            raise ValueError(f"Source fingerprint mismatch in {path}")
+        if file_metadata.get("source_fingerprint_method") != (
+            "sha256(filename,size,mtime_ns);traj_data+0..L-1.jpg"
+        ):
+            raise ValueError(f"Unsupported source fingerprint method in {path}")
+        expected_metadata = self.precomputed_latent_metadata or {}
+        # These fields define the numerical meaning of the cached tensors. The
+        # source section is trajectory-specific and is validated by the frame
+        # index/name checks above.
+        for key in (
+            "vae_fingerprint",
+            "transform_fingerprint",
+            "encoding_fingerprint",
+            "scaling_factor",
+            "image_size",
+            "storage_dtype",
+            "compute_dtype",
+            "vae_batch_size",
+        ):
+            if key not in file_metadata:
+                raise ValueError(f"metadata.{key} is missing in {path}")
+            if key in expected_metadata and file_metadata[key] != expected_metadata[key]:
+                raise ValueError(
+                    f"metadata.{key} mismatch in {path}: "
+                    f"{file_metadata[key]!r} != {expected_metadata[key]!r}"
+                )
+
+        return payload
+
+    def _get_latent_trajectory(self, trajectory_name: str) -> Dict[str, Any]:
+        """Load and validate one trajectory, with a small per-worker CPU LRU."""
+        cached = self._latent_trajectory_cache.pop(trajectory_name, None)
+        if cached is not None:
+            self._latent_trajectory_cache[trajectory_name] = cached
+            return cached
+
+        path = self._latent_path(trajectory_name)
+        if not os.path.isfile(path):
+            raise FileNotFoundError(
+                f"Precomputed latent cache is incomplete; missing {path}"
+            )
+        try:
+            payload = torch.load(
+                path, map_location="cpu", weights_only=True, mmap=True
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load latent cache {path}: {exc}") from exc
+        payload = self._validate_latent_trajectory(payload, trajectory_name, path)
+
+        self._latent_trajectory_cache[trajectory_name] = payload
+        while len(self._latent_trajectory_cache) > self.precomputed_latent_cache_size:
+            self._latent_trajectory_cache.popitem(last=False)
+        return payload
+
+    def _get_precomputed_posteriors(
+        self, trajectory_name: str, frame_times: Sequence[int]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        payload = self._get_latent_trajectory(trajectory_name)
+        frame_indices = payload["frame_indices"]
+        requested = torch.as_tensor(frame_times, dtype=torch.int64)
+        locations = torch.searchsorted(frame_indices, requested)
+
+        in_range = locations < frame_indices.numel()
+        matches = torch.zeros_like(in_range)
+        matches[in_range] = frame_indices[locations[in_range]] == requested[in_range]
+        if not torch.all(matches):
+            missing = requested[~matches].tolist()
+            raise IndexError(
+                f"Precomputed latent cache for {self.dataset_name}/{trajectory_name} "
+                f"does not contain requested frame(s): {missing}"
+            )
+
+        selected_mean = payload["posterior_mean"].index_select(0, locations)
+        selected_logvar = payload["posterior_logvar"].index_select(0, locations)
+        # Touch and validate only the frames used by this sample. A full finite
+        # scan here would defeat mmap by paging an entire trajectory into RAM on
+        # every LRU miss; extraction verification plus _SUCCESS covers the file.
+        if not torch.isfinite(selected_mean).all() or not torch.isfinite(
+            selected_logvar
+        ).all():
+            raise ValueError(
+                f"Precomputed posterior contains non-finite values for "
+                f"{self.dataset_name}/{trajectory_name}, frames={list(frame_times)}"
+            )
+        return selected_mean, selected_logvar
+
+    def _motion_type_for_index(self, index: int) -> str:
+        # Stable assignment makes proxy mixtures reproducible across workers and
+        # epochs; DistributedSampler still shuffles observation order.
+        return self.motion_types[int(index) % len(self.motion_types)]
+
+    def _get_motion(
+        self,
+        motion_type: str,
+        trajectory_name: str,
+        current_frame: int,
+        target_frames: Sequence[int],
+    ) -> Optional[torch.Tensor]:
+        if motion_type == "none":
+            return None
+        if motion_type == "real":
+            trajectory = self._get_trajectory(trajectory_name)
+            _, goal_pose = self._compute_actions(
+                trajectory, current_frame, np.asarray(target_frames)
+            )
+            return torch.as_tensor(goal_pose, dtype=torch.float32)
+        return self.offline_motion_stores[motion_type].get(
+            trajectory_name, current_frame, target_frames
+        )
 
     def __getitem__(self, i: int) -> Tuple[torch.Tensor]:
         try:
@@ -416,8 +884,19 @@ class TrainingDataset(BaseDataset):
                 int(max_goal_dist),
             )
 
+            sample_min, sample_max = min_goal_dist, max_goal_dist
+            if self.alignment_warmup:
+                local_limit = self.alignment_max_abs_frame_offset
+                sample_min = max(sample_min, -local_limit)
+                sample_max = min(sample_max, local_limit)
+                if sample_min > sample_max:
+                    raise ValueError(
+                        f"No local alignment goal for {self.dataset_name}/{f_curr} "
+                        f"frame={curr_time}, available=[{min_goal_dist},{max_goal_dist}], "
+                        f"required=[{-local_limit},{local_limit}]"
+                    )
             goal_offset = np.random.randint(
-                min_goal_dist, max_goal_dist + 1, size=(self.goals_per_obs)
+                sample_min, sample_max + 1, size=(self.goals_per_obs)
             )
             goal_time = (curr_time + goal_offset).astype("int")
             rel_time = (goal_offset).astype("float") / (
@@ -427,22 +906,126 @@ class TrainingDataset(BaseDataset):
             context_times = list(
                 range(curr_time - self.context_size + 1, curr_time + 1)
             )
-            context = [(f_curr, t) for t in context_times] + [
-                (f_curr, t) for t in goal_time
-            ]
+            all_frame_times = context_times + goal_time.tolist()
+            if self.uses_precomputed_latents:
+                posterior_mean, posterior_logvar = self._get_precomputed_posteriors(
+                    f_curr, all_frame_times
+                )
+            else:
+                context = [(f_curr, t) for t in all_frame_times]
+                obs_image = torch.stack(
+                    [
+                        self.transform(
+                            load_image(get_data_path(self.data_folder, f, t))
+                        )
+                        for f, t in context
+                    ]
+                )
 
-            obs_image = torch.stack(
-                [
-                    self.transform(load_image(get_data_path(self.data_folder, f, t)))
-                    for f, t in context
-                ]
-            )
+            if self.motion_condition_enabled:
+                motion_type = self._motion_type_for_index(i)
+                sample = {
+                    "k": torch.as_tensor(rel_time, dtype=torch.float32),
+                    "motion_type": motion_type,
+                }
+                if self.training_stage != "legacy":
+                    sample["frame_offset"] = torch.as_tensor(
+                        goal_offset, dtype=torch.int64
+                    )
+                if self.uses_precomputed_latents:
+                    sample.update(
+                        {
+                            "posterior_mean": posterior_mean,
+                            "posterior_logvar": posterior_logvar,
+                        }
+                    )
+                else:
+                    sample["video"] = torch.as_tensor(
+                        obs_image, dtype=torch.float32
+                    )
 
-            # Compute actions
+                motion_mask = None
+                max_frame_offset = self.motion_max_frame_offsets.get(motion_type)
+                if max_frame_offset is not None:
+                    motion_mask = motion_offset_mask(goal_offset, max_frame_offset)
+                    selected_targets = goal_time[motion_mask.numpy()].tolist()
+                    selected_motion = (
+                        self._get_motion(
+                            motion_type, f_curr, curr_time, selected_targets
+                        )
+                        if selected_targets
+                        else None
+                    )
+                    motion = torch.zeros(
+                        (
+                            self.goals_per_obs,
+                            motion_input_dim(self.motion_condition, motion_type),
+                        ),
+                        dtype=torch.float32,
+                    )
+                    if selected_motion is not None:
+                        motion[motion_mask] = selected_motion
+                    sample["motion_mask"] = motion_mask
+                else:
+                    motion = self._get_motion(
+                        motion_type, f_curr, curr_time, goal_time.tolist()
+                    )
+                if motion is not None:
+                    sample["motion"] = motion
+                if self.alignment_proxy_store is not None:
+                    latent = torch.zeros(
+                        (self.goals_per_obs, self.alignment_latent_dim),
+                        dtype=torch.float32,
+                    )
+                    latent_eligible = motion_offset_mask(
+                        goal_offset, self.alignment_max_abs_frame_offset
+                    )
+                    latent_found = torch.zeros(
+                        self.goals_per_obs, dtype=torch.bool
+                    )
+                    latent_invalid = torch.zeros_like(latent_found)
+                    latent_valid = torch.zeros_like(latent_found)
+                    # The exact integer offset gates I/O. Long-range examples
+                    # still carry real action and diffusion loss, but never
+                    # touch the DreamDojo cache.
+                    for goal_index in torch.nonzero(
+                        latent_eligible, as_tuple=False
+                    ).flatten().tolist():
+                        result = self.alignment_proxy_store.lookup(
+                            self.dataset_name,
+                            f_curr,
+                            curr_time,
+                            int(goal_time[goal_index]),
+                        )
+                        latent_found[goal_index] = result.found
+                        latent_invalid[goal_index] = result.invalid
+                        latent_valid[goal_index] = result.valid
+                        if result.valid:
+                            latent[goal_index] = result.proxy_action
+                    sample.update(
+                        teacher_latent=latent,
+                        latent_eligible=latent_eligible,
+                        latent_found=latent_found,
+                        latent_invalid=latent_invalid,
+                        latent_valid=latent_valid,
+                    )
+                return sample
+
+            # Legacy real-action tuple path, kept for old configs/checkpoints.
             curr_traj_data = self._get_trajectory(f_curr)
             _, goal_pos = self._compute_actions(curr_traj_data, curr_time, goal_time)
             goal_pos[:, :2] = normalize_data(goal_pos[:, :2], self.ACTION_STATS)
 
+            if self.uses_precomputed_latents:
+                # Four elements are an explicit marker for train_step. Keeping
+                # the batch dimension first also preserves train.py's throughput
+                # accounting without special collation or extra copies.
+                return (
+                    posterior_mean,
+                    posterior_logvar,
+                    torch.as_tensor(goal_pos, dtype=torch.float32),
+                    torch.as_tensor(rel_time, dtype=torch.float32),
+                )
             return (
                 torch.as_tensor(obs_image, dtype=torch.float32),
                 torch.as_tensor(goal_pos, dtype=torch.float32),
@@ -450,6 +1033,8 @@ class TrainingDataset(BaseDataset):
             )
         except Exception as e:
             print(f"Exception in {self.dataset_name}", e)
+            if self.training_stage != "legacy":
+                raise
             raise Exception(e)
 
 
@@ -472,6 +1057,7 @@ class EvalDataset(BaseDataset):
         normalize: bool = True,
         predefined_index: list = None,
         goals_per_obs: int = 1,
+        motion_condition_enabled: bool = False,
     ):
         super().__init__(
             data_folder,
@@ -491,6 +1077,7 @@ class EvalDataset(BaseDataset):
             predefined_index,
             goals_per_obs,
         )
+        self.motion_condition_enabled = bool(motion_condition_enabled)
 
     def __getitem__(self, i: int) -> Tuple[torch.Tensor]:
         try:
@@ -525,7 +1112,10 @@ class EvalDataset(BaseDataset):
             actions, _ = self._compute_actions(
                 curr_traj_data, curr_time, np.array([curr_time + 1])
             )  # last argument is dummy goal
-            actions[:, :2] = normalize_data(actions[:, :2], self.ACTION_STATS)
+            # New adapters own normalization, while legacy checkpoints keep the
+            # historical pre-normalized action contract.
+            if not self.motion_condition_enabled:
+                actions[:, :2] = normalize_data(actions[:, :2], self.ACTION_STATS)
             delta = get_delta_np(actions)
 
             return (

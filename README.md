@@ -140,6 +140,50 @@ uv run bash scripts/plan.sh --nproc=4 -- \
   ++ckp="latest"
 ```
 
+## Reproducible NWM Benchmark Suite
+
+The benchmark runner evaluates registered checkpoints with one shared protocol,
+updates one append-only-style JSON registry, and renders a comparison against
+previous models and the NWM/CompACT paper baselines:
+
+```bash
+# Reuse completed results and run every missing task for all registered models.
+scripts/run_nwm_benchmark.sh --gpus 0,1,2,3
+
+# Select models and tasks. Tasks: recon_prediction,navigation,unseen.
+scripts/run_nwm_benchmark.sh \
+  --models nwm-base,nwm-real,nwm-release \
+  --tasks unseen,navigation \
+  --gpus 0,1,2,3
+
+# Fill only a missing navigation dataset; optionally limit CEM peak memory.
+scripts/run_nwm_benchmark.sh \
+  --models nwm-release --tasks navigation \
+  --navigation-datasets scand --planning-microbatch-size 40 \
+  --gpus 0,1
+
+# Inspect commands without launching jobs.
+scripts/run_nwm_benchmark.sh --models nwm-base --tasks unseen --dry-run
+```
+
+The canonical outputs are:
+
+- `/file_system/nas/algorithm/dujun.nie/nwm/results/nwm_benchmark/benchmark_results.json`
+- `/file_system/nas/algorithm/dujun.nie/nwm/results/nwm_benchmark/benchmark_results.md`
+
+## NavAnywhere Stage-1 pretraining
+
+For coverage-balanced, exactly replayable NavAnywhere sampling, the shared
+TimePT/GeoPT/IDMPT/LatentPT recipe, one-command W&B training, and resumable
+eight-GPU SD-VAE posterior precompute, see
+[NAVANYWHERE_STAGE1.md](NAVANYWHERE_STAGE1.md).
+
+Use `scripts/nwm_benchmark_registry.py` to register/import another model's
+audited results. Registry writes are atomic and file-locked, so independent GPU
+jobs can safely append results concurrently. Navigation also checkpoints every
+trajectory under the model's planning directory and resumes completed samples
+after interruption.
+
 ## Acknowledgements
 
 This codebase builds on the following repositories:

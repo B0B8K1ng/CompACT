@@ -12,7 +12,14 @@ import torch
 import torch.nn as nn
 import numpy as np
 import math
+from collections.abc import Mapping
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
+
+from motion_condition import (
+    MotionConditionEncoder,
+    RealToLatentAdapter,
+    make_motion_group,
+)
 
 
 def modulate(x, shift, scale):
@@ -206,19 +213,64 @@ class CDiT(nn.Module):
         num_heads=16,
         mlp_ratio=4.0,
         learn_sigma=True,
+        motion_condition=None,
+        training_stage="legacy",
+        action_mode=None,
+        finetune=None,
     ):
         super().__init__()
         self.context_size = context_size
+        self.hidden_size = int(hidden_size)
         self.learn_sigma = learn_sigma
         self.in_channels = in_channels
         self.out_channels = in_channels * 2 if learn_sigma else in_channels
         self.patch_size = patch_size
         self.num_heads = num_heads
+        self.training_stage = str(training_stage or "legacy")
+        self.action_mode = str(action_mode or "real")
+        raw_finetune_scheme = (
+            str((finetune or {}).get("scheme", "reset"))
+            .strip()
+            .lower()
+            .replace("-", "_")
+        )
+        self.finetune_scheme = {
+            "align": "embedding_align",
+            "alignment": "embedding_align",
+            "embedding_alignment": "embedding_align",
+        }.get(raw_finetune_scheme, raw_finetune_scheme)
         self.x_embedder = PatchEmbed(
             input_size, patch_size, in_channels, hidden_size, bias=True
         )
         self.t_embedder = TimestepEmbedder(hidden_size)
-        self.y_embedder = ActionEmbedder(hidden_size)
+        self.motion_condition_enabled = bool(
+            motion_condition is not None
+            and motion_condition.get("enabled", False)
+        )
+        if self.motion_condition_enabled:
+            self.motion_condition_encoder = MotionConditionEncoder(
+                hidden_size, motion_condition
+            )
+            if (
+                self.training_stage == "real_finetune"
+                and self.finetune_scheme == "real_to_latent"
+            ):
+                real_dim = self.motion_condition_encoder.input_dims.get("real")
+                latent_dim = self.motion_condition_encoder.input_dims.get("latent")
+                if real_dim is None or latent_dim is None:
+                    raise ValueError(
+                        "real_to_latent requires both real and latent motion adapters"
+                    )
+                mapper_hidden = int(
+                    (finetune or {}).get("real_to_latent_hidden_dim", hidden_size)
+                )
+                self.real_to_latent = RealToLatentAdapter(
+                    real_dim, mapper_hidden, latent_dim
+                )
+        else:
+            # Preserve the original module and state-dict keys for old configs and
+            # checkpoints. The discrete models also continue to use ActionEmbedder.
+            self.y_embedder = ActionEmbedder(hidden_size)
         num_patches = self.x_embedder.num_patches
         self.pos_embed = nn.Parameter(
             torch.zeros(self.context_size + 1, num_patches, hidden_size),
@@ -252,15 +304,16 @@ class CDiT(nn.Module):
         nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
         nn.init.constant_(self.x_embedder.proj.bias, 0)
 
-        # Initialize action embedding:
-        nn.init.normal_(self.y_embedder.x_emb.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.y_embedder.x_emb.mlp[2].weight, std=0.02)
+        # Keep the exact legacy initialization when the new framework is off.
+        if not self.motion_condition_enabled:
+            nn.init.normal_(self.y_embedder.x_emb.mlp[0].weight, std=0.02)
+            nn.init.normal_(self.y_embedder.x_emb.mlp[2].weight, std=0.02)
 
-        nn.init.normal_(self.y_embedder.y_emb.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.y_embedder.y_emb.mlp[2].weight, std=0.02)
+            nn.init.normal_(self.y_embedder.y_emb.mlp[0].weight, std=0.02)
+            nn.init.normal_(self.y_embedder.y_emb.mlp[2].weight, std=0.02)
 
-        nn.init.normal_(self.y_embedder.angle_emb.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.y_embedder.angle_emb.mlp[2].weight, std=0.02)
+            nn.init.normal_(self.y_embedder.angle_emb.mlp[0].weight, std=0.02)
+            nn.init.normal_(self.y_embedder.angle_emb.mlp[2].weight, std=0.02)
 
         # Initialize timestep embedding MLP:
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
@@ -295,13 +348,236 @@ class CDiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def forward(self, x, t, y, x_cond, rel_t):
+    def _dense_action_condition(
+        self,
+        base_condition,
+        motion_type,
+        action,
+        action_valid=None,
+    ):
+        """Add a dense action embedding, masking only after the encoder."""
+        embeddings = self.motion_condition_encoder.encode(motion_type, action)
+        if embeddings.shape[0] != base_condition.shape[0]:
+            raise ValueError(
+                "Action and condition batch sizes differ: "
+                f"{embeddings.shape[0]} != {base_condition.shape[0]}"
+            )
+        if action_valid is not None:
+            action_valid = torch.as_tensor(
+                action_valid, device=embeddings.device, dtype=torch.bool
+            )
+            if action_valid.shape != (embeddings.shape[0],):
+                raise ValueError(
+                    f"action_valid must be [{embeddings.shape[0]}], got "
+                    f"{tuple(action_valid.shape)}"
+                )
+            embeddings = embeddings * action_valid.to(embeddings.dtype).unsqueeze(-1)
+        return base_condition + embeddings.to(base_condition.dtype), embeddings
+
+    def _group_real_to_latent_condition(self, base_condition, motion):
+        if motion is None or len(motion) == 0:
+            return base_condition, None
+        if not isinstance(motion, Mapping) or set(motion).difference({"real"}):
+            raise ValueError(
+                "real_to_latent inference accepts grouped real action only"
+            )
+        payload = motion.get("real")
+        if payload is None:
+            return base_condition, None
+        indices = payload.get("indices")
+        values = payload.get("values")
+        if not isinstance(indices, torch.Tensor) or not isinstance(values, torch.Tensor):
+            raise TypeError("motion['real'] requires tensor indices and values")
+        indices = indices.to(device=base_condition.device, dtype=torch.int64)
+        if indices.ndim != 1 or values.ndim != 2 or values.shape[0] != indices.numel():
+            raise ValueError("Grouped real motion indices/values are misaligned")
+        if bool(((indices < 0) | (indices >= base_condition.shape[0])).any()):
+            raise ValueError("Grouped real motion indices are outside the model batch")
+        if indices.numel() != torch.unique(indices).numel():
+            raise ValueError("Grouped real motion indices contain duplicates")
+        normalized_real = self.motion_condition_encoder.normalize("real", values)
+        predicted_latent = self.real_to_latent(normalized_real)
+        latent_embedding = self.motion_condition_encoder.encode(
+            "latent", predicted_latent
+        ).to(base_condition.dtype)
+        return base_condition.index_add(0, indices, latent_embedding), predicted_latent
+
+    def _alignment_embeddings(self, action, teacher_latent, teacher_valid=None):
+        if action is None or teacher_latent is None:
+            raise ValueError("Alignment requires real action and teacher_latent")
+        real_embedding = self.motion_condition_encoder.encode("real", action)
+        with torch.no_grad():
+            target_embedding = self.motion_condition_encoder.encode(
+                "latent", teacher_latent
+            )
+        if real_embedding.shape != target_embedding.shape:
+            raise ValueError(
+                "Alignment embedding shape mismatch: "
+                f"{tuple(real_embedding.shape)} != {tuple(target_embedding.shape)}"
+            )
+        if teacher_valid is None:
+            teacher_valid = torch.ones(
+                real_embedding.shape[0], dtype=torch.bool, device=real_embedding.device
+            )
+        else:
+            teacher_valid = torch.as_tensor(
+                teacher_valid, dtype=torch.bool, device=real_embedding.device
+            )
+        if teacher_valid.shape != (real_embedding.shape[0],):
+            raise ValueError(
+                f"teacher_valid must be [{real_embedding.shape[0]}], got "
+                f"{tuple(teacher_valid.shape)}"
+            )
+        return {
+            "real_embedding": real_embedding,
+            "target_embedding": target_embedding,
+            "alignment_valid": teacher_valid,
+        }
+
+    def _compute_condition(
+        self,
+        diffusion_embedding,
+        relative_time_embedding,
+        *,
+        y=None,
+        motion=None,
+        action=None,
+        action_valid=None,
+        conditioning_mode=None,
+        teacher_latent=None,
+        teacher_valid=None,
+    ):
+        base_condition = diffusion_embedding + relative_time_embedding
+        auxiliary = {}
+
+        # Preserve the pre-existing path byte-for-byte for old configs and calls.
+        if self.training_stage == "legacy" and conditioning_mode is None and action is None:
+            if self.motion_condition_enabled:
+                if motion is None and y is not None:
+                    motion = make_motion_group("real", y)
+                return self.motion_condition_encoder(base_condition, motion), auxiliary
+            if y is None:
+                raise ValueError("Legacy CDiT requires the real action argument y")
+            return base_condition + self.y_embedder(y), auxiliary
+
+        if not self.motion_condition_enabled:
+            raise ValueError("Two-stage conditioning requires motion_condition.enabled=true")
+
+        if conditioning_mode is not None:
+            mode = str(conditioning_mode).lower()
+        elif self.training_stage == "proxy_pretrain":
+            mode = self.action_mode.lower()
+        elif self.finetune_scheme == "real_to_latent":
+            mode = "real_to_latent"
+        else:
+            mode = "real"
+
+        if mode == "none":
+            return base_condition, auxiliary
+
+        if (
+            action is None
+            and self.training_stage == "proxy_pretrain"
+            and mode in {"geometry", "idm", "latent"}
+            and motion is not None
+        ):
+            supplied_types = set(motion)
+            incompatible = supplied_types.difference({mode})
+            if incompatible:
+                raise ValueError(
+                    "Stage-1 proxy conditioning cannot consume a different action "
+                    f"representation: action_mode={mode!r}, supplied="
+                    f"{sorted(supplied_types)}. Run real-action inference from a "
+                    "stage-2 checkpoint instead."
+                )
+
+        if mode == "real_to_latent":
+            if action is None:
+                condition, predicted_latent = self._group_real_to_latent_condition(
+                    base_condition, motion
+                )
+            else:
+                normalized_real = self.motion_condition_encoder.normalize("real", action)
+                predicted_latent = self.real_to_latent(normalized_real)
+                latent_embedding = self.motion_condition_encoder.encode(
+                    "latent", predicted_latent
+                )
+                if action_valid is not None:
+                    valid = torch.as_tensor(
+                        action_valid, dtype=torch.bool, device=latent_embedding.device
+                    )
+                    if valid.shape != (latent_embedding.shape[0],):
+                        raise ValueError(
+                            f"action_valid must be [{latent_embedding.shape[0]}], got "
+                            f"{tuple(valid.shape)}"
+                        )
+                    latent_embedding = latent_embedding * valid.to(
+                        latent_embedding.dtype
+                    ).unsqueeze(-1)
+                condition = base_condition + latent_embedding.to(base_condition.dtype)
+            if predicted_latent is not None:
+                auxiliary["predicted_latent"] = predicted_latent
+            return condition, auxiliary
+
+        if action is not None:
+            condition, action_embedding = self._dense_action_condition(
+                base_condition, mode, action, action_valid
+            )
+        else:
+            condition = self.motion_condition_encoder(base_condition, motion)
+            action_embedding = None
+
+        if (
+            self.finetune_scheme == "embedding_align"
+            and teacher_latent is not None
+        ):
+            alignment = self._alignment_embeddings(
+                action, teacher_latent, teacher_valid
+            )
+            if action_embedding is not None:
+                # Reuse the exact embedding that conditioned the NWM.
+                alignment["real_embedding"] = action_embedding
+            auxiliary.update(alignment)
+        return condition, auxiliary
+
+    def forward(
+        self,
+        x,
+        t,
+        y=None,
+        x_cond=None,
+        rel_t=None,
+        motion=None,
+        *,
+        action=None,
+        action_valid=None,
+        conditioning_mode=None,
+        teacher_latent=None,
+        teacher_valid=None,
+        return_aux=False,
+        alignment_only=False,
+    ):
         """
         Forward pass of DiT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
         t: (N,) tensor of diffusion timesteps
-        y: (N,) tensor of class labels
+        y: legacy real action tensor. New callers should pass grouped ``motion``.
+        motion: optional per-type mapping with ``indices`` and ``values`` tensors.
         """
+        if alignment_only:
+            if self.finetune_scheme != "embedding_align":
+                raise ValueError("alignment_only is valid only for embedding_align")
+            return self._alignment_embeddings(action, teacher_latent, teacher_valid)
+
+        actual_context_size = int(x_cond.shape[1])
+        if actual_context_size != self.context_size:
+            raise ValueError(
+                "CDiT context length does not match its positional embeddings: "
+                f"received {actual_context_size}, configured {self.context_size}. "
+                "Evaluation and planning context sizes must equal the training "
+                "dataset.context_size recorded by the checkpoint."
+            )
+
         x = self.x_embedder(x) + self.pos_embed[self.context_size :]
         x_cond = (
             self.x_embedder(x_cond.flatten(0, 1)).unflatten(
@@ -311,15 +587,24 @@ class CDiT(nn.Module):
         )  # (N, T, D), where T = H * W / patch_size ** 2.flatten(1, 2)
         x_cond = x_cond.flatten(1, 2)
         t = self.t_embedder(t[..., None])
-        y = self.y_embedder(y)
         time_emb = self.time_embedder(rel_t[..., None])
-        c = t + time_emb + y  # if training on unlabeled data, dont add y.
+        c, auxiliary = self._compute_condition(
+            t,
+            time_emb,
+            y=y,
+            motion=motion,
+            action=action,
+            action_valid=action_valid,
+            conditioning_mode=conditioning_mode,
+            teacher_latent=teacher_latent,
+            teacher_valid=teacher_valid,
+        )
 
         for block in self.blocks:
             x = block(x, c, x_cond)
         x = self.final_layer(x, c)
         x = self.unpatchify(x)
-        return x
+        return (x, auxiliary) if return_aux else x
 
 
 #################################################################################

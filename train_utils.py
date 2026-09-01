@@ -10,11 +10,49 @@ import os
 import matplotlib.pyplot as plt
 from omegaconf import DictConfig, OmegaConf, open_dict
 from hydra.utils import instantiate, get_original_cwd
+from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
+
+from motion_condition import flatten_motion_groups
 
 logger = logging.getLogger(__name__)
 
 # Global cache for evaluation model to prevent memory leaks
 _eval_model_cache = None
+
+
+def sample_precomputed_vae_posterior(
+    posterior_mean: torch.Tensor,
+    posterior_logvar: torch.Tensor,
+    scaling_factor: float,
+) -> torch.Tensor:
+    """Sample cached SD-VAE posteriors with Diffusers' native semantics."""
+    if posterior_mean.shape != posterior_logvar.shape:
+        raise ValueError(
+            "Cached posterior mean/logvar shapes differ: "
+            f"{tuple(posterior_mean.shape)} != {tuple(posterior_logvar.shape)}"
+        )
+    if posterior_mean.ndim != 5 or posterior_mean.shape[2] != 4:
+        raise ValueError(
+            "Cached posterior tensors must have shape [B,T,4,H,W]; got "
+            f"{tuple(posterior_mean.shape)}"
+        )
+    if posterior_mean.dtype != torch.bfloat16 or posterior_logvar.dtype != torch.bfloat16:
+        raise TypeError(
+            "Cached posterior tensors must stay bfloat16 through collation and transfer; "
+            f"got {posterior_mean.dtype} and {posterior_logvar.dtype}"
+        )
+
+    batch_size, sequence_length = posterior_mean.shape[:2]
+    posterior_parameters = torch.cat(
+        (
+            posterior_mean.flatten(0, 1),
+            posterior_logvar.flatten(0, 1),
+        ),
+        dim=1,
+    )
+    posterior = DiagonalGaussianDistribution(posterior_parameters)
+    latents = posterior.sample().mul_(float(scaling_factor))
+    return latents.unflatten(0, (batch_size, sequence_length))
 
 
 def setup_tokenizer(config: DictConfig, device: torch.device):
@@ -99,15 +137,55 @@ def setup_tokenizer(config: DictConfig, device: torch.device):
 
 def setup_model(config: DictConfig, device: torch.device):
     """Setup CDiT model using hydra instantiation."""
-    # Extract model name to get the appropriate class from CDiT_models
-    # Instantiate model using hydra
+    model_kwargs = {"context_size": config.dataset.context_size}
+    generator_target = str(config.model.generator.get("_target_", ""))
+    if generator_target.startswith("models.CDiT") and "motion_condition" in config:
+        model_kwargs["motion_condition"] = config.motion_condition
+        training_stage = str(config.get("training_stage", "legacy"))
+        if training_stage != "legacy":
+            model_kwargs.update(
+                training_stage=training_stage,
+                action_mode=str(config.get("action_mode", "none")),
+                finetune=config.get("finetune", None),
+            )
     model = instantiate(
         config.model.generator,
-        context_size=config.dataset.context_size,
+        **model_kwargs,
         _recursive_=False,  # Don't recursively instantiate nested configs
     ).to(device)
 
     return model
+
+
+def validate_model_context_sizes(config: DictConfig, *context_keys: str) -> int:
+    """Fail early when an evaluation view disagrees with the trained CDiT.
+
+    CDiT owns one positional embedding per configured context frame, so the
+    dataset, evaluator slicing, and checkpoint architecture must use the same
+    length. Keeping this check at the entry points turns an otherwise obscure
+    positional-embedding shape error into an actionable configuration error.
+    """
+    model_context = int(config.dataset.context_size)
+    mismatches = {}
+    for key in context_keys:
+        if key not in config:
+            raise ValueError(
+                f"Missing required context-size setting {key!r}; expected "
+                f"dataset.context_size={model_context}"
+            )
+        value = int(config.get(key))
+        if value != model_context:
+            mismatches[key] = value
+    if mismatches:
+        rendered = ", ".join(
+            f"{key}={value}" for key, value in sorted(mismatches.items())
+        )
+        raise ValueError(
+            "Evaluation context length must match the trained CDiT/checkpoint: "
+            f"dataset.context_size={model_context}, {rendered}. Set every "
+            "evaluation/planning context-size override to the training value."
+        )
+    return model_context
 
 
 def setup_diffusion(config: DictConfig, for_eval: bool, device: torch.device):
@@ -335,9 +413,26 @@ def evaluate(
     # Use cached evaluation model to prevent memory leaks
     if _eval_model_cache is None:
         from dreamsim import dreamsim
+        from dreamsim.model import download_weights
+
+        eval_model_cache = os.environ.get(
+            "NWM_MODEL_CACHE", os.path.join(get_original_cwd(), "models")
+        )
+        os.makedirs(eval_model_cache, exist_ok=True)
+
+        # DreamSim's own cache helper is not distributed-aware. Without this
+        # guard every DDP rank downloads the same ~1.17 GiB archive and writes
+        # into the same directory. Rank 0 populates the shared NAS cache once;
+        # all ranks wait before constructing their local evaluation model.
+        if rank == 0:
+            logger.info(
+                f"Preparing DreamSim ensemble weights in {eval_model_cache}"
+            )
+            download_weights(eval_model_cache, "ensemble")
+        dist.barrier()
 
         _eval_model_cache, _ = dreamsim(
-            pretrained=True, cache_dir=os.path.join(get_original_cwd(), "models")
+            pretrained=True, cache_dir=eval_model_cache
         )
         _eval_model_cache = _eval_model_cache.to(device)
         logger.info("Created and cached DreamSim evaluation model")
@@ -346,14 +441,32 @@ def evaluate(
     score = torch.tensor(0.0).to(device)
     n_samples = torch.tensor(0).to(device)
 
-    # Run for 1 step
-    x, y, rel_t = next(iter(loader))
-    x = x.to(device)
-    y = y.to(device)
-    rel_t = rel_t.to(device).flatten(0, 1)
+    # Run for 1 step. New datasets return a dictionary so heterogeneous
+    # conditions are not padded; legacy configs retain their tuple contract.
+    batch = next(iter(loader))
+    motion = None
+    if isinstance(batch, dict):
+        if "video" not in batch:
+            raise RuntimeError("Evaluation requires pixel video samples")
+        x = batch["video"].to(device)
+        y = None
+        rel_t = batch["k"].to(device)
+    else:
+        x, y, rel_t = batch
+        x = x.to(device)
+        y = y.to(device)
+        rel_t = rel_t.to(device)
     with torch.amp.autocast("cuda", enabled=bfloat_enable, dtype=torch.bfloat16):
         B, T = x.shape[:2]
         num_goals = T - num_cond
+        if isinstance(batch, dict):
+            motion = flatten_motion_groups(
+                batch.get("motion"),
+                batch_size=B,
+                num_goals=num_goals,
+                device=device,
+            )
+        rel_t = rel_t.flatten(0, 1)
 
         start_time = time()
         samples = model_forward_wrapper(
@@ -366,6 +479,7 @@ def evaluate(
             num_cond=num_cond,
             num_goals=num_goals,
             rel_t=rel_t,
+            motion=motion,
         )
         logger.info(
             f"Time taken for generating {samples.shape}: {time() - start_time:.2f} seconds"
@@ -418,7 +532,7 @@ def evaluate(
     import gc
 
     try:
-        del x, y, rel_t, samples, x_start_pixels, x_cond_pixels
+        del x, y, rel_t, motion, samples, x_start_pixels, x_cond_pixels
         if "res" in locals():
             del res
         if "ax" in locals():
@@ -452,31 +566,104 @@ def train_step(
     config,
 ):
     """Execute a single training step."""
-    x, y, rel_t = batch
-    x = x.to(device, non_blocking=True)
-    y = y.to(device, non_blocking=True)
-    rel_t = rel_t.to(device, non_blocking=True)
+    use_precomputed_latents = bool(
+        config.dataset.get("precomputed_latents", {}).get("enabled", False)
+    )
+    uses_motion_framework = isinstance(batch, dict)
+    motion = None
+
+    if uses_motion_framework:
+        rel_t = batch["k"].to(device, non_blocking=True)
+        y = None
+        if use_precomputed_latents:
+            if "posterior_mean" not in batch or "video" in batch:
+                raise RuntimeError(
+                    "Precomputed latent mode is enabled, but the motion dataset "
+                    "did not return posterior tensors."
+                )
+            posterior_mean = batch["posterior_mean"].to(
+                device, non_blocking=True
+            )
+            posterior_logvar = batch["posterior_logvar"].to(
+                device, non_blocking=True
+            )
+        else:
+            if "video" not in batch or "posterior_mean" in batch:
+                raise RuntimeError(
+                    "Precomputed latent mode is disabled, but the motion dataset "
+                    "did not return pixels."
+                )
+            x = batch["video"].to(device, non_blocking=True)
+    elif use_precomputed_latents:
+        if len(batch) != 4:
+            raise RuntimeError(
+                "Precomputed latent mode is enabled, but the training dataset "
+                "returned pixels. Refusing to silently mix input modes."
+            )
+        posterior_mean, posterior_logvar, y, rel_t = batch
+        posterior_mean = posterior_mean.to(device, non_blocking=True)
+        posterior_logvar = posterior_logvar.to(device, non_blocking=True)
+    else:
+        if len(batch) != 3:
+            raise RuntimeError(
+                "Precomputed latent mode is disabled, but the training dataset "
+                "returned posterior tensors. Refusing to silently mix input modes."
+            )
+        x, y, rel_t = batch
+        x = x.to(device, non_blocking=True)
+    if y is not None:
+        y = y.to(device, non_blocking=True)
+    if not uses_motion_framework:
+        rel_t = rel_t.to(device, non_blocking=True)
 
     with torch.amp.autocast("cuda", enabled=bfloat_enable, dtype=torch.bfloat16):
         with torch.no_grad():
-            # Map input images to latent space + normalize latents:
-            B, T = x.shape[:2]
-            x = x.flatten(0, 1)
-            x = tokenizer.encode(x)
-            x = x.unflatten(0, (B, T))
+            if use_precomputed_latents:
+                # This is the same sampling implementation used by
+                # AutoencoderKL.encode(...).latent_dist.sample(). Keeping the
+                # cached posterior in bfloat16 and sampling inside the existing
+                # autocast context preserves the original CDiT-B training path.
+                x = sample_precomputed_vae_posterior(
+                    posterior_mean,
+                    posterior_logvar,
+                    tokenizer.scaling_factor,
+                )
+                B, T = x.shape[:2]
+            else:
+                # Map input images to latent space + normalize latents:
+                B, T = x.shape[:2]
+                x = x.flatten(0, 1)
+                x = tokenizer.encode(x)
+                x = x.unflatten(0, (B, T))
 
         num_goals = T - config.dataset.context_size
+        if rel_t.shape != (B, num_goals):
+            raise ValueError(
+                f"Temporal k must have shape {(B, num_goals)}, "
+                f"got {tuple(rel_t.shape)}"
+            )
         x_start = x[:, config.dataset.context_size :].flatten(0, 1)
         x_cond = repeat(
             x[:, : config.dataset.context_size], "b t ... -> (b g) t ...", g=num_goals
         )
-        y = y.flatten(0, 1)
+        if uses_motion_framework:
+            motion = flatten_motion_groups(
+                batch.get("motion"),
+                batch_size=B,
+                num_goals=num_goals,
+                device=device,
+            )
+        else:
+            y = y.flatten(0, 1)
         rel_t = rel_t.flatten(0, 1)
 
         t = torch.randint(
             0, diffusion.num_timesteps, (x_start.shape[0],), device=device
         )
-        model_kwargs = dict(y=y, x_cond=x_cond, rel_t=rel_t)
+        if uses_motion_framework:
+            model_kwargs = {"x_cond": x_cond, "rel_t": rel_t, "motion": motion}
+        else:
+            model_kwargs = {"y": y, "x_cond": x_cond, "rel_t": rel_t}
         loss_dict = diffusion.training_losses(model, x_start, t, model_kwargs)
         loss = loss_dict["loss"].mean()
 

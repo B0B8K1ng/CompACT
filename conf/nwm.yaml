@@ -1,0 +1,37 @@
+# @package _global_
+
+# CDiT-B + SD-VAE reproduction of the NWM baseline reported by CompACT.
+defaults:
+  - _self_
+  - dataset: nwm
+  - model/generator: cdit_b
+  - model/tokenizer: sdvae
+  - model/diffusion: gaussian
+  - motion_condition: default
+  - optional two_stage: null
+  - training: nwm
+  - scheduler: default
+  - override hydra/job_logging: colorlog
+  - override hydra/hydra_logging: colorlog
+
+hydra:
+  run:
+    dir: ${training.results_dir}/${training.run_name}
+  sweep:
+    dir: ${training.results_dir}/${training.run_name}
+    subdir: ${hydra.job.num}
+  job:
+    chdir: true
+
+seed: 0
+epochs: 100
+max_train_steps: 200000
+log_every: 100
+ckpt_every: 10000
+eval_every: 5000
+eval_at_first_step: true
+log_cuda_memory: true
+bfloat16: 1
+torch_compile: 0
+
+resume_from_dir: null

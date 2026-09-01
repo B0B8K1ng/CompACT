@@ -3,7 +3,12 @@ import logging
 import torch
 import torch.nn as nn
 from diffusers.models import AutoencoderKL
-from flextok.flextok_wrapper import FlexTok, FlexTokFromHub
+try:
+    from flextok.flextok_wrapper import FlexTok, FlexTokFromHub
+except ImportError:
+    # FlexTok is optional for the SD-VAE NWM reproduction path.
+    FlexTok = None
+    FlexTokFromHub = None
 from token_distill.mage_vqgan.vqgan import VQModel
 
 logger = logging.getLogger(__name__)
@@ -62,7 +67,11 @@ class TokenizerWrapper(nn.Module):
 class VAEWrapper(TokenizerWrapper):
     def __init__(self, model_path: str, normalize_mean=None, normalize_std=None):
         super().__init__(normalize_mean=normalize_mean, normalize_std=normalize_std)
-        self.vae = AutoencoderKL.from_pretrained(model_path).eval()
+        # stabilityai/sd-vae-ft-ema publishes Diffusers weights as a .bin file.
+        # Avoid probing for a non-existent safetensors file on every DDP rank.
+        self.vae = AutoencoderKL.from_pretrained(
+            model_path, use_safetensors=False
+        ).eval()
         self.scaling_factor = 0.18215
 
     def forward(self, x):
@@ -93,6 +102,11 @@ class FlexTokenWrapper(TokenizerWrapper):
         normalize_std=None,
     ):
         super().__init__(normalize_mean=normalize_mean, normalize_std=normalize_std)
+        if FlexTokFromHub is None:
+            raise ImportError(
+                "FlexTok is required only for FlexTokenWrapper; install the "
+                "optional flextok dependency to use this tokenizer."
+            )
         self.tokenizer: FlexTok = FlexTokFromHub.from_pretrained(model_path).eval()
         self.num_tokens = num_tokens
         self.codebook_size = codebook_size

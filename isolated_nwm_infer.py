@@ -26,7 +26,26 @@ from train_utils import (
     print_config,
     create_logger,
     setup_diffusion,
+    validate_model_context_sizes,
 )
+from motion_condition import make_motion_group
+
+
+def _uses_motion_condition(model):
+    """Read the flag through optional DDP and torch.compile wrappers."""
+    current = model
+    visited = set()
+    while id(current) not in visited:
+        visited.add(id(current))
+        if hasattr(current, "motion_condition_enabled"):
+            return bool(current.motion_condition_enabled)
+        if hasattr(current, "module"):
+            current = current.module
+        elif hasattr(current, "_orig_mod"):
+            current = current._orig_mod
+        else:
+            break
+    return False
 
 
 def save_image(output_file, img):
@@ -39,7 +58,12 @@ def save_image(output_file, img):
 
 
 def get_dataset_eval(config, dataset_name, eval_type, predefined_index=True):
-    data_config = config.dataset.datasets[dataset_name]
+    if dataset_name in config.dataset.datasets:
+        data_config = config.dataset.datasets[dataset_name]
+    elif dataset_name in config.evaluation_datasets:
+        data_config = config.evaluation_datasets[dataset_name]
+    else:
+        raise KeyError(f"Unknown evaluation dataset: {dataset_name}")
     if predefined_index:
         predefined_index = f"data_splits/{dataset_name}/test/{eval_type}.pkl"
     else:
@@ -64,6 +88,9 @@ def get_dataset_eval(config, dataset_name, eval_type, predefined_index=True):
         goals_per_obs=4,
         predefined_index=predefined_index,
         traj_names="traj_names.txt",
+        motion_condition_enabled=bool(
+            config.get("motion_condition", {}).get("enabled", False)
+        ),
     )
 
     return dataset
@@ -82,17 +109,32 @@ def model_forward_wrapper(
     rel_t=None,
     progress=False,
     skip_tokenizer=False,
+    motion=None,
+    motion_type="real",
 ):
     model, diffusion, tokenizer = all_models
     x = curr_obs.to(device)
-    y = curr_delta.to(device)
+    y = curr_delta.to(device) if curr_delta is not None else None
 
     with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
         B, T = x.shape[:2]
+        model_batch = B * num_goals
 
         if rel_t is None:
-            rel_t = (torch.ones(B) * (1.0 / 128.0)).to(device)
-            rel_t *= num_timesteps
+            if num_timesteps is None:
+                raise ValueError("num_timesteps is required when rel_t is omitted")
+            rel_t = torch.full(
+                (model_batch,),
+                float(num_timesteps) / 128.0,
+                device=device,
+            )
+        else:
+            rel_t = rel_t.to(device).reshape(-1)
+            if rel_t.numel() != model_batch:
+                raise ValueError(
+                    f"rel_t must contain B*num_goals={model_batch} values, "
+                    f"got {rel_t.numel()}"
+                )
 
         if not skip_tokenizer:
             x = x.flatten(0, 1)
@@ -100,9 +142,44 @@ def model_forward_wrapper(
 
         x_cond = repeat(x[:, :num_cond], "b t ... -> (b g) t ...", g=num_goals)
         z = torch.randn(B * num_goals, *x.shape[2:], device=device)
-        y = y.flatten(0, 1)
+        if y is not None:
+            if y.ndim == 3:
+                y = y.flatten(0, 1)
+            elif y.ndim != 2:
+                raise ValueError("Action must have shape [B,G,D] or [B*G,D]")
+            if y.shape[0] != model_batch:
+                raise ValueError(
+                    f"Action must contain B*num_goals={model_batch} rows, "
+                    f"got {y.shape[0]}"
+                )
 
-        model_kwargs = dict(y=y, x_cond=x_cond, rel_t=rel_t)
+        if _uses_motion_condition(model):
+            if motion is None and y is not None:
+                # Navigation inference is deliberately real-action conditioned
+                # for every training variant. An empty mapping distinguishes an
+                # explicit none request from an omitted legacy argument.
+                motion = (
+                    {}
+                    if motion_type == "none"
+                    else make_motion_group(motion_type, y)
+                )
+            elif motion is not None:
+                motion = {
+                    key: {
+                        "indices": value["indices"].to(device),
+                        "values": value["values"].to(device),
+                    }
+                    for key, value in motion.items()
+                }
+            model_kwargs = {
+                "x_cond": x_cond,
+                "rel_t": rel_t,
+                "motion": motion,
+            }
+        else:
+            # Preserve the original kwargs contract for legacy continuous and
+            # discrete checkpoints, whose forward methods do not accept motion.
+            model_kwargs = {"y": y, "x_cond": x_cond, "rel_t": rel_t}
         samples = diffusion.p_sample_loop(
             model.forward,
             z.shape,
@@ -172,6 +249,7 @@ def generate_rollout_efficient(
                 num_cond=num_cond,
                 num_goals=1,
                 device=device,
+                motion_type="real",
                 skip_tokenizer=True,  # Work directly with latents
             )
 
@@ -233,10 +311,18 @@ def generate_rollout(
                 num_cond=num_cond,
                 num_goals=1,
                 device=device,
+                motion_type="real",
             )
 
+        # model_forward_wrapper returns display-space pixels in [0, 1], while
+        # EvalDataset observations are normalized before entering the VAE.
+        # Restore that input contract before recursively feeding predictions
+        # back into the context window.
+        x_pred_context = misc.get_normalize(
+            config.dataset.mean, config.dataset.std
+        )(x_pred_pixels)
         curr_obs = torch.cat(
-            (curr_obs, x_pred_pixels.unsqueeze(1)), dim=1
+            (curr_obs, x_pred_context.unsqueeze(1)), dim=1
         )  # append current prediction
         curr_obs = curr_obs[
             :, 1:
@@ -290,6 +376,7 @@ def generate_time(
                 num_cond=num_cond,
                 num_goals=1,
                 device=device,
+                motion_type="real",
             )
         visualize_preds(
             output_dir,
@@ -325,6 +412,9 @@ def main(config: DictConfig):
 
     num_tasks = dist.get_world_size()
     global_rank = dist.get_rank()
+    # Keep stochastic diffusion samples reproducible across checkpoints while
+    # still assigning a distinct random stream to every distributed rank.
+    misc.seed_everything(config.seed * num_tasks + global_rank)
 
     # Validate required parameters
     if config.output_dir is None:
@@ -343,6 +433,8 @@ def main(config: DictConfig):
     # Output directory setup
     if config.gt:
         save_output_dir = os.path.join(config.output_dir, "gt")
+    elif config.prediction_dir is not None:
+        save_output_dir = os.path.abspath(config.prediction_dir)
     else:
         save_output_dir = os.path.join(get_original_cwd(), config.exp_dir, "results")
         save_output_dir = save_output_dir + f"_{config.ckp}"
@@ -361,6 +453,8 @@ def main(config: DictConfig):
             logger.info("Experiment configuration merged with inference config")
     else:
         raise ValueError(f"Experiment directory {config.exp_dir} does not exist")
+
+    validate_model_context_sizes(config, "eval_context_size")
 
     # Get number of context frames
     num_cond = config.dataset.context_size
@@ -428,7 +522,7 @@ def main(config: DictConfig):
             sampler=sampler_val,
             batch_size=config.batch_size,
             num_workers=config.num_workers,
-            pin_memory=True,
+            pin_memory=config.pin_memory,
             drop_last=False,
         )
         datasets[dataset_name] = curr_data_loader

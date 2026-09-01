@@ -739,7 +739,12 @@ class GaussianDiffusion:
         # At the first timestep return the decoder NLL,
         # otherwise return KL(q(x_{t-1}|x_t,x_0) || p(x_{t-1}|x_t))
         output = th.where((t == 0), decoder_nll, kl)
-        return {"output": output, "pred_xstart": out["pred_xstart"]}
+        result = {"output": output, "pred_xstart": out["pred_xstart"]}
+        if out["extra"] is not None:
+            if not isinstance(out["extra"], dict):
+                raise TypeError("A model tuple output must be (prediction, auxiliary_dict)")
+            result["model_aux"] = out["extra"]
+        return result
 
     def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
         """
@@ -762,18 +767,27 @@ class GaussianDiffusion:
         terms = {}
 
         if self.loss_type == LossType.KL or self.loss_type == LossType.RESCALED_KL:
-            terms["loss"] = self._vb_terms_bpd(
+            vb_terms = self._vb_terms_bpd(
                 model=model,
                 x_start=x_start,
                 x_t=x_t,
                 t=t,
                 clip_denoised=False,
                 model_kwargs=model_kwargs,
-            )["output"]
+            )
+            terms["loss"] = vb_terms["output"]
+            if "model_aux" in vb_terms:
+                terms["model_aux"] = vb_terms["model_aux"]
             if self.loss_type == LossType.RESCALED_KL:
                 terms["loss"] *= self.num_timesteps
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
             model_output = model(x_t, t, **model_kwargs)
+            if isinstance(model_output, tuple):
+                if len(model_output) != 2 or not isinstance(model_output[1], dict):
+                    raise TypeError(
+                        "A model tuple output must be (prediction, auxiliary_dict)"
+                    )
+                model_output, terms["model_aux"] = model_output
 
             if self.model_var_type in [
                 ModelVarType.LEARNED,
