@@ -508,9 +508,16 @@ def build_checkpoint_metadata(
     # keep the required field but store its accurate null value until stage 2.
     if training_stage == "proxy_pretrain":
         scheme = None
+        finetune_initialization = None
     else:
+        finetune = _finetune_config(config)
         scheme = _normalize_scheme(
-            _get(_finetune_config(config), "scheme", "reset")
+            _get(finetune, "scheme", "reset")
+        )
+        finetune_initialization = (
+            "random"
+            if bool(_get(finetune, "random_init", False))
+            else "stage1_checkpoint"
         )
     substage = _normalize_substage(finetune_substage)
     warmup_steps = int(completed_warmup_steps)
@@ -532,6 +539,7 @@ def build_checkpoint_metadata(
         "latent_dim": _latent_dim(config, model),
         "latent_normalization": _latent_normalization(config),
         "finetune_scheme": scheme,
+        "finetune_initialization": finetune_initialization,
         "finetune_substage": substage,
         "completed_warmup_steps": warmup_steps,
         "completed_joint_steps": joint_steps,
@@ -777,6 +785,16 @@ def validate_resume_checkpoint(
             )
     else:
         source_scheme = _normalize_scheme(source.get("finetune_scheme"))
+        # Schema-v1 stage-2 checkpoints written before this field existed were
+        # necessarily initialized from stage 1: random-init was not supported.
+        source_initialization = str(
+            source.get("finetune_initialization", "stage1_checkpoint")
+        ).strip().lower()
+        if source_initialization not in {"random", "stage1_checkpoint"}:
+            raise ValueError(
+                "Unknown checkpoint finetune_initialization: "
+                f"{source_initialization!r}"
+            )
 
     if config is not None:
         expected_stage = str(
@@ -849,6 +867,17 @@ def validate_resume_checkpoint(
             _assert_same(
                 "finetune_scheme", source_scheme, expected_scheme, required=True
             )
+            expected_initialization = (
+                "random"
+                if bool(_get(finetune, "random_init", False))
+                else "stage1_checkpoint"
+            )
+            _assert_same(
+                "finetune_initialization",
+                source_initialization,
+                expected_initialization,
+                required=True,
+            )
             configured_warmup_steps = _get(finetune, "warmup_steps", None)
             configured_joint_steps = _get(finetune, "joint_steps", None)
             if (
@@ -885,6 +914,9 @@ def validate_resume_checkpoint(
         ),
         "completed_warmup_steps": warmup_steps,
         "completed_joint_steps": joint_steps,
+        "finetune_initialization": (
+            source_initialization if stage == "real_finetune" else None
+        ),
     }
 
 

@@ -11,6 +11,8 @@ import torch
 from PIL import Image
 from torch.utils.data import default_collate
 
+import navanywhere_recipe
+import two_stage_data
 from navanywhere_recipe import build_sampling_recipe, frame_indices_sha256
 from two_stage_data import (
     NavAnywhereDataset,
@@ -67,6 +69,68 @@ def _write_pt_cache(
         path,
     )
     return path
+
+
+def test_dataset_retries_transient_duplicate_directory_entries(
+    tmp_path: Path, monkeypatch
+) -> None:
+    data_root = tmp_path / "NavAnywhere"
+    trajectory = _write_frames(data_root, first=0, last=1)
+    real_scan = navanywhere_recipe._scan_trajectory_frames_once
+    calls = 0
+
+    def flaky_scan(path: str):
+        nonlocal calls
+        calls += 1
+        frames = real_scan(path)
+        if Path(path) == trajectory and calls == 1:
+            return [frames[0], frames[0], *frames[1:]]
+        return frames
+
+    monkeypatch.setattr(navanywhere_recipe, "_scan_trajectory_frames_once", flaky_scan)
+    monkeypatch.setattr(navanywhere_recipe, "FRAME_SCAN_RETRY_DELAY_SECONDS", 0)
+
+    dataset = NavAnywhereDataset(
+        data_root,
+        source_id="nav_source",
+        context_size=1,
+        fixed_goal_offsets=[0],
+    )
+
+    assert dataset._trajectories[0].frame_indices.tolist() == [0, 1]
+    assert calls == 2
+
+
+def test_precomputed_recipe_startup_does_not_rescan_raw_frames(
+    tmp_path: Path, monkeypatch
+) -> None:
+    data_root = tmp_path / "NavAnywhere"
+    _write_frames(data_root, first=0, last=5)
+    recipe = build_sampling_recipe(
+        data_root,
+        seed=23,
+        context_size=1,
+        goals_per_obs=1,
+    )
+    latent_root = tmp_path / "latents"
+    latent_root.mkdir()
+
+    def fail_scan(path: str):
+        raise AssertionError(f"raw frame scan was called for {path}")
+
+    monkeypatch.setattr(two_stage_data, "scan_trajectory_frames", fail_scan)
+    dataset = NavAnywhereDataset(
+        data_root,
+        sampling_recipe=recipe,
+        context_size=1,
+        goals_per_obs=1,
+        seed=23,
+        precomputed_latent_root=latent_root,
+        precomputed_latent_records={"nav_source": {"trajectory_001": {}}},
+    )
+
+    assert dataset._trajectories[0].frame_indices.tolist() == list(range(6))
+    assert dataset._trajectories[0].frame_paths == ()
 
 
 def test_proxy_offset_mask_keeps_full_signed_range_but_marks_only_local() -> None:

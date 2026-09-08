@@ -1,0 +1,522 @@
+% ICLR-style experiment tables for NavAnywhere / latent-action NWM.
+% The file compiles standalone on Overleaf. In the paper, copy the table
+% environments, the fine-tuning paragraph, and the macros into the ICLR source.
+% Replace \TBD with mean $\pm$ standard deviation over three training seeds.
+
+\documentclass{article}
+
+\IfFileExists{iclr2027_conference.sty}{
+  \usepackage{iclr2027_conference,times}
+}{
+  \usepackage[margin=0.68in]{geometry}
+  \usepackage{times}
+}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{makecell}
+\usepackage{threeparttable}
+\usepackage{xcolor}
+
+\newcommand{\method}{\textsc{NavAnywhere}}
+\newcommand{\TBD}{\textcolor{gray}{--}}
+\newcommand{\best}[1]{\textbf{#1}}
+\newcommand{\secondbest}[1]{\underline{#1}}
+\newcommand{\BaseData}{\textsc{Base}}
+\newcommand{\NAvOne}{\textsc{NA-v1}}
+\newcommand{\NAvTwo}{\textsc{NA-v2}}
+\newcommand{\UnseenData}{\textsc{GO Stanford}}
+\newcommand{\LPIPS}{LPIPS$\downarrow$}
+\newcommand{\DreamSim}{DreamSim$\downarrow$}
+\newcommand{\PSNR}{PSNR$\uparrow$}
+
+% Keep paired floats under one logical table number (e.g., 2a and 2b).
+% The redefinitions are local to each table environment.  If hyperref is
+% loaded by the paper template, give each part a distinct link destination.
+\newcommand{\tablepart}[1]{%
+  \renewcommand{\thetable}{\arabic{table}#1}%
+  \ifcsname theHtable\endcsname
+    \renewcommand{\theHtable}{\arabic{table}.#1}%
+  \fi
+}
+\newcommand{\continuedtablepart}[1]{%
+  \addtocounter{table}{-1}%
+  \tablepart{#1}%
+}
+
+\begin{document}
+
+% =============================================================================
+% Table 1: main comparison. NWM Table 2 reports navigation only on RECON.
+% =============================================================================
+\begin{table}[t]
+  \caption{Goal-conditioned visual navigation on RECON. We report ATE and RPE
+  for two-second trajectories; lower is better. Baselines are quoted from NWM.}
+  \label{tab:main_sota_navigation}
+  \centering
+  \small
+  \setlength{\tabcolsep}{9pt}
+  \renewcommand{\arraystretch}{1.08}
+  \begin{threeparttable}
+    \begin{tabular}{lcc}
+      \toprule
+      Method & ATE $\downarrow$ & RPE $\downarrow$ \\
+      \midrule
+      GNM & $1.87{\pm}0.00$ & $0.73{\pm}0.00$ \\
+      NoMaD & $1.93{\pm}0.04$ & $0.52{\pm}0.00$ \\
+      NWM (planning) & \best{$1.13{\pm}0.02$} & \best{$0.35{\pm}0.01$} \\
+      \midrule
+      \method{} (Ours) & \TBD & \TBD \\
+      \bottomrule
+    \end{tabular}
+    \begin{tablenotes}[flushleft]\footnotesize
+      \item Recompute bold and underline formatting after inserting our results.
+    \end{tablenotes}
+  \end{threeparttable}
+\end{table}
+
+% =============================================================================
+% Table 2a: pretraining ablation -- prediction and generalization.
+% Every evaluation reports all three image metrics.
+% =============================================================================
+\begin{table*}[t]
+  \tablepart{a}
+  \caption{Effect of video pretraining on prediction and generalization.
+  Our models use the same NWM backbone and are fine-tuned on \BaseData{}
+  (RECON, SCAND, TartanDrive, and HuRoN). The published NWM results are included
+  as a reference. Results are evaluated at 4\,s.}
+  \label{tab:pretraining_prediction}
+  \centering
+  \scriptsize
+  \setlength{\tabcolsep}{4.2pt}
+  \renewcommand{\arraystretch}{0.98}
+  \begin{threeparttable}
+    \begin{tabular}{lll lccc}
+      \toprule
+      Pretraining data & Variant & Hours & Evaluation
+      & \LPIPS & \DreamSim & \PSNR \\
+      \midrule
+      \multirow{4}{*}{None}
+      & \multirow{4}{*}{NWM (paper)\tnote{a}} & \multirow{4}{*}{0}
+      & Single-step (RECON) & $0.295{\pm}0.002$ & $0.091{\pm}0.001$ & $15.343{\pm}0.060$ \\
+      & & & Rollout 1\,FPS (RECON) & -- & -- & -- \\
+      & & & Rollout 4\,FPS (RECON) & -- & -- & -- \\
+      & & & Unseen (\UnseenData{}) & $0.658{\pm}0.002$ & $0.478{\pm}0.001$ & $11.031{\pm}0.036$ \\
+      \addlinespace[2pt]
+      \multirow{4}{*}{Ego4D}
+      & \multirow{4}{*}{NWM (paper)\tnote{a}} & \multirow{4}{*}{--}
+      & Single-step (RECON) & $0.368{\pm}0.003$ & $0.138{\pm}0.002$ & $14.072{\pm}0.075$ \\
+      & & & Rollout 1\,FPS (RECON) & -- & -- & -- \\
+      & & & Rollout 4\,FPS (RECON) & -- & -- & -- \\
+      & & & Unseen (\UnseenData{}) & $0.652{\pm}0.003$ & $0.464{\pm}0.003$ & $11.083{\pm}0.064$ \\
+      \midrule
+      \multirow{4}{*}{None}
+      & \multirow{4}{*}{NWM-Real} & \multirow{4}{*}{0}
+      & Single-step (RECON) & 0.325 & 0.120 & 15.357 \\
+      & & & Rollout 1\,FPS (RECON) & 0.385 & 0.152 & 14.579 \\
+      & & & Rollout 4\,FPS (RECON) & 0.450 & 0.214 & 13.314 \\
+      & & & Unseen (\UnseenData{}) & 0.653 & 0.462 & 11.202 \\
+      \midrule
+      \multirow{4}{*}{None}
+      & \multirow{4}{*}{No-Pretrain} & \multirow{4}{*}{0}
+      & Single-step (RECON) & 0.457 & 0.257 & 12.839 \\
+      & & & Rollout 1\,FPS (RECON) & 0.454 & 0.254 & 13.198 \\
+      & & & Rollout 4\,FPS (RECON) & 0.461 & 0.257 & 13.174 \\
+      & & & Unseen (\UnseenData{}) & 0.645 & 0.472 & 11.307 \\
+      \midrule
+      \multirow{12}{*}{\NAvOne{}}
+      & \multirow{4}{*}{TimePT} & \multirow{4}{*}{322}
+      & Single-step (RECON) & 0.359 & 0.148 & 14.872 \\
+      & & & Rollout 1\,FPS (RECON) & 0.417 & 0.182 & 13.975 \\
+      & & & Rollout 4\,FPS (RECON) & 0.488 & 0.258 & 12.555 \\
+      & & & Unseen (\UnseenData{}) & 0.635 & 0.435 & 11.842 \\
+      \addlinespace[2pt]
+      & \multirow{4}{*}{GeoPT} & \multirow{4}{*}{322}
+      & Single-step (RECON) & 0.362 & 0.153 & 14.841 \\
+      & & & Rollout 1\,FPS (RECON) & 0.417 & 0.186 & 13.986 \\
+      & & & Rollout 4\,FPS (RECON) & 0.475 & 0.250 & 13.051 \\
+      & & & Unseen (\UnseenData{}) & 0.639 & 0.439 & 11.587 \\
+      \addlinespace[2pt]
+      & \multirow{4}{*}{LatentPT} & \multirow{4}{*}{322}
+      & Single-step (RECON) & \TBD & \TBD & \TBD \\
+      & & & Rollout 1\,FPS (RECON) & \TBD & \TBD & \TBD \\
+      & & & Rollout 4\,FPS (RECON) & \TBD & \TBD & \TBD \\
+      & & & Unseen (\UnseenData{}) & \TBD & \TBD & \TBD \\
+      \midrule
+      \multirow{12}{*}{\NAvTwo{}}
+      & \multirow{4}{*}{TimePT} & \multirow{4}{*}{$1200{+}$}
+      & Single-step (RECON) & \TBD & \TBD & \TBD \\
+      & & & Rollout 1\,FPS (RECON) & \TBD & \TBD & \TBD \\
+      & & & Rollout 4\,FPS (RECON) & \TBD & \TBD & \TBD \\
+      & & & Unseen (\UnseenData{}) & \TBD & \TBD & \TBD \\
+      \addlinespace[2pt]
+      & \multirow{4}{*}{GeoPT} & \multirow{4}{*}{$1200{+}$}
+      & Single-step (RECON) & \TBD & \TBD & \TBD \\
+      & & & Rollout 1\,FPS (RECON) & \TBD & \TBD & \TBD \\
+      & & & Rollout 4\,FPS (RECON) & \TBD & \TBD & \TBD \\
+      & & & Unseen (\UnseenData{}) & \TBD & \TBD & \TBD \\
+      \addlinespace[2pt]
+      & \multirow{4}{*}{LatentPT} & \multirow{4}{*}{$1200{+}$}
+      & Single-step (RECON) & \TBD & \TBD & \TBD \\
+      & & & Rollout 1\,FPS (RECON) & \TBD & \TBD & \TBD \\
+      & & & Rollout 4\,FPS (RECON) & \TBD & \TBD & \TBD \\
+      & & & Unseen (\UnseenData{}) & \TBD & \TBD & \TBD \\
+      \bottomrule
+    \end{tabular}
+    \begin{tablenotes}[flushleft]\footnotesize
+      \item[a] Values are taken directly from Table~4 of the original NWM paper
+      for its CDiT-XL models trained with in-domain data, with and without
+      additional unlabeled Ego4D data (mean $\pm$ std over five samples).
+      The paper does not report the two rollout settings; ``--'' denotes unavailable.
+      These rows are published references rather than architecture-matched comparisons.
+      \item \NAvOne{} contains 13 datasets (322 hours); \NAvTwo{} adds Ego4D
+      and GO ($1200{+}$ hours). GO and \UnseenData{} are distinct datasets.
+    \end{tablenotes}
+  \end{threeparttable}
+\end{table*}
+
+% =============================================================================
+% Table 2b: pretraining ablation -- planning. All planning metrics and datasets.
+% =============================================================================
+\begin{table*}[t]
+  \continuedtablepart{b}
+  \caption{Effect of video pretraining on navigation planning. Our models use
+  the same fine-tuning and CEM80 evaluation protocol. The published NWM results
+  are included as a reference. Lower is better.}
+  \label{tab:pretraining_planning}
+  \centering
+  \small
+  \setlength{\tabcolsep}{7pt}
+  \renewcommand{\arraystretch}{1.06}
+  \begin{threeparttable}
+    \begin{tabular}{llc cc cc}
+      \toprule
+      & & & \multicolumn{2}{c}{RECON} & \multicolumn{2}{c}{SCAND} \\
+      \cmidrule(lr){4-5}\cmidrule(l){6-7}
+      Pretraining data & Variant & Hours
+      & ATE $\downarrow$ & RPE $\downarrow$
+      & ATE $\downarrow$ & RPE $\downarrow$ \\
+      \midrule
+      None & NWM (paper)\tnote{a} & 0
+      & $1.13{\pm}0.02$ & $0.35{\pm}0.01$
+      & $1.28{\pm}0.02$ & $0.33{\pm}0.01$ \\
+      \midrule
+      None & NWM-Real & 0 & 1.158 & 0.345 & 1.065 & 0.288 \\
+      \midrule
+      None & No-Pretrain & 0 & \TBD & \TBD & \TBD & \TBD \\
+      \midrule
+      \multirow{3}{*}{\NAvOne{}}
+      & TimePT & 322 & 1.174 & 0.365 & 1.045 & 0.286 \\
+      & GeoPT & 322 & \TBD & \TBD & \TBD & \TBD \\
+      & LatentPT & 322 & \TBD & \TBD & \TBD & \TBD \\
+      \midrule
+      \multirow{3}{*}{\NAvTwo{}}
+      & TimePT & $1200{+}$ & \TBD & \TBD & \TBD & \TBD \\
+      & GeoPT & $1200{+}$ & \TBD & \TBD & \TBD & \TBD \\
+      & LatentPT & $1200{+}$ & \TBD & \TBD & \TBD & \TBD \\
+      \bottomrule
+    \end{tabular}
+    \begin{tablenotes}[flushleft]\footnotesize
+      \item[a] Values are taken directly from Table~7 of the original NWM paper
+      for its CDiT-XL model (mean $\pm$ std). NWM uses a CEM population of 120,
+      so this row is a published reference rather than a protocol-matched
+      comparison.
+      \item CEM80 uses 100 test cases per dataset, population 80, top-$5$,
+      three repeats, and an eight-step horizon at 0.25\,s per step.
+      NWM-Real and TimePT values are single-checkpoint point estimates over the
+      100 cases.
+    \end{tablenotes}
+  \end{threeparttable}
+\end{table*}
+
+% =============================================================================
+% Fine-tuning schemes: explanation and equations live in the text, not tables.
+% Pretraining and fine-tuning are the two overall phases. "Stage 1/2" below
+% refer only to the two stages within fine-tuning.
+% =============================================================================
+\paragraph{Latent-action fine-tuning.}
+Let $F_{\theta}$ be the pretrained NWM, $z$ the LAM action, $E_z$ the
+pretrained latent-action encoder, and $E_a$ the real-action encoder. Fine-tuning
+contains Stage~1 (action warm-up) and Stage~2 (joint adaptation). We compare:
+
+\noindent\textbf{Reset.}
+Discard $E_z$ and condition $F_{\theta}$ directly on $E_a(a)$:
+\begin{equation}
+  \text{Stage 1: }\min_{E_a}\mathcal{L}_{\mathrm{NWM}},
+  \qquad
+  \text{Stage 2: }\min_{E_a,\theta}\mathcal{L}_{\mathrm{NWM}}.
+  \label{eq:reset}
+\end{equation}
+
+\noindent\textbf{Align.}
+Keep $E_z$ frozen and align the two action embeddings with
+\begin{equation}
+  \mathcal{L}_{\mathrm{align}}
+  = 1-\cos\!\left(E_a(a),E_z(z)\right)
+  + \lambda_1\left\lVert E_a(a)-E_z(z)\right\rVert_1 .
+  \label{eq:alignment_loss}
+\end{equation}
+The two stages optimize
+\begin{equation}
+  \text{Stage 1: }\min_{E_a}\mathcal{L}_{\mathrm{align}},
+  \qquad
+  \text{Stage 2: }\min_{E_a,\theta}
+  \mathcal{L}_{\mathrm{NWM}}+\lambda_{\mathrm{a}}\mathcal{L}_{\mathrm{align}},
+  \quad E_z\ \text{frozen}.
+  \label{eq:align}
+\end{equation}
+
+\noindent\textbf{Action2Latent.}
+Map real actions into the latent-action space and use
+$c(a)=E_z(E_a(a))$ as the NWM condition:
+\begin{equation}
+  \text{Stage 1: }\min_{E_a}\mathcal{L}_{\mathrm{NWM}},
+  \quad (E_z,\theta)\ \text{frozen};
+  \qquad
+  \text{Stage 2: }\min_{E_a,E_z,\theta}\mathcal{L}_{\mathrm{NWM}}.
+  \label{eq:action2latent}
+\end{equation}
+
+% =============================================================================
+% Table 3a: fine-tuning method -- prediction and generalization.
+% =============================================================================
+\begin{table*}[t]
+  \tablepart{a}
+  \caption{Prediction and generalization under different latent-action
+  fine-tuning strategies. All methods start from the same pretrained checkpoint
+  and use the same fine-tuning budget. Results are evaluated at 4\,s.}
+  \label{tab:finetuning_prediction}
+  \centering
+  \small
+  \setlength{\tabcolsep}{6pt}
+  \renewcommand{\arraystretch}{1.02}
+  \begin{tabular}{llccc}
+    \toprule
+    Fine-tuning & Evaluation & \LPIPS & \DreamSim & \PSNR \\
+    \midrule
+    \multirow{4}{*}{Reset}
+    & Single-step (RECON) & \TBD & \TBD & \TBD \\
+    & Rollout 1\,FPS (RECON) & \TBD & \TBD & \TBD \\
+    & Rollout 4\,FPS (RECON) & \TBD & \TBD & \TBD \\
+    & Unseen (\UnseenData{}) & \TBD & \TBD & \TBD \\
+    \midrule
+    \multirow{4}{*}{Align}
+    & Single-step (RECON) & \TBD & \TBD & \TBD \\
+    & Rollout 1\,FPS (RECON) & \TBD & \TBD & \TBD \\
+    & Rollout 4\,FPS (RECON) & \TBD & \TBD & \TBD \\
+    & Unseen (\UnseenData{}) & \TBD & \TBD & \TBD \\
+    \midrule
+    \multirow{4}{*}{Action2Latent}
+    & Single-step (RECON) & \TBD & \TBD & \TBD \\
+    & Rollout 1\,FPS (RECON) & \TBD & \TBD & \TBD \\
+    & Rollout 4\,FPS (RECON) & \TBD & \TBD & \TBD \\
+    & Unseen (\UnseenData{}) & \TBD & \TBD & \TBD \\
+    \bottomrule
+  \end{tabular}
+\end{table*}
+
+% =============================================================================
+% Table 3b: fine-tuning method -- planning.
+% =============================================================================
+\begin{table*}[t]
+  \continuedtablepart{b}
+  \caption{Navigation planning under different latent-action fine-tuning
+  strategies. Lower is better.}
+  \label{tab:finetuning_planning}
+  \centering
+  \small
+  \setlength{\tabcolsep}{8pt}
+  \renewcommand{\arraystretch}{1.06}
+  \begin{tabular}{l cc cc}
+    \toprule
+    & \multicolumn{2}{c}{RECON} & \multicolumn{2}{c}{SCAND} \\
+    \cmidrule(lr){2-3}\cmidrule(l){4-5}
+    Fine-tuning & ATE $\downarrow$ & RPE $\downarrow$
+    & ATE $\downarrow$ & RPE $\downarrow$ \\
+    \midrule
+    Reset & \TBD & \TBD & \TBD & \TBD \\
+    Align & \TBD & \TBD & \TBD & \TBD \\
+    Action2Latent & \TBD & \TBD & \TBD & \TBD \\
+    \bottomrule
+  \end{tabular}
+\end{table*}
+
+% =============================================================================
+% Table 4: LAM objectives. No v1/v2 column. Each native decoder is evaluated
+% with every metric implemented for its modality under all four protocols.
+% =============================================================================
+\begin{table*}[t]
+  \caption{Navigation LAM evaluation. All objectives are trained on RECON,
+  SCAND, and HuRoN; TartanDrive is held out for OOD evaluation. Each panel
+  reports the complete metric set for the corresponding decoder.}
+  \label{tab:lam_objectives}
+  \centering
+  \scriptsize
+  \setlength{\tabcolsep}{5pt}
+  \renewcommand{\arraystretch}{0.98}
+
+  \textbf{(a) RGB reconstruction}\par\vspace{2pt}
+  \begin{tabular}{ll ccccc}
+    \toprule
+    Objective & Protocol & MSE $\downarrow$ & MAE $\downarrow$
+    & PSNR $\uparrow$ & SSIM $\uparrow$ & LPIPS $\downarrow$ \\
+    \midrule
+    \multirow{4}{*}{Pixel}
+    & ID & \TBD & \TBD & \TBD & \TBD & \TBD \\
+    & ID-CD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+    & OOD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+    & OOD-CD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+    \midrule
+    \multirow{4}{*}{Pixel + action}
+    & ID & 0.0144 & 0.0761 & 19.2250 & 0.5955 & 0.5407 \\
+    & ID-CD & 0.0392 & 0.1363 & 14.7818 & 0.4970 & 0.5899 \\
+    & OOD & 0.0204 & 0.1031 & 17.2198 & 0.3169 & 0.7067 \\
+    & OOD-CD & 0.0428 & 0.1477 & 14.2394 & 0.3814 & 0.6610 \\
+    \bottomrule
+  \end{tabular}
+
+  \vspace{7pt}
+  \textbf{(b) DINO feature reconstruction}\par\vspace{2pt}
+  \begin{tabular}{ll ccc}
+    \toprule
+    Objective & Protocol & MSE $\downarrow$ & MAE $\downarrow$
+    & Cosine similarity $\uparrow$ \\
+    \midrule
+    \multirow{4}{*}{DINO}
+    & ID & \TBD & \TBD & \TBD \\
+    & ID-CD & \TBD & \TBD & \TBD \\
+    & OOD & \TBD & \TBD & \TBD \\
+    & OOD-CD & \TBD & \TBD & \TBD \\
+    \bottomrule
+  \end{tabular}
+
+  \vspace{7pt}
+  \textbf{(c) Action reconstruction}\par\vspace{2pt}
+  \begin{tabular}{ll cccccc}
+    \toprule
+    Objective & Protocol
+    & nMSE $\downarrow$ & nMAE $\downarrow$
+    & EPE$_{\mathrm{wp}}\downarrow$ & EPE$_{\mathrm{m}}\downarrow$
+    & Yaw MAE ($^\circ$)$\downarrow$ & Yaw RMSE ($^\circ$)$\downarrow$ \\
+    \midrule
+    \multirow{4}{*}{Pixel + action}
+    & ID & 0.0966 & 0.1699 & 1.2589 & 0.3753 & 6.3057 & 11.1570 \\
+    & ID-CD & 0.0496 & 0.1136 & 0.8972 & 0.2621 & 3.6505 & 5.4844 \\
+    & OOD & 0.9720 & 0.4739 & 4.5175 & 3.2526 & 5.4041 & 8.0419 \\
+    & OOD-CD & 0.1925 & 0.1989 & 1.8174 & 0.7269 & 3.4042 & 4.8640 \\
+    \midrule
+    \multirow{4}{*}{Action only}
+    & ID & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+    & ID-CD & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+    & OOD & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+    & OOD-CD & \TBD & \TBD & \TBD & \TBD & \TBD & \TBD \\
+    \bottomrule
+  \end{tabular}
+
+  \vspace{7pt}
+  \textbf{(d) Cross-domain pixel degradation}\par\vspace{2pt}
+  \begin{tabular}{ll ccccc}
+    \toprule
+    Objective & Protocol & $\Delta$MSE $\downarrow$ & $\Delta$MAE $\downarrow$
+    & $\Delta$PSNR $\downarrow$ & $\Delta$SSIM $\downarrow$
+    & $\Delta$LPIPS $\downarrow$ \\
+    \midrule
+    \multirow{2}{*}{Pixel + action}
+    & ID-CD & 0.0270 & 0.0676 & 5.2853 & 0.1006 & 0.0705 \\
+    & OOD-CD & 0.0274 & 0.0653 & 4.6937 & 0.0837 & 0.0597 \\
+    \bottomrule
+  \end{tabular}
+
+  \vspace{3pt}
+  \parbox{0.96\textwidth}{\footnotesize
+  ID and OOD evaluate held-out RECON/SCAND/HuRoN and TartanDrive,
+  respectively. CD transfers action-matched latents across domains. Results
+  macro-average non-zero offsets in $\{-8,-6,-4,-2,2,4,6,8\}$ and then
+  macro-average conditions within each protocol. Pixel + action reports the
+  nav1 checkpoint as single-checkpoint point estimates. For degradation,
+  $\Delta$MSE, $\Delta$MAE, and
+  $\Delta$LPIPS are swapped minus oracle, whereas $\Delta$PSNR and
+  $\Delta$SSIM are oracle minus swapped; thus lower is better for every
+  degradation column.}
+\end{table*}
+
+\noindent\textbf{Navigation LAM result.}
+For nav1 Pixel + action, cross-domain latent swapping increases RGB MSE by
+0.0270 on ID-CD and 0.0274 on OOD-CD relative to oracle decoding. The
+corresponding LPIPS degradations are 0.0705 and 0.0597. Action reconstruction
+is most difficult on direct OOD data (nMSE 0.9720 and EPE$_{\mathrm{wp}}$
+4.5175), while the other three protocols have substantially smaller errors.
+
+% =============================================================================
+% Table 5a: downstream effect of the LAM objective -- prediction/generalization.
+% No v1/v2 column; LAM data and NWM fine-tuning are fixed.
+% =============================================================================
+\begin{table*}[t]
+  \tablepart{a}
+  \caption{Downstream NWM prediction with different LAM objectives. All LAMs
+  use RECON, SCAND, and HuRoN; NWM pretraining and Reset fine-tuning are fixed.
+  Results are evaluated at 4\,s.}
+  \label{tab:lam_downstream_prediction}
+  \centering
+  \small
+  \setlength{\tabcolsep}{6pt}
+  \renewcommand{\arraystretch}{1.02}
+  \begin{tabular}{llccc}
+    \toprule
+    LAM objective & Evaluation & \LPIPS & \DreamSim & \PSNR \\
+    \midrule
+    \multirow{4}{*}{Pixel}
+    & Single-step (RECON) & \TBD & \TBD & \TBD \\
+    & Rollout 1\,FPS (RECON) & \TBD & \TBD & \TBD \\
+    & Rollout 4\,FPS (RECON) & \TBD & \TBD & \TBD \\
+    & Unseen (\UnseenData{}) & \TBD & \TBD & \TBD \\
+    \midrule
+    \multirow{4}{*}{Pixel + action}
+    & Single-step (RECON) & \TBD & \TBD & \TBD \\
+    & Rollout 1\,FPS (RECON) & \TBD & \TBD & \TBD \\
+    & Rollout 4\,FPS (RECON) & \TBD & \TBD & \TBD \\
+    & Unseen (\UnseenData{}) & \TBD & \TBD & \TBD \\
+    \midrule
+    \multirow{4}{*}{DINO}
+    & Single-step (RECON) & \TBD & \TBD & \TBD \\
+    & Rollout 1\,FPS (RECON) & \TBD & \TBD & \TBD \\
+    & Rollout 4\,FPS (RECON) & \TBD & \TBD & \TBD \\
+    & Unseen (\UnseenData{}) & \TBD & \TBD & \TBD \\
+    \midrule
+    \multirow{4}{*}{Action only}
+    & Single-step (RECON) & \TBD & \TBD & \TBD \\
+    & Rollout 1\,FPS (RECON) & \TBD & \TBD & \TBD \\
+    & Rollout 4\,FPS (RECON) & \TBD & \TBD & \TBD \\
+    & Unseen (\UnseenData{}) & \TBD & \TBD & \TBD \\
+    \bottomrule
+  \end{tabular}
+\end{table*}
+
+% =============================================================================
+% Table 5b: downstream effect of the LAM objective -- planning.
+% =============================================================================
+\begin{table*}[t]
+  \continuedtablepart{b}
+  \caption{Downstream NWM planning with different LAM objectives. Lower is
+  better.}
+  \label{tab:lam_downstream_planning}
+  \centering
+  \small
+  \setlength{\tabcolsep}{8pt}
+  \renewcommand{\arraystretch}{1.06}
+  \begin{tabular}{l cc cc}
+    \toprule
+    & \multicolumn{2}{c}{RECON} & \multicolumn{2}{c}{SCAND} \\
+    \cmidrule(lr){2-3}\cmidrule(l){4-5}
+    LAM objective & ATE $\downarrow$ & RPE $\downarrow$
+    & ATE $\downarrow$ & RPE $\downarrow$ \\
+    \midrule
+    Pixel & \TBD & \TBD & \TBD & \TBD \\
+    Pixel + action & \TBD & \TBD & \TBD & \TBD \\
+    DINO & \TBD & \TBD & \TBD & \TBD \\
+    Action only & \TBD & \TBD & \TBD & \TBD \\
+    \bottomrule
+  \end{tabular}
+\end{table*}
+
+\end{document}

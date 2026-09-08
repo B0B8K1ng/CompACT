@@ -9,8 +9,10 @@ from __future__ import annotations
 import gc
 import logging
 import os
+import uuid
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
+from time import time
 from typing import Any
 
 import torch
@@ -22,7 +24,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from hydra.utils import get_original_cwd
 
 from data_utils import create_dataloader, prepare_datasets
+from misc import get_unnormalize
 from train_utils import (
+    evaluate,
     sample_precomputed_vae_posterior,
     setup_diffusion,
     setup_model,
@@ -196,15 +200,125 @@ def _checkpoint_payload(
 
 
 def save_two_stage_checkpoint(path: str, **kwargs: Any) -> str:
-    """Save one exact substage checkpoint (rank zero only)."""
-    os.makedirs(os.path.dirname(os.path.realpath(path)), exist_ok=True)
+    """Atomically save one exact substage checkpoint (rank zero only)."""
+    final_path = os.path.abspath(os.fspath(path))
+    checkpoint_dir = os.path.dirname(final_path)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    temporary_path = os.path.join(
+        checkpoint_dir,
+        f".{os.path.basename(final_path)}.{uuid.uuid4().hex}.tmp",
+    )
     payload = _checkpoint_payload(**kwargs)
-    torch.save(payload, path)
-    del payload
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    try:
+        torch.save(payload, temporary_path)
+        os.replace(temporary_path, final_path)
+    finally:
+        if os.path.lexists(temporary_path):
+            os.unlink(temporary_path)
+        del payload
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     return path
+
+
+def _periodic_checkpoint_due(
+    *,
+    training_stage: str,
+    current_steps: int,
+    global_steps: int,
+    target_steps: int,
+    interval: int,
+) -> bool:
+    """Return whether this step should publish a periodic checkpoint."""
+    if interval <= 0:
+        raise ValueError("ckpt_every must be positive")
+    if training_stage == "real_finetune":
+        return (
+            current_steps > 0
+            and current_steps % interval == 0
+            and current_steps < target_steps
+        )
+    return global_steps > 0 and global_steps % interval == 0
+
+
+def _evaluation_due(
+    *,
+    global_steps: int,
+    interval: int,
+    eval_at_first_step: bool,
+) -> bool:
+    """Match the legacy training-loop evaluation schedule."""
+    global_steps = int(global_steps)
+    interval = int(interval)
+    if global_steps < 0:
+        raise ValueError("global_steps must be non-negative")
+    return bool(
+        (interval > 0 and global_steps % interval == 0)
+        or (eval_at_first_step and global_steps == 1)
+    )
+
+
+def _retained_stage2_checkpoint_path(
+    checkpoint_dir: str,
+    substage: str,
+    current_steps: int,
+) -> str:
+    """Build the stable per-substage checkpoint path used by Stage 2."""
+    if substage not in {"warmup", "joint"}:
+        raise ValueError(f"Unsupported retained stage-2 substage: {substage!r}")
+    if current_steps < 0:
+        raise ValueError("current_steps must be non-negative")
+    return os.path.join(
+        checkpoint_dir,
+        f"{substage}_{current_steps:07d}.pth.tar",
+    )
+
+
+def _atomic_update_latest_checkpoint(target_path: str, latest_path: str) -> None:
+    """Atomically point latest at a retained checkpoint using a relative link."""
+    target_path = os.path.abspath(os.fspath(target_path))
+    latest_path = os.path.abspath(os.fspath(latest_path))
+    latest_dir = os.path.dirname(latest_path)
+    os.makedirs(latest_dir, exist_ok=True)
+    temporary_link = os.path.join(
+        latest_dir,
+        f".{os.path.basename(latest_path)}.{uuid.uuid4().hex}.tmp",
+    )
+    try:
+        os.symlink(os.path.relpath(target_path, latest_dir), temporary_link)
+        os.replace(temporary_link, latest_path)
+    finally:
+        if os.path.lexists(temporary_link):
+            os.unlink(temporary_link)
+
+
+def _save_training_checkpoint(
+    checkpoint_dir: str,
+    *,
+    training_stage: str,
+    substage: str,
+    current_steps: int,
+    **kwargs: Any,
+) -> str:
+    """Save a retained Stage-2 checkpoint or the legacy Stage-1 latest file."""
+    latest_path = os.path.join(checkpoint_dir, "latest.pth.tar")
+    if training_stage == "real_finetune":
+        checkpoint_path = _retained_stage2_checkpoint_path(
+            checkpoint_dir,
+            substage,
+            current_steps,
+        )
+    else:
+        checkpoint_path = latest_path
+    save_two_stage_checkpoint(
+        checkpoint_path,
+        substage=substage,
+        **kwargs,
+    )
+    if training_stage == "real_finetune":
+        _atomic_update_latest_checkpoint(checkpoint_path, latest_path)
+    return checkpoint_path
 
 
 def _proxy_metrics_state(metrics: ProxyMetrics) -> dict[str, float]:
@@ -560,6 +674,22 @@ def _should_check_first_step_gradients(
     return True
 
 
+def _defer_random_init_gradient_check(config, substage, completed_substage_steps):
+    """Allow fresh zero-initialized CDiT layers to open before checking E_real.
+
+    On the first joint backward only the zero-initialized output projection can
+    receive a gradient.  The second backward opens the zero-initialized adaLN
+    paths, and the third is the first one on which E_real can be required to
+    have a nonzero gradient.
+    """
+    random_init = bool(config.get("finetune", {}).get("random_init", False))
+    return (
+        random_init
+        and substage == "joint"
+        and int(completed_substage_steps) < 2
+    )
+
+
 def _validate_resume_metadata(metadata, training_stage, action_mode, scheme):
     recorded_stage = str(metadata.get("training_stage", ""))
     if recorded_stage != training_stage:
@@ -807,17 +937,26 @@ def _load_ema_and_training_state(checkpoint_path, ema, scheduler, scaler):
     return checkpoint
 
 
-def _prepare_loader(config, rank, substage):
+def _prepare_loader(config, rank, substage, *, include_eval=False):
     stage = str(config.training_stage)
     if stage == "proxy_pretrain":
         from data_utils import prepare_proxy_pretrain_dataset
 
         dataset = prepare_proxy_pretrain_dataset(config)
+        eval_dataset = None
     else:
-        dataset, _ = prepare_datasets(
-            config, finetune_substage=substage, include_test=False
+        dataset, eval_dataset = prepare_datasets(
+            config,
+            finetune_substage=substage,
+            include_test=bool(include_eval),
         )
-    return (*create_dataloader(dataset, config, rank, is_train=True), dataset)
+    loader, sampler = create_dataloader(dataset, config, rank, is_train=True)
+    eval_loader = None
+    if eval_dataset is not None:
+        eval_loader, _ = create_dataloader(
+            eval_dataset, config, rank, is_train=False
+        )
+    return loader, sampler, dataset, eval_loader, eval_dataset
 
 
 def run_two_stage_training(config, device, rank, local_gpu, experiment_dir, log=None):
@@ -859,15 +998,26 @@ def run_two_stage_training(config, device, rank, local_gpu, experiment_dir, log=
         )
     elif training_stage == "real_finetune":
         stage1_path = config.finetune.get("stage1_checkpoint", None)
-        if not stage1_path:
+        random_init = bool(config.finetune.get("random_init", False))
+        if random_init:
+            # setup_model constructs CDiT and every motion adapter with their
+            # standard fresh initialization. Deliberately do not touch any NWM
+            # checkpoint here; validate_two_stage_config also rejects a path.
+            log.info(
+                "Strict no-pretrain initialization: fresh CDiT and real-action "
+                "adapter weights (seed=%s); no NWM checkpoint loaded",
+                config.get("seed", 0),
+            )
+        elif not stage1_path:
             raise ValueError("real_finetune requires finetune.stage1_checkpoint")
-        stage1_path = _resolve_user_path(stage1_path)
-        summary = load_stage1_weights(raw_model, stage1_path, config)
-        log.info(
-            "Stage-1 initialization loaded modules=%s skipped=%s",
-            summary["loaded_modules"],
-            summary["skipped_modules"],
-        )
+        else:
+            stage1_path = _resolve_user_path(stage1_path)
+            summary = load_stage1_weights(raw_model, stage1_path, config)
+            log.info(
+                "Stage-1 initialization loaded modules=%s skipped=%s",
+                summary["loaded_modules"],
+                summary["skipped_modules"],
+            )
 
     ema = deepcopy(raw_model).to(device).eval()
     for parameter in ema.parameters():
@@ -880,6 +1030,36 @@ def run_two_stage_training(config, device, rank, local_gpu, experiment_dir, log=
     )
     if resume_path:
         _load_ema_and_training_state(resume_path, ema, None, scaler)
+
+    eval_interval = int(config.get("eval_every", 0))
+    eval_at_first_step = bool(config.get("eval_at_first_step", True))
+    eval_enabled = bool(
+        training_stage == "real_finetune"
+        and (eval_interval > 0 or eval_at_first_step)
+    )
+    eval_tokenizer = None
+    if eval_enabled:
+        # Cached posteriors are a training-only optimization. The legacy
+        # evaluator needs RGB inputs and a real VAE to encode conditions and
+        # decode predictions, while training keeps its lightweight tokenizer.
+        if bool(
+            config.dataset.get("precomputed_latents", {}).get("enabled", False)
+        ):
+            training_rng_state = capture_rng_state()
+            try:
+                eval_tokenizer = setup_tokenizer(config, device)
+            finally:
+                restore_rng_state(training_rng_state)
+        else:
+            eval_tokenizer = tokenizer
+        eval_tokenizer.eval()
+        for parameter in eval_tokenizer.parameters():
+            parameter.requires_grad_(False)
+        log.info(
+            "Stage-2 legacy eval enabled: first_step=%s interval=%d model=EMA",
+            eval_at_first_step,
+            eval_interval,
+        )
 
     completed_warmup = int((resume_metadata or {}).get("completed_warmup_steps", 0))
     completed_joint = int((resume_metadata or {}).get("completed_joint_steps", 0))
@@ -973,7 +1153,12 @@ def run_two_stage_training(config, device, rank, local_gpu, experiment_dir, log=
         compiled = torch.compile(raw_model) if bool(config.get("torch_compile", False)) else raw_model
         model = DDP(compiled, device_ids=[local_gpu], find_unused_parameters=False)
         model.train()
-        loader, sampler, dataset = _prepare_loader(config, rank, substage)
+        loader, sampler, dataset, eval_loader, eval_dataset = _prepare_loader(
+            config,
+            rank,
+            substage,
+            include_eval=eval_enabled,
+        )
         if rank == 0 and getattr(dataset, "recipe_summary", None) is not None:
             recipe_summary = dataset.recipe_summary
             log.info("Frozen NavAnywhere sampling recipe: %s", recipe_summary)
@@ -1110,7 +1295,12 @@ def run_two_stage_training(config, device, rank, local_gpu, experiment_dir, log=
                     training_stage=training_stage,
                     scheme=scheme,
                     substage=substage,
-                    check_gradients=not checked_gradients,
+                    check_gradients=(
+                        not checked_gradients
+                        and not _defer_random_init_gradient_check(
+                            config, substage, current
+                        )
+                    ),
                 )
                 checked_gradients = checked_gradients or bool(
                     logs.pop("gradient_check_performed", False)
@@ -1155,13 +1345,21 @@ def run_two_stage_training(config, device, rank, local_gpu, experiment_dir, log=
                         _wandb_log(
                             config, rank, wandb_values, global_steps
                         )
-                if global_steps % int(config.get("ckpt_every", 10000)) == 0:
+                if _periodic_checkpoint_due(
+                    training_stage=training_stage,
+                    current_steps=current,
+                    global_steps=global_steps,
+                    target_steps=target_steps,
+                    interval=int(config.get("ckpt_every", 10000)),
+                ):
                     runtime_states = _gather_runtime_states(
                         proxy_metrics, valid_alignment_batches
                     )
                     if rank == 0:
-                        save_two_stage_checkpoint(
-                            os.path.join(checkpoint_dir, "latest.pth.tar"),
+                        _save_training_checkpoint(
+                            checkpoint_dir,
+                            training_stage=training_stage,
+                            current_steps=current,
                             model=model,
                             ema=ema,
                             optimizer=optimizer,
@@ -1179,6 +1377,63 @@ def run_two_stage_training(config, device, rank, local_gpu, experiment_dir, log=
                             data_fingerprint=phase_data_fingerprint,
                         )
                     dist.barrier()
+                if eval_enabled and _evaluation_due(
+                    global_steps=global_steps,
+                    interval=eval_interval,
+                    eval_at_first_step=eval_at_first_step,
+                ):
+                    if eval_loader is None or eval_tokenizer is None:
+                        raise RuntimeError(
+                            "Stage-2 evaluation is enabled but its pixel eval "
+                            "loader or tokenizer was not created"
+                        )
+                    eval_start_time = time()
+                    save_dir = os.path.join(
+                        experiment_dir, "viz", str(global_steps)
+                    )
+                    # Sampling consumes Python/NumPy/torch RNG. Restore every
+                    # stream afterward so eval cannot alter training or exact
+                    # checkpoint-resume behavior.
+                    training_rng_state = capture_rng_state()
+                    try:
+                        sim_score = evaluate(
+                            ema,
+                            eval_tokenizer,
+                            diffusion,
+                            eval_loader,
+                            rank,
+                            int(config.model.generator.input_size),
+                            device,
+                            save_dir,
+                            int(config.seed),
+                            bool(config.get("bfloat16", False)),
+                            int(config.dataset.context_size),
+                            get_unnormalize(
+                                config.dataset.mean, config.dataset.std
+                            ),
+                        )
+                    finally:
+                        restore_rng_state(training_rng_state)
+                    dist.barrier()
+                    eval_time = time() - eval_start_time
+                    log.info(
+                        "(step=%07d) Perceptual Loss: %.4f, Eval Time: %.2f",
+                        global_steps,
+                        float(sim_score),
+                        eval_time,
+                    )
+                    if rank == 0:
+                        _wandb_log(
+                            config,
+                            rank,
+                            {
+                                "eval/perceptual_loss": sim_score,
+                                "eval/eval_time": eval_time,
+                                "eval/step": global_steps,
+                                "epoch": epoch,
+                            },
+                            global_steps,
+                        )
                 if current >= target_steps:
                     break
             finished_epoch = epoch
@@ -1217,8 +1472,10 @@ def run_two_stage_training(config, device, rank, local_gpu, experiment_dir, log=
             proxy_metrics, valid_alignment_batches
         )
         if rank == 0:
-            save_two_stage_checkpoint(
-                os.path.join(checkpoint_dir, "latest.pth.tar"),
+            _save_training_checkpoint(
+                checkpoint_dir,
+                training_stage=training_stage,
+                current_steps=current,
                 model=model,
                 ema=ema,
                 optimizer=optimizer,
@@ -1236,7 +1493,17 @@ def run_two_stage_training(config, device, rank, local_gpu, experiment_dir, log=
                 data_fingerprint=phase_data_fingerprint,
             )
         dist.barrier()
-        del loader, sampler, dataset, model, compiled, optimizer, scheduler
+        del (
+            loader,
+            sampler,
+            dataset,
+            eval_loader,
+            eval_dataset,
+            model,
+            compiled,
+            optimizer,
+            scheduler,
+        )
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

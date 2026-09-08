@@ -24,6 +24,10 @@ from navanywhere_recipe import (
     load_sampling_recipe,
     scan_trajectory_frames,
 )
+
+
+IMAGE_READ_ATTEMPTS = 3
+IMAGE_READ_RETRY_DELAY_SECONDS = 0.25
 from precompute_vae_latents import (
     DEFAULT_SCALING_FACTOR,
     FORMAT_NAME,
@@ -205,11 +209,18 @@ def _cache_record(
     )
     if tuple(mean.shape) != expected_shape:
         raise ValueError(f"posterior shape {tuple(mean.shape)} != {expected_shape}")
-    if payload["metadata"] != expected_metadata:
-        raise ValueError("file metadata mismatch")
+    metadata = payload["metadata"]
+    if not isinstance(metadata, dict):
+        raise TypeError("file metadata is not a mapping")
+    for key, expected in expected_metadata.items():
+        if metadata.get(key) != expected:
+            raise ValueError(f"file metadata.{key} mismatch")
+    substitutions = metadata.get("invalid_frame_substitutions", [])
+    if not isinstance(substitutions, list):
+        raise TypeError("file metadata.invalid_frame_substitutions is not a list")
     if not torch.isfinite(mean).all() or not torch.isfinite(logvar).all():
         raise ValueError("non-finite posterior statistics")
-    return {
+    record = {
         "source_id": task["source_id"],
         "trajectory_id": task["trajectory_id"],
         "frame_count": len(frames),
@@ -218,6 +229,9 @@ def _cache_record(
         "file_size_bytes": path.stat().st_size,
         "source_fingerprint": source_fingerprint,
     }
+    if substitutions:
+        record["invalid_frame_substitutions"] = substitutions
+    return record
 
 
 def _scan_task(state: dict[str, Any], task: dict[str, Any]) -> tuple[list[tuple[int, str]], str]:
@@ -235,6 +249,61 @@ def _scan_task(state: dict[str, Any], task: dict[str, Any]) -> tuple[list[tuple[
     return frames, _source_fingerprint(frames, trajectory_root)
 
 
+def _load_frame_with_fallback(
+    frames: list[tuple[int, str]], position: int, transform: Any
+) -> tuple[torch.Tensor, dict[str, Any] | None]:
+    """Load one frame, deterministically replacing an unreadable image.
+
+    The original path is retried to tolerate transient NAS reads.  A genuinely
+    unreadable source frame is replaced by the nearest readable frame, preferring
+    the previous frame on equal distance.  The caller persists this substitution
+    in the trajectory cache metadata.
+    """
+    candidate_positions = [position]
+    for distance in range(1, len(frames)):
+        previous = position - distance
+        following = position + distance
+        if previous >= 0:
+            candidate_positions.append(previous)
+        if following < len(frames):
+            candidate_positions.append(following)
+
+    original_error: OSError | None = None
+    attempted: list[str] = []
+    for candidate_position in candidate_positions:
+        candidate_index, candidate_path = frames[candidate_position]
+        attempts = IMAGE_READ_ATTEMPTS if candidate_position == position else 1
+        for attempt in range(attempts):
+            try:
+                image = load_image_tensor(Path(candidate_path), transform)
+                if candidate_position == position:
+                    return image, None
+                original_index, original_path = frames[position]
+                return image, {
+                    "frame_index": int(original_index),
+                    "frame_path": Path(original_path).name,
+                    "replacement_frame_index": int(candidate_index),
+                    "replacement_frame_path": Path(candidate_path).name,
+                    "reason": (
+                        f"{type(original_error).__name__}: {original_error}"
+                        if original_error is not None
+                        else "unreadable image"
+                    ),
+                }
+            except OSError as exc:
+                attempted.append(candidate_path)
+                if candidate_position == position:
+                    original_error = exc
+                if attempt + 1 < attempts:
+                    time.sleep(IMAGE_READ_RETRY_DELAY_SECONDS * (attempt + 1))
+
+    original_index, original_path = frames[position]
+    raise RuntimeError(
+        f"No readable replacement for frame {original_index} ({original_path}); "
+        f"attempted {len(attempted)} image reads"
+    ) from original_error
+
+
 def _compute_task(
     state: dict[str, Any],
     task: dict[str, Any],
@@ -245,9 +314,11 @@ def _compute_task(
     transform: Any,
     device: torch.device,
     loader_threads: int,
+    rank: int,
 ) -> dict[str, Any]:
     means: list[torch.Tensor] = []
     logvars: list[torch.Tensor] = []
+    substitutions: list[dict[str, Any]] = []
     batch_size = int(state["encoding"]["vae_batch_size"])
     pool = (
         ThreadPoolExecutor(max_workers=loader_threads)
@@ -256,13 +327,23 @@ def _compute_task(
     )
     with pool as executor:
         for start in range(0, len(frames), batch_size):
-            paths = [Path(item[1]) for item in frames[start : start + batch_size]]
+            positions = list(range(start, min(start + batch_size, len(frames))))
             if executor is None:
-                images = [load_image_tensor(path, transform) for path in paths]
+                loaded = [
+                    _load_frame_with_fallback(frames, position, transform)
+                    for position in positions
+                ]
             else:
-                images = list(
-                    executor.map(lambda path: load_image_tensor(path, transform), paths)
+                loaded = list(
+                    executor.map(
+                        lambda position: _load_frame_with_fallback(
+                            frames, position, transform
+                        ),
+                        positions,
+                    )
                 )
+            images = [item[0] for item in loaded]
+            substitutions.extend(item[1] for item in loaded if item[1] is not None)
             mean, logvar = encode_fixed_batch(
                 vae,
                 images,
@@ -275,6 +356,18 @@ def _compute_task(
             logvars.append(logvar)
     mean = torch.cat(means, dim=0).contiguous()
     logvar = torch.cat(logvars, dim=0).contiguous()
+    metadata = _file_metadata(state, source_fingerprint)
+    if substitutions:
+        substitutions.sort(key=lambda item: int(item["frame_index"]))
+        metadata["invalid_frame_substitutions"] = substitutions
+        for item in substitutions:
+            log(
+                rank,
+                "replaced unreadable frame "
+                f"{task['source_id']}/{task['trajectory_id']}/"
+                f"{item['frame_path']} with {item['replacement_frame_path']}: "
+                f"{item['reason']}",
+            )
     payload = {
         "schema_version": SCHEMA_VERSION,
         "format": FORMAT_NAME,
@@ -285,7 +378,7 @@ def _compute_task(
         ),
         "posterior_mean": mean,
         "posterior_logvar": logvar,
-        "metadata": _file_metadata(state, source_fingerprint),
+        "metadata": metadata,
     }
     output = _safe_path(
         Path(state["output_root"]), task["source_id"], task["trajectory_id"], ".pt"
@@ -367,6 +460,15 @@ def _write_completion(
             "manifest_sha256": sha256_file(manifest),
         }
     complete = not partial and len(all_records) == len(state["recipe"]["trajectories"])
+    substitutions = [
+        {
+            "source_id": record["source_id"],
+            "trajectory_id": record["trajectory_id"],
+            **substitution,
+        }
+        for record in all_records
+        for substitution in record.get("invalid_frame_substitutions", [])
+    ]
     metadata = {
         "schema_version": SCHEMA_VERSION,
         "format": FORMAT_NAME,
@@ -394,7 +496,9 @@ def _write_completion(
         "totals": {
             "trajectories": len(all_records),
             "frames": sum(int(record["frame_count"]) for record in all_records),
+            "invalid_frame_substitutions": len(substitutions),
         },
+        "invalid_frame_substitutions": substitutions,
     }
     metadata_path = output_root / "metadata.json"
     atomic_write_json(metadata_path, metadata)
@@ -494,6 +598,7 @@ def main() -> None:
                 transform=transform,
                 device=device,
                 loader_threads=args.loader_threads,
+                rank=rank,
             )
         records.append(record)
         if task_index % max(1, args.log_every_trajectories) == 0:

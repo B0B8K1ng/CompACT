@@ -51,6 +51,60 @@ not constrain the later training batch size: cached posterior statistics are
 stored per frame. In cached mode the trainer also does not load the VAE weights
 onto each training GPU; it retains only the recorded posterior scaling factor.
 
+### nav1 PixelActionLAM proxy for LatentPT
+
+LatentPT additionally needs a local-pair proxy cache. The dedicated launcher
+loads the nav1 `PixelActionLAM` checkpoint, applies its exact 240x320 RGB
+preprocessing, and stores the raw deterministic 32-D posterior mean `z_mu`.
+The supervised three-dimensional pixel-action decoder is not used.
+
+First run a small smoke extraction into a separate output root:
+
+```bash
+EXPERIMENT_NAME=nav1-latent-smoke \
+GPU_IDS=0 NPROC=1 MAX_TRAJECTORIES=4 \
+OUTPUT_ROOT=/file_system/nas/algorithm/dujun.nie/nwm/compact/cache/nav1-latent-smoke \
+./precompute_navanywhere_nav1_latent_actions_8gpu.sh
+```
+
+Then launch the resumable full eight-GPU extraction:
+
+```bash
+EXPERIMENT_NAME=nav1-latent-full \
+./precompute_navanywhere_nav1_latent_actions_8gpu.sh
+```
+
+The full cache defaults to
+`/file_system/nas/algorithm/dujun.nie/nwm/compact/cache/navanywhere_nav1_pixel_action_step100000`.
+Each trajectory stores `frame_pairs` as the numeric IDs parsed from the JPEG
+filenames, not zero-based positions, and `motion` as float32 `[num_pairs, 32]`.
+Every existing target within `[-8,8]` is included so strict loading remains
+valid as epoch-dependent goals change. Cache metadata binds the source frame
+inventory, sampling recipe, checkpoint SHA-256, preprocessing, precision, and
+pair policy; a complete run publishes `_SUCCESS.json`.
+
+Before extracting, the same launcher can run a CPU-only plan replay. It uses
+the actual PyTorch `DistributedSampler` contract and the goal-sampling function
+shared with `NavAnywhereDataset`, then deduplicates only the local pairs that a
+200k-step LatentPT run will request:
+
+```bash
+PLAN_ONLY=1 EXPERIMENT_NAME=nav1-latent-plan \
+./precompute_navanywhere_nav1_latent_actions_8gpu.sh
+```
+
+The default plan is fixed to the completed TimePT/GeoPT contract: eight ranks,
+batch size 16 per rank, 200k steps, and recipe seed 20260901. It fails unless
+both completed reference logs agree on the launch contract and every completed
+epoch's total count and local-pair count. It also checks the GeoPT absolute
+offset sum reconstructed from the logged mean against the exact integer replay,
+allowing only the bounded float32 rounding introduced by the eight-rank NCCL
+reduction. The JSON report defaults to
+`/file_system/nas/algorithm/dujun.nie/nwm/compact/plans/navanywhere_latent_action_seed20260901_ws8_bs16_steps200000.json`.
+`PLAN_WORLD_SIZE`, `PLAN_TRAIN_BATCH_SIZE`, and `PLAN_MAX_TRAIN_STEPS` may be
+overridden for a different future run, but such a plan intentionally cannot be
+validated against reference logs from a different contract.
+
 ## 2. Coverage-oriented sampling recipe
 
 The recipe is a compact, versioned JSON file, not a huge expanded pair list.
@@ -169,7 +223,7 @@ IDM_PROXY_ROOT=/path/to/idm-proxy \
 
 STAGE1_MODE=latentpt EXPERIMENT_NAME=nwm-latentpt-nav-v1 \
 SAMPLING_RECIPE=/file_system/nas/algorithm/dujun.nie/nwm/compact/recipes/nav-balanced.json \
-LATENT_PROXY_ROOT=/path/to/dreamdojo-latent-proxy \
+LATENT_PROXY_ROOT=/file_system/nas/algorithm/dujun.nie/nwm/compact/cache/navanywhere_nav1_pixel_action_step100000 \
 ./run_navanywhere_stage1.sh
 ```
 

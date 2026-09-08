@@ -6,6 +6,9 @@ defaults:
 training_stage: real_finetune
 action_mode: real
 
+training:
+  num_workers: 8
+
 # Scheme C reuses E_z but deliberately has no ground-truth latent cache.
 proxy:
   type: latent

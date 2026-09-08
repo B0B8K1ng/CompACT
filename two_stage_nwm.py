@@ -126,6 +126,24 @@ def validate_two_stage_config(config: Any) -> tuple[str, str, str | None]:
         raise ValueError("real_finetune must use action_mode=real")
     finetune = config_get(config, "finetune", {})
     scheme = normalize_finetune_scheme(config_get(finetune, "scheme", "reset"))
+    random_init = bool(config_get(finetune, "random_init", False))
+    if random_init:
+        if scheme != "reset":
+            raise ValueError(
+                "finetune.random_init=true requires finetune.scheme=reset"
+            )
+        if str(config_get(proxy, "type", "none")) != "none":
+            raise ValueError("finetune.random_init=true requires proxy.type=none")
+        if config_get(finetune, "stage1_checkpoint", None):
+            raise ValueError(
+                "finetune.random_init=true forbids finetune.stage1_checkpoint"
+            )
+        if int(config_get(finetune, "warmup_steps", 0)) != 0:
+            raise ValueError(
+                "finetune.random_init=true requires finetune.warmup_steps=0: "
+                "a fresh CDiT's zero-initialized output/adaLN layers block "
+                "adapter-only warmup gradients"
+            )
     if scheme in {"embedding_align", "real_to_latent"}:
         if str(config_get(proxy, "type", "")) != "latent":
             raise ValueError(f"{scheme} requires proxy.type=latent")

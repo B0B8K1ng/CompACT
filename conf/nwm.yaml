@@ -8,9 +8,11 @@ defaults:
   - model/tokenizer: sdvae
   - model/diffusion: gaussian
   - motion_condition: default
-  - optional two_stage: null
   - training: nwm
   - scheduler: default
+  # Load an optional stage overlay last so its stage-specific training defaults
+  # (for example Stage-2 worker count) override the shared baseline.
+  - optional two_stage: null
   - override hydra/job_logging: colorlog
   - override hydra/hydra_logging: colorlog
 

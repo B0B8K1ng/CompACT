@@ -68,6 +68,48 @@ MODELS = {
             "tartan_drive",
         ],
     },
+    "nwm-timept-ft": {
+        "architecture": "CDiT-B/2 + SD-VAE + TimePT adapter reset fine-tune",
+        "exp_dir": "/file_system/nas/algorithm/dujun.nie/nwm/compact/runs/navanywherev1_timept_ft/nwm-nav1-timept-finetune",
+        "checkpoint_id": "joint_0100000",
+        "checkpoint": "/file_system/nas/algorithm/dujun.nie/nwm/compact/runs/navanywherev1_timept_ft/nwm-nav1-timept-finetune/checkpoints/joint_0100000.pth.tar",
+        "checkpoint_step": 110000,
+        "sha256": "34332c5b130eb0bceab3ccdb21489d1e61bb1bd30e1bfca0e04b3050285842aa",
+        "training_datasets": ["recon", "sacson", "scand", "tartan_drive"],
+        "provenance": {
+            "stage1": "NavAnywhere-v1 TimePT",
+            "fine_tune_scheme": "adapter reset; 10k warmup + 100k joint steps",
+        },
+    },
+    "nwm-geopt-ft": {
+        "architecture": "CDiT-B/2 + SD-VAE + GeoPT adapter reset fine-tune",
+        "exp_dir": "/file_system/nas/algorithm/dujun.nie/nwm/compact/runs/navanywherev1_geopt_ft/nwm-nav1-geopt-finetune",
+        "checkpoint_id": "joint_0100000",
+        "checkpoint": "/file_system/nas/algorithm/dujun.nie/nwm/compact/runs/navanywherev1_geopt_ft/nwm-nav1-geopt-finetune/checkpoints/joint_0100000.pth.tar",
+        "checkpoint_step": 110000,
+        "sha256": "4915124400ae8042c6616c645d0ab296ee508090fb18258feace417bd15b041a",
+        "training_datasets": ["recon", "sacson", "scand", "tartan_drive"],
+        "provenance": {
+            "stage1": "NavAnywhere-v1 GeoPT",
+            "stage1_checkpoint": "/file_system/nas/algorithm/dujun.nie/nwm/compact/runs/navanywhere_stage1/nwm-geopt/checkpoints/latest.pth.tar",
+            "fine_tune_scheme": "adapter reset; 10k warmup + 100k joint steps",
+            "training_complete_at": "2026-09-07T03:32:21Z",
+        },
+    },
+    "nwm-no-pretrain": {
+        "architecture": "CDiT-B/2 + SD-VAE + real-motion adapter, trained from scratch",
+        "exp_dir": "/file_system/nas/algorithm/dujun.nie/nwm/compact/runs/no_pretrain_ft/nwm-no-pretrain-finetune",
+        "checkpoint_id": "joint_0110000",
+        "checkpoint": "/file_system/nas/algorithm/dujun.nie/nwm/compact/runs/no_pretrain_ft/nwm-no-pretrain-finetune/checkpoints/joint_0110000.pth.tar",
+        "checkpoint_step": 110000,
+        "sha256": "b5c914d39cf1d9ce059fb39131bf514716f2136cc7a3d9b6db1a177ceeba8787",
+        "training_datasets": ["recon", "sacson", "scand", "tartan_drive"],
+        "provenance": {
+            "initialization": "fresh CDiT and real-action adapter weights; no NWM checkpoint loaded",
+            "fine_tune_scheme": "0 warmup + 110k joint steps",
+            "training_complete_at": "2026-09-06T20:45:11Z",
+        },
+    },
 }
 
 PROTOCOLS = {
@@ -94,6 +136,63 @@ PROTOCOLS = {
         "diffusion_steps": 250,
         "seed": 0,
         "paper_comparison_caveat": "NWM paper reports five-sample mean for CDiT-XL; local models are CDiT-B single-seed checkpoints",
+        "metrics": {
+            "lpips_alex": "lower",
+            "dreamsim": "lower",
+            "psnr": "higher",
+        },
+    },
+    "go_stanford_unseen_rollout_v1": {
+        "category": "unseen_generalization",
+        "dataset": "go_stanford",
+        "evaluation": ["rollout_1fps", "rollout_4fps"],
+        "split": "data_splits/go_stanford/test/rollout.pkl",
+        "split_sha256": "e48af806e991d465f8b04f4dd106ff9b8db55cd65303831ee31e71dbef95cc23",
+        "sample_count": 150,
+        "input_fps": 4,
+        "rollout_fps": [1, 4],
+        "horizons_seconds": [1, 2, 4, 8, 16],
+        "diffusion_steps": 250,
+        "seed": 0,
+        "autoregressive": True,
+        "execution": {
+            "distributed_world_size": 2,
+            "batch_size_per_rank": 64,
+            "use_efficient_rollout": True,
+        },
+        "visualization_sample_ids": [0, 21, 43, 64, 86, 107, 129, 149],
+        "metrics": {
+            "lpips_alex": "lower",
+            "dreamsim": "lower",
+            "psnr": "higher",
+        },
+    },
+    "go_stanford_unseen_rollout_10_v1": {
+        "category": "unseen_generalization",
+        "dataset": "go_stanford",
+        "evaluation": ["rollout_10_1fps", "rollout_10_4fps"],
+        "source_evaluations": {
+            "rollout_10_1fps": "rollout_1fps",
+            "rollout_10_4fps": "rollout_4fps",
+        },
+        "split": "data_splits/go_stanford/test/rollout.pkl",
+        "split_sha256": "e48af806e991d465f8b04f4dd106ff9b8db55cd65303831ee31e71dbef95cc23",
+        "source_sample_count": 150,
+        "sample_indices": list(range(10)),
+        "selected_entries_sha256": "9cecd790344ab5ffe9bddb7a429be61a91cc26d04f51971114fd83541a85f9cc",
+        "sample_count": 10,
+        "input_fps": 4,
+        "rollout_fps": [1, 4],
+        "horizons_seconds": [1, 2, 4, 8, 16],
+        "diffusion_steps": 250,
+        "seed": 0,
+        "autoregressive": True,
+        "execution": {
+            "distributed_world_size": 2,
+            "batch_size_per_rank": 64,
+            "use_efficient_rollout": True,
+        },
+        "visualization_sample_ids": list(range(10)),
         "metrics": {
             "lpips_alex": "lower",
             "dreamsim": "lower",
@@ -268,7 +367,12 @@ def register_model(
 
 
 def import_prediction(
-    registry: dict[str, Any], model_name: str, dataset: str, evaluation: str, audit: Path
+    registry: dict[str, Any],
+    model_name: str,
+    dataset: str,
+    evaluation: str,
+    audit: Path,
+    protocol: str | None = None,
 ) -> None:
     payload = json.loads(audit.read_text(encoding="utf-8"))
     if payload.get("dataset") != dataset or payload.get("eval_name") != evaluation:
@@ -278,7 +382,46 @@ def import_prediction(
         )
     model = require_model(registry, model_name)
     category = "recon_prediction" if dataset == "recon" else "unseen_generalization"
-    protocol = "recon_prediction_v1" if dataset == "recon" else "go_stanford_unseen_v1"
+    if protocol is None:
+        if dataset == "recon":
+            protocol = "recon_prediction_v1"
+        elif evaluation.startswith("rollout_10_"):
+            protocol = "go_stanford_unseen_rollout_10_v1"
+        elif evaluation.startswith("rollout_"):
+            protocol = "go_stanford_unseen_rollout_v1"
+        else:
+            protocol = "go_stanford_unseen_v1"
+    if protocol not in PROTOCOLS:
+        raise ValueError(f"Unknown prediction protocol: {protocol}")
+    protocol_config = PROTOCOLS[protocol]
+    protocol_evaluations = protocol_config.get("evaluation")
+    if isinstance(protocol_evaluations, str):
+        protocol_evaluations = [protocol_evaluations]
+    if protocol_evaluations is not None and evaluation not in protocol_evaluations:
+        raise ValueError(f"{evaluation} is not part of {protocol}")
+    expected_count = (
+        protocol_config["sample_counts"][evaluation]
+        if "sample_counts" in protocol_config
+        else protocol_config["sample_count"]
+    )
+    if evaluation == "time":
+        expected_frames = {"1s": 1, "2s": 2, "4s": 4, "8s": 8, "16s": 16}
+    elif evaluation.endswith("_1fps"):
+        expected_frames = {"1s": 0, "2s": 1, "4s": 3, "8s": 7, "16s": 15}
+    elif evaluation.endswith("_4fps"):
+        expected_frames = {"1s": 3, "2s": 7, "4s": 15, "8s": 31, "16s": 63}
+    else:
+        raise ValueError(f"Unknown prediction evaluation: {evaluation}")
+    if payload.get("sample_count") != expected_count:
+        raise ValueError(
+            f"Audit sample count does not match {protocol}: "
+            f"expected {expected_count}, got {payload.get('sample_count')}"
+        )
+    if payload.get("frame_indices") != expected_frames:
+        raise ValueError(
+            f"Audit frame indices do not match {protocol}/{evaluation}: "
+            f"expected {expected_frames}, got {payload.get('frame_indices')}"
+        )
     model["results"].setdefault(category, {}).setdefault(dataset, {})[evaluation] = {
         "protocol": protocol,
         "source_audit": str(audit.resolve()),
@@ -451,22 +594,31 @@ def render_markdown(registry: dict[str, Any]) -> str:
             "",
             "## Go Stanford unseen (all measured horizons)",
             "",
-            "| Model | Horizon | LPIPS | DreamSim | PSNR | Samples |",
-            "|---|---:|---:|---:|---:|---:|",
+            "| Model | Mode | Horizon | LPIPS | DreamSim | PSNR | Samples |",
+            "|---|---|---:|---:|---:|---:|---:|",
         ]
     )
     for model_name, model in registry["models"].items():
-        result = (
+        evaluations = (
             model.get("results", {})
             .get("unseen_generalization", {})
             .get("go_stanford", {})
-            .get("time")
         )
-        if result:
+        for evaluation in (
+            "time",
+            "rollout_10_1fps",
+            "rollout_10_4fps",
+            "rollout_1fps",
+            "rollout_4fps",
+        ):
+            result = evaluations.get(evaluation)
+            if not result:
+                continue
             for horizon in ("1s", "2s", "4s", "8s", "16s"):
                 metrics = result["metrics"][horizon]
                 lines.append(
-                    f"| {model_name} | {horizon} | {metrics['lpips_alex']:.6f} | "
+                    f"| {model_name} | {evaluation} | {horizon} | "
+                    f"{metrics['lpips_alex']:.6f} | "
                     f"{metrics['dreamsim']:.6f} | {metrics['psnr']:.6f} | "
                     f"{metrics['sample_count']} |"
                 )
@@ -525,6 +677,7 @@ def parse_args() -> argparse.Namespace:
     prediction.add_argument("--dataset", required=True)
     prediction.add_argument("--evaluation", required=True)
     prediction.add_argument("--audit", type=Path, required=True)
+    prediction.add_argument("--protocol")
 
     planning = subparsers.add_parser("import-planning")
     planning.add_argument("--model", required=True)
@@ -558,7 +711,14 @@ def main() -> None:
                 args.training_datasets,
             )
         elif args.command == "import-prediction":
-            import_prediction(registry, args.model, args.dataset, args.evaluation, args.audit)
+            import_prediction(
+                registry,
+                args.model,
+                args.dataset,
+                args.evaluation,
+                args.audit,
+                args.protocol,
+            )
         elif args.command == "import-planning":
             import_planning(
                 registry,

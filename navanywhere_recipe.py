@@ -14,6 +14,7 @@ import json
 import math
 import os
 import re
+import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,8 @@ RECIPE_FORMAT = "navanywhere_sampling_recipe"
 OBSERVATION_SAMPLING = "source_trajectory_balanced_affine_v1"
 GOAL_SAMPLING = "signed_offset_stratified_v1"
 DEFAULT_GOAL_STRATA = ((-64, -9), (-8, -1), (0, 8), (9, 64))
+FRAME_SCAN_ATTEMPTS = 3
+FRAME_SCAN_RETRY_DELAY_SECONDS = 0.25
 
 
 def canonical_json(value: Any) -> bytes:
@@ -54,20 +57,50 @@ def _frame_index(filename: str) -> int:
     return int(matches[-1])
 
 
-def scan_trajectory_frames(path: str | os.PathLike[str]) -> list[tuple[int, str]]:
-    """Return sorted ``(frame_index, absolute_path)`` JPEG records."""
-    path = os.path.realpath(os.path.expanduser(os.fspath(path)))
-    frames = [
+def _scan_trajectory_frames_once(path: str) -> list[tuple[int, str]]:
+    # Some NAS clients can occasionally yield the same directory entry more
+    # than once in a single readdir pass.  Collapse only byte-for-byte identical
+    # records here; distinct paths that map to the same frame index are still
+    # rejected by ``scan_trajectory_frames`` below.
+    frames = list({
         (_frame_index(entry.name), os.path.realpath(entry.path))
         for entry in os.scandir(path)
         if entry.is_file(follow_symlinks=False)
         and entry.name.lower().endswith(".jpg")
-    ]
+    })
     frames.sort(key=lambda item: (item[0], item[1]))
-    indices = [index for index, _ in frames]
-    if len(indices) != len(set(indices)):
-        raise ValueError(f"Duplicate NavAnywhere frame indices under {path}")
     return frames
+
+
+def scan_trajectory_frames(path: str | os.PathLike[str]) -> list[tuple[int, str]]:
+    """Return sorted ``(frame_index, absolute_path)`` JPEG records.
+
+    NAS directory listings can rarely return a transient duplicate entry. Retry
+    that specific failure a few times, while still rejecting persistent duplicate
+    frame indices as corrupt input.
+    """
+    path = os.path.realpath(os.path.expanduser(os.fspath(path)))
+    duplicate_indices: list[int] = []
+    for attempt in range(FRAME_SCAN_ATTEMPTS):
+        frames = _scan_trajectory_frames_once(path)
+        indices = [index for index, _ in frames]
+        seen: set[int] = set()
+        duplicates: set[int] = set()
+        for index in indices:
+            if index in seen:
+                duplicates.add(index)
+            seen.add(index)
+        duplicate_indices = sorted(duplicates)
+        if not duplicate_indices:
+            return frames
+        if attempt + 1 < FRAME_SCAN_ATTEMPTS:
+            time.sleep(FRAME_SCAN_RETRY_DELAY_SECONDS * (attempt + 1))
+    preview = duplicate_indices[:8]
+    suffix = "..." if len(duplicate_indices) > len(preview) else ""
+    raise ValueError(
+        "Duplicate NavAnywhere frame indices under "
+        f"{path}: {preview}{suffix}; persisted across {FRAME_SCAN_ATTEMPTS} scans"
+    )
 
 
 def discover_inventory(
@@ -326,6 +359,88 @@ def coprime_stride(length: int, identity: str, seed: int) -> tuple[int, int]:
     return stride, shift
 
 
+def affine_observation_slot(
+    *,
+    epoch: int,
+    trajectory_draw: int,
+    trajectory_draws_per_epoch: int,
+    observation_count: int,
+    stride: int,
+    shift: int,
+) -> int:
+    """Return the recipe observation slot for one logical dataset index.
+
+    This is shared by the training dataset and latent-action plan generation so
+    the plan cannot drift from the affine observation cycle used in training.
+    """
+
+    if int(epoch) < 0 or int(trajectory_draw) < 0:
+        raise ValueError("Recipe epoch and trajectory draw must be non-negative")
+    if int(trajectory_draws_per_epoch) < 1 or int(observation_count) < 1:
+        raise ValueError("Recipe draw and observation counts must be positive")
+    global_draw = (
+        int(epoch) * int(trajectory_draws_per_epoch) + int(trajectory_draw)
+    )
+    return (
+        int(shift) + int(stride) * global_draw
+    ) % int(observation_count)
+
+
+def sample_recipe_goal_offsets(
+    available_offsets: Sequence[int] | np.ndarray,
+    *,
+    seed: int,
+    epoch: int,
+    dataset_index: int,
+    goals_per_obs: int,
+    strata: Sequence[Sequence[int]] = DEFAULT_GOAL_STRATA,
+) -> np.ndarray:
+    """Sample the exact stratified offsets used by NavAnywhere training.
+
+    Keep this function as the single source of truth for both
+    ``NavAnywhereDataset`` and plan-only latent-action accounting.  In
+    particular, it intentionally preserves the SeedSequence construction and
+    the fallback behavior at trajectory boundaries.
+    """
+
+    available = np.asarray(available_offsets, dtype=np.int64)
+    if available.ndim != 1 or available.size == 0:
+        raise ValueError("available_offsets must be a non-empty vector")
+    if np.any(np.diff(available) <= 0):
+        raise ValueError("available_offsets must be strictly increasing")
+    goals_per_obs = int(goals_per_obs)
+    if goals_per_obs < 1:
+        raise ValueError("goals_per_obs must be positive")
+    normalized_strata = tuple(tuple(map(int, bounds)) for bounds in strata)
+    if normalized_strata != DEFAULT_GOAL_STRATA:
+        raise ValueError("NavAnywhere signed offset strata were changed")
+
+    generator = np.random.default_rng(
+        np.random.SeedSequence((int(seed), int(epoch), int(dataset_index)))
+    )
+    selected: list[int] = []
+    unused = set(map(int, available.tolist()))
+    available_values = list(map(int, available.tolist()))
+    for goal_index in range(goals_per_obs):
+        low, high = normalized_strata[goal_index % len(normalized_strata)]
+        candidates = [value for value in unused if low <= value <= high]
+        if not candidates:
+            candidates = [
+                value for value in available_values if low <= value <= high
+            ]
+        if not candidates:
+            # Preserve the training dataset's boundary fallback ordering.  For
+            # integer offsets this is deterministic in the pinned runtime and
+            # is independently checked against completed TimePT/GeoPT logs by
+            # the plan-only command.
+            candidates = list(unused) or available_values
+        candidates.sort()
+        choice = candidates[int(generator.integers(0, len(candidates)))]
+        selected.append(choice)
+        unused.discard(choice)
+    return np.asarray(selected, dtype=np.int64)
+
+
 __all__ = [
     "DEFAULT_GOAL_STRATA",
     "GOAL_SAMPLING",
@@ -333,12 +448,14 @@ __all__ = [
     "RECIPE_FORMAT",
     "RECIPE_SCHEMA_VERSION",
     "build_sampling_recipe",
+    "affine_observation_slot",
     "canonical_json",
     "coprime_stride",
     "discover_inventory",
     "frame_indices_sha256",
     "load_sampling_recipe",
     "scan_trajectory_frames",
+    "sample_recipe_goal_offsets",
     "sha256_file",
     "validate_sampling_recipe",
     "write_sampling_recipe",

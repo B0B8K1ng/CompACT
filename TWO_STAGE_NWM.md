@@ -25,6 +25,9 @@ Stage 2 uses the training splits of exactly these four sources:
 
 `go_stanford` is disabled and evaluation-only. NavAnywhere is not mixed into
 stage 2. Set `NWM_DATA_ROOT` to the parent of the four processed datasets.
+Stage 2 defaults to eight GPUs, eight data-loader workers per rank, and the
+completed four-dataset SD-VAE posterior cache. Relocate that cache with
+`NWM_FINETUNE_VAE_LATENT_ROOT`.
 
 ## 2. Stage-1 modes
 
@@ -155,6 +158,7 @@ Stage 1:
 
 Stage 2:
 
+- `conf/two_stage/no_pretrain.yaml`
 - `conf/two_stage/latent_reset.yaml`
 - `conf/two_stage/latent_align.yaml`
 - `conf/two_stage/latent_real_to_latent.yaml`
@@ -181,6 +185,7 @@ Cache environment variables are:
 | IDMPT | `NWM_IDM_PROXY_ROOT` |
 | LatentPT | `NWM_LATENT_PROXY_ROOT` |
 | EmbeddingAlign | `NWM_FINETUNE_LATENT_ROOT` |
+| Every stage-2 run (SD-VAE posterior) | `NWM_FINETUNE_VAE_LATENT_ROOT` (optional override) |
 
 The current latent adapter uses its existing parameter-free, per-sample
 `layer_norm`, so these overlays do not invent an external statistics file. Its
@@ -204,7 +209,7 @@ TimePT on one GPU:
 export NWM_NAVANYWHERE_ROOT=/path/to/NavAnywhere
 export NWM_RESULTS_DIR=/path/to/nwm-checkpoints
 export NWM_CONDA_ENV=nwm
-codex-exp start nwm-timept -- conda run -n "${NWM_CONDA_ENV}" ./two_stage_nwm.sh stage1 timept --gpus=0 --nproc=1
+conda run -n "${NWM_CONDA_ENV}" ./two_stage_nwm.sh stage1 timept --gpus=0 --nproc=1
 ```
 
 GeoPT, IDMPT, and LatentPT use the same form after setting the cache variables:
@@ -213,9 +218,9 @@ GeoPT, IDMPT, and LatentPT use the same form after setting the cache variables:
 export NWM_GEOMETRY_PROXY_ROOT=/path/to/proxy-cache/geometry
 export NWM_IDM_PROXY_ROOT=/path/to/proxy-cache/idm
 export NWM_LATENT_PROXY_ROOT=/path/to/proxy-cache/dreamdojo-latent
-codex-exp start nwm-geopt -- conda run -n "${NWM_CONDA_ENV}" ./two_stage_nwm.sh stage1 geopt --gpus=0,1,2,3 --nproc=4
-codex-exp start nwm-idmpt -- conda run -n "${NWM_CONDA_ENV}" ./two_stage_nwm.sh stage1 idmpt --gpus=0,1,2,3 --nproc=4
-codex-exp start nwm-latentpt -- conda run -n "${NWM_CONDA_ENV}" ./two_stage_nwm.sh stage1 latentpt --gpus=0,1,2,3 --nproc=4
+conda run -n "${NWM_CONDA_ENV}" ./two_stage_nwm.sh stage1 geopt --gpus=0,1,2,3 --nproc=4
+conda run -n "${NWM_CONDA_ENV}" ./two_stage_nwm.sh stage1 idmpt --gpus=0,1,2,3 --nproc=4
+conda run -n "${NWM_CONDA_ENV}" ./two_stage_nwm.sh stage1 latentpt --gpus=0,1,2,3 --nproc=4
 ```
 
 Start stage 2 from a LatentPT checkpoint (the same syntax works for every reset
@@ -225,12 +230,13 @@ overlay):
 export NWM_DATA_ROOT=/path/to/processed-navigation-data
 export NWM_RESULTS_DIR=/path/to/nwm-checkpoints
 export NWM_STAGE1_CHECKPOINT=/path/to/checkpoints/latentpt.pt
+export NWM_FINETUNE_VAE_LATENT_ROOT=/path/to/vae-cache/four-datasets
 export NWM_FINETUNE_LATENT_ROOT=/path/to/proxy-cache/finetune-dreamdojo-latent
-codex-exp start nwm-align -- conda run -n "${NWM_CONDA_ENV}" ./two_stage_nwm.sh stage2 latent_align --gpus=0,1,2,3 --nproc=4 --stage1-checkpoint="${NWM_STAGE1_CHECKPOINT}"
+conda run -n "${NWM_CONDA_ENV}" ./two_stage_nwm.sh stage2 latent_align --stage1-checkpoint="${NWM_STAGE1_CHECKPOINT}"
 
-codex-exp start nwm-real-to-latent -- conda run -n "${NWM_CONDA_ENV}" ./two_stage_nwm.sh stage2 latent_real_to_latent --gpus=0,1,2,3 --nproc=4 --stage1-checkpoint="${NWM_STAGE1_CHECKPOINT}"
+conda run -n "${NWM_CONDA_ENV}" ./two_stage_nwm.sh stage2 latent_real_to_latent --stage1-checkpoint="${NWM_STAGE1_CHECKPOINT}"
 
-codex-exp start nwm-latent-reset -- conda run -n "${NWM_CONDA_ENV}" ./two_stage_nwm.sh stage2 latent_reset --gpus=0,1,2,3 --nproc=4 --stage1-checkpoint="${NWM_STAGE1_CHECKPOINT}"
+conda run -n "${NWM_CONDA_ENV}" ./two_stage_nwm.sh stage2 latent_reset --stage1-checkpoint="${NWM_STAGE1_CHECKPOINT}"
 ```
 
 Reset from TimePT, GeoPT, or IDMPT by selecting the matching overlay and source
@@ -238,9 +244,27 @@ checkpoint:
 
 ```bash
 export NWM_SOURCE_CHECKPOINT=/path/to/checkpoints/source-stage1.pt
-codex-exp start nwm-time-reset -- conda run -n "${NWM_CONDA_ENV}" ./two_stage_nwm.sh stage2 time_reset --gpus=0,1,2,3 --nproc=4 --stage1-checkpoint="${NWM_SOURCE_CHECKPOINT}"
-codex-exp start nwm-geo-reset -- conda run -n "${NWM_CONDA_ENV}" ./two_stage_nwm.sh stage2 geo_reset --gpus=0,1,2,3 --nproc=4 --stage1-checkpoint="${NWM_SOURCE_CHECKPOINT}"
-codex-exp start nwm-idm-reset -- conda run -n "${NWM_CONDA_ENV}" ./two_stage_nwm.sh stage2 idm_reset --gpus=0,1,2,3 --nproc=4 --stage1-checkpoint="${NWM_SOURCE_CHECKPOINT}"
+conda run -n "${NWM_CONDA_ENV}" ./two_stage_nwm.sh stage2 time_reset --stage1-checkpoint="${NWM_SOURCE_CHECKPOINT}"
+conda run -n "${NWM_CONDA_ENV}" ./two_stage_nwm.sh stage2 geo_reset --stage1-checkpoint="${NWM_SOURCE_CHECKPOINT}"
+conda run -n "${NWM_CONDA_ENV}" ./two_stage_nwm.sh stage2 idm_reset --stage1-checkpoint="${NWM_SOURCE_CHECKPOINT}"
+```
+
+Run the strict no-pretraining control with the same four-dataset stage-2 data
+budget. It constructs CDiT and the real-action adapter from the standard
+seeded initialization and intentionally accepts no stage-1 checkpoint. Unlike
+checkpoint-initialized reset runs, it starts joint CDiT + adapter optimization
+immediately: a fresh CDiT's zero-initialized output and adaLN layers make an
+adapter-only warm-up unable to propagate diffusion gradients. The first two
+joint updates open those standard zero-initialized paths, so the E_real
+gradient assertion is performed on the third backward. The frozen
+SD-VAE/cached SD-VAE posteriors remain shared with all other runs and are not
+part of the NWM pretraining comparison:
+
+```bash
+export NWM_DATA_ROOT=/path/to/processed-navigation-data
+export NWM_RESULTS_DIR=/path/to/nwm-checkpoints
+export NWM_FINETUNE_VAE_LATENT_ROOT=/path/to/vae-cache/four-datasets
+conda run -n "${NWM_CONDA_ENV}" ./two_stage_nwm.sh stage2 no_pretrain
 ```
 
 Resume a warm-up checkpoint, then separately resume a transition or joint
@@ -250,10 +274,10 @@ joint training:
 
 ```bash
 export NWM_WARMUP_CHECKPOINT=/path/to/checkpoints/latent-align-warmup.pt
-codex-exp start nwm-align-warmup-resume -- conda run -n "${NWM_CONDA_ENV}" ./two_stage_nwm.sh stage2 latent_align --gpus=0,1,2,3 --nproc=4 --resume="${NWM_WARMUP_CHECKPOINT}"
+conda run -n "${NWM_CONDA_ENV}" ./two_stage_nwm.sh stage2 latent_align --resume="${NWM_WARMUP_CHECKPOINT}"
 
 export NWM_JOINT_CHECKPOINT=/path/to/checkpoints/latent-align-transition.pt
-codex-exp start nwm-align-joint-resume -- conda run -n "${NWM_CONDA_ENV}" ./two_stage_nwm.sh stage2 latent_align --gpus=0,1,2,3 --nproc=4 --resume="${NWM_JOINT_CHECKPOINT}"
+conda run -n "${NWM_CONDA_ENV}" ./two_stage_nwm.sh stage2 latent_align --resume="${NWM_JOINT_CHECKPOINT}"
 ```
 
 Minimal one-GPU smoke launch (two warm-up and three joint steps):
@@ -274,7 +298,7 @@ Command-only checks do not require a GPU, data mount, or cache:
 
 ```bash
 ./two_stage_nwm.sh stage1 latentpt --gpus=0 --nproc=1 --dry-run -- training.batch_size=2 max_train_steps=3
-./two_stage_nwm.sh stage2 latent_align --gpus=0,1,2,3 --nproc=4 --dry-run --stage1-checkpoint=/path/to/checkpoints/latentpt.pt
+./two_stage_nwm.sh stage2 latent_align --dry-run --stage1-checkpoint=/path/to/checkpoints/latentpt.pt
 ```
 
 For multi-node DDP, run one launcher per node with the same host/port and the
@@ -328,6 +352,33 @@ the next epoch. Each checkpoint also stores every DDP rank's Python, NumPy,
 torch, proxy-metric, and alignment-progress state. Even when a resumed phase is
 already complete and its loop is skipped, that saved RNG state is carried into
 joint training and restored after joint iterator creation.
+
+With the default `finetune.warmup_steps=10000`,
+`finetune.joint_steps=100000`, and `ckpt_every=10000`, stage 2 retains
+`warmup_0010000.pth.tar` and `joint_0010000.pth.tar` through
+`joint_0100000.pth.tar`. The interval is counted independently inside each
+substage. A phase target that is not an exact interval multiple still gets one
+phase-final retained checkpoint. `latest.pth.tar` is an atomically replaced
+relative symlink to the newest retained file and is intended as a convenient
+resume path; retained files are never overwritten by later intervals. Stage 1
+keeps its prior latest-only behavior.
+
+Stage 2 runs the same lightweight inline evaluation as legacy training. With
+the shared defaults it evaluates the EMA model at global step 1 and every
+`eval_every=5000` steps, computes DreamSim on the first distributed test batch,
+writes up to ten condition/ground-truth/prediction panels under `viz/<step>`,
+and logs `eval/perceptual_loss` plus timing to W&B. Cached SD-VAE posteriors
+remain training-only: the eval loader reads RGB frames and a frozen SD-VAE is
+loaded for encoding and decoding. Evaluation RNG consumption is restored so it
+does not change the training or exact-resume trajectory.
+
+This inline score is a quick regression signal, not a complete checkpoint
+selection benchmark. Evaluate retained checkpoints offline by passing their
+stem (for example `ckp=joint_0030000`) to `isolated_nwm_infer.py`, then compare
+LPIPS, DreamSim, PSNR, and generated frames on one frozen validation set. Run
+the more expensive navigation `planning_eval.py` on the strongest candidates.
+Do not select a checkpoint by repeatedly inspecting the test set; reserve test
+for the final chosen model.
 
 The warm-up completion transition artifact is always the epoch-zero, cursor-zero
 entry point for joint training. It omits the warm-up optimizer and scheduler,

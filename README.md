@@ -150,11 +150,18 @@ previous models and the NWM/CompACT paper baselines:
 # Reuse completed results and run every missing task for all registered models.
 scripts/run_nwm_benchmark.sh --gpus 0,1,2,3
 
-# Select models and tasks. Tasks: recon_prediction,navigation,unseen.
+# Select models and tasks. `unseen` is the fixed Go Stanford one-shot task.
 scripts/run_nwm_benchmark.sh \
   --models nwm-base,nwm-real,nwm-release \
   --tasks unseen,navigation \
   --gpus 0,1,2,3
+
+# Run the standardized Go Stanford autoregressive rollout benchmark and
+# render GT/models side by side. This protocol intentionally requires 2 GPUs.
+scripts/run_nwm_benchmark.sh \
+  --models nwm-real,nwm-timept-ft \
+  --tasks unseen_rollout \
+  --gpus 0,1
 
 # Fill only a missing navigation dataset; optionally limit CEM peak memory.
 scripts/run_nwm_benchmark.sh \
@@ -170,6 +177,20 @@ The canonical outputs are:
 
 - `/file_system/nas/algorithm/dujun.nie/nwm/results/nwm_benchmark/benchmark_results.json`
 - `/file_system/nas/algorithm/dujun.nie/nwm/results/nwm_benchmark/benchmark_results.md`
+- `/file_system/nas/algorithm/dujun.nie/nwm/results/nwm_benchmark/visualizations/go_stanford_unseen_rollout_10_v1/`
+
+`unseen_rollout` uses `go_stanford_unseen_rollout_10_v1`: the first ten entries
+of the 150-sample Go Stanford `rollout.pkl`. Both the parent split SHA-256 and
+the selected-entry SHA-256 are recorded in the registry. The ten entries are
+ten distinct trajectories. The protocol keeps 1 fps and 4 fps autoregressive
+rollouts, 16 seconds, 250 diffusion steps, seed 0, two GPUs, and batch size 64
+per GPU. It scores and visualizes all ten trajectory IDs at
+1/2/4/8/16-second horizons for every model. Prediction artifacts live under
+`protocol_runs/go_stanford_unseen_rollout_10_v1`, isolated from the archived
+150-sample `go_stanford_unseen_rollout_v1` results. To compare a newly
+registered model, include it together with the desired baselines in `--models`;
+completed baseline audits are reused and one new side-by-side visualization set
+is made.
 
 ## NavAnywhere Stage-1 pretraining
 

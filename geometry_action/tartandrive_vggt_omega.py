@@ -415,8 +415,17 @@ def estimate_pose_similarity(
         scale = 1.0
     else:
         scale = float(np.sum(centered_local * centered_target) / denominator)
-        if not math.isfinite(scale) or scale <= 0:
+        if not math.isfinite(scale):
             raise ValueError(f"Invalid overlap similarity scale: {scale}")
+        if scale <= 0:
+            if not allow_degenerate_scale:
+                raise ValueError(f"Invalid overlap similarity scale: {scale}")
+            # A non-positive least-squares scale cannot represent a Sim(3).
+            # Treat it like a translation-degenerate overlap: retain the
+            # orientation alignment, use unit scale, and expose the fallback
+            # through ``degenerate_scale`` for provenance and diagnostics.
+            scale = 1.0
+            degenerate = True
     translation = target_mean - scale * (rotation @ local_mean)
     return SimilarityAlignment(scale, rotation, translation, degenerate)
 
@@ -1100,6 +1109,7 @@ class VGGTOmegaCameraExtractor:
         expected_code_revision: str = PINNED_CODE_REVISION,
         retain_dense_head: bool = False,
         allow_tf32: bool = True,
+        preprocess_workers: int = 1,
     ) -> None:
         self.third_party_root = Path(third_party_root).resolve()
         self.checkpoint_path = Path(checkpoint_path).resolve()
@@ -1121,7 +1131,16 @@ class VGGTOmegaCameraExtractor:
         load_module = importlib.import_module("vggt_omega.utils.load_fn")
         pose_module = importlib.import_module("vggt_omega.utils.pose_enc")
         self._preprocess = load_module.load_and_preprocess_images
+        self._pad_preprocessed = load_module._pad_images_to_common_size
         self._decode_camera = pose_module.encoding_to_camera
+        self.preprocess_workers = int(preprocess_workers)
+        if self.preprocess_workers < 1:
+            raise ValueError("preprocess_workers must be at least one")
+        self._preprocess_executor = (
+            ThreadPoolExecutor(max_workers=self.preprocess_workers)
+            if self.preprocess_workers > 1
+            else None
+        )
 
         self.device = torch.device(device)
         if self.device.type != "cuda" or not torch.cuda.is_available():
@@ -1188,12 +1207,28 @@ class VGGTOmegaCameraExtractor:
         resize_mode: str,
         resolution: int,
     ) -> torch.Tensor:
-        images = self._preprocess(
-            [str(path) for path in image_paths],
-            mode=resize_mode,
-            image_resolution=int(resolution),
-            patch_size=16,
-        )
+        paths = [str(path) for path in image_paths]
+        if self._preprocess_executor is None or len(paths) < 2:
+            images = self._preprocess(
+                paths,
+                mode=resize_mode,
+                image_resolution=int(resolution),
+                patch_size=16,
+            )
+        else:
+            def preprocess_one(path: str) -> torch.Tensor:
+                return self._preprocess(
+                    [path],
+                    mode=resize_mode,
+                    image_resolution=int(resolution),
+                    patch_size=16,
+                )[0]
+
+            image_list = list(self._preprocess_executor.map(preprocess_one, paths))
+            shapes = {(int(image.shape[1]), int(image.shape[2])) for image in image_list}
+            if len(shapes) > 1:
+                image_list = self._pad_preprocessed(image_list, shapes)
+            images = torch.stack(image_list)
         return images.pin_memory().to(self.device, non_blocking=True)
 
     def _forward(self, images: torch.Tensor, *, full: bool) -> Mapping[str, torch.Tensor]:

@@ -8,10 +8,10 @@ show_help() {
     cat <<'EOF'
 Usage:
   ./two_stage_nwm.sh stage1 {timept|geopt|idmpt|latentpt} [options] [-- HYDRA_OVERRIDES...]
-  ./two_stage_nwm.sh stage2 {latent_reset|latent_align|latent_real_to_latent|time_reset|geo_reset|idm_reset} [options] [-- HYDRA_OVERRIDES...]
+  ./two_stage_nwm.sh stage2 {no_pretrain|latent_reset|latent_align|latent_real_to_latent|time_reset|geo_reset|idm_reset} [options] [-- HYDRA_OVERRIDES...]
 
 Options:
-  --nproc=N                    Processes per node (default: one, or GPU list size)
+  --nproc=N                    Processes per node (stage 2 default: 8; otherwise GPU list size or 1)
   --gpus=LIST                  CUDA_VISIBLE_DEVICES, for example 0 or 0,1,2,3
   --nodes=N                    Number of nodes (default: 1)
   --host=HOST                  Rendezvous host (default: localhost)
@@ -26,6 +26,16 @@ Required data environment:
   stage 1: NWM_NAVANYWHERE_ROOT
   stage 2: NWM_DATA_ROOT
   all runs: NWM_RESULTS_DIR (logs and checkpoints; not needed by --dry-run)
+
+Runtime environment:
+  NWM_CONDA_ACTIVATE (defaults to the absolute shared Miniconda activate script)
+  NWM_CONDA_ENV_PATH (defaults to the absolute shared nwm environment)
+  NWM_HF_HOME (defaults to the shared NAS Hugging Face cache)
+  VAE_MODEL_PATH (defaults to the cached SD-VAE snapshot on NAS)
+  NWM_MODEL_CACHE (defaults to the shared NAS DreamSim cache)
+
+Stage-2 VAE latent cache:
+  NWM_FINETUNE_VAE_LATENT_ROOT (defaults to the completed four-dataset cache)
 
 Optional stage-1 split selection:
   NWM_NAVANYWHERE_MANIFEST (JSON, JSONL, or text trajectory manifest)
@@ -61,6 +71,16 @@ STAGE1_CHECKPOINT=""
 RESUME_CHECKPOINT=""
 DRY_RUN=0
 HYDRA_EXTRA=()
+DEFAULT_NWM_CONDA_ACTIVATE="/file_system/vepfs/algorithm/dujun.nie/miniconda3/bin/activate"
+DEFAULT_NWM_CONDA_ENV_PATH="/file_system/vepfs/algorithm/dujun.nie/miniconda3/envs/nwm"
+NWM_CONDA_ACTIVATE="${NWM_CONDA_ACTIVATE:-${DEFAULT_NWM_CONDA_ACTIVATE}}"
+NWM_CONDA_ENV_PATH="${NWM_CONDA_ENV_PATH:-${DEFAULT_NWM_CONDA_ENV_PATH}}"
+NWM_HF_HOME="${NWM_HF_HOME:-/file_system/nas/algorithm/dujun.nie/huggingface}"
+NWM_MODEL_CACHE="${NWM_MODEL_CACHE:-/file_system/nas/algorithm/dujun.nie/nwm/compact/cache/models}"
+VAE_MODEL_PATH="${VAE_MODEL_PATH:-}"
+DEFAULT_FINETUNE_VAE_LATENT_ROOT="/file_system/nas/algorithm/dujun.nie/nwm/compact/cache/vae_latents_sd_vae_ft_ema_224_four_datasets"
+NWM_FINETUNE_VAE_LATENT_ROOT="${NWM_FINETUNE_VAE_LATENT_ROOT:-${DEFAULT_FINETUNE_VAE_LATENT_ROOT}}"
+export NWM_FINETUNE_VAE_LATENT_ROOT
 
 while (( $# > 0 )); do
     case "$1" in
@@ -96,7 +116,7 @@ case "${STAGE}" in
         ;;
     stage2)
         case "${VARIANT}" in
-            latent_reset|latent_align|latent_real_to_latent|time_reset|geo_reset|idm_reset) ;;
+            no_pretrain|latent_reset|latent_align|latent_real_to_latent|time_reset|geo_reset|idm_reset) ;;
             *) echo "ERROR: unsupported stage-2 variant ${VARIANT}." >&2; exit 2 ;;
         esac
         ;;
@@ -105,6 +125,65 @@ case "${STAGE}" in
         exit 2
         ;;
 esac
+
+if [[ ! -r "${NWM_CONDA_ACTIVATE}" ]]; then
+    echo "ERROR: conda activation script is not readable: ${NWM_CONDA_ACTIVATE}" >&2
+    exit 2
+fi
+if [[ ! -d "${NWM_CONDA_ENV_PATH}" ]]; then
+    echo "ERROR: nwm conda environment does not exist: ${NWM_CONDA_ENV_PATH}" >&2
+    exit 2
+fi
+# Activate by absolute path so a caller initialized against another Conda root
+# (for example /root/miniconda3) cannot redirect the named nwm environment.
+# Clear inherited activation state first; otherwise Conda may still inspect the
+# old prefix and its configuration before switching to the requested path.
+unset CONDA_PREFIX CONDA_DEFAULT_ENV CONDA_PROMPT_MODIFIER CONDA_SHLVL
+unset CONDA_EXE CONDA_PYTHON_EXE _CE_CONDA _CE_M
+# shellcheck disable=SC1090
+source "${NWM_CONDA_ACTIVATE}" "${NWM_CONDA_ENV_PATH}"
+echo "Conda environment=${CONDA_PREFIX}"
+
+export HF_HOME="${NWM_HF_HOME}"
+export HF_HUB_CACHE="${NWM_HF_HOME}/hub"
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export NWM_MODEL_CACHE
+if [[ -z "${VAE_MODEL_PATH}" ]]; then
+    VAE_CACHE_DIR="${HF_HUB_CACHE}/models--stabilityai--sd-vae-ft-ema"
+    VAE_REVISION_FILE="${VAE_CACHE_DIR}/refs/main"
+    if [[ -r "${VAE_REVISION_FILE}" ]]; then
+        VAE_REVISION="$(<"${VAE_REVISION_FILE}")"
+        VAE_MODEL_PATH="${VAE_CACHE_DIR}/snapshots/${VAE_REVISION}"
+    fi
+fi
+if [[ -z "${VAE_MODEL_PATH}" || ! -r "${VAE_MODEL_PATH}/config.json" ]]; then
+    echo "ERROR: a complete local SD-VAE snapshot was not found under ${HF_HUB_CACHE}." >&2
+    echo "       Set VAE_MODEL_PATH to a readable stabilityai/sd-vae-ft-ema snapshot." >&2
+    exit 2
+fi
+if [[ ! -r "${VAE_MODEL_PATH}/diffusion_pytorch_model.bin" && \
+      ! -r "${VAE_MODEL_PATH}/diffusion_pytorch_model.safetensors" ]]; then
+    echo "ERROR: SD-VAE weights are missing from ${VAE_MODEL_PATH}." >&2
+    exit 2
+fi
+for dreamsim_artifact in \
+    dino_vitb16_pretrain.pth \
+    open_clip_vitb16_pretrain.pth.tar \
+    clip_vitb16_pretrain.pth.tar \
+    ensemble_lora/adapter_config.json \
+    ensemble_lora/adapter_model.safetensors; do
+    if [[ ! -r "${NWM_MODEL_CACHE}/${dreamsim_artifact}" ]]; then
+        echo "ERROR: DreamSim artifact is not readable: ${NWM_MODEL_CACHE}/${dreamsim_artifact}" >&2
+        exit 2
+    fi
+done
+echo "SD-VAE model=${VAE_MODEL_PATH}"
+echo "DreamSim cache=${NWM_MODEL_CACHE}"
+
+if [[ "${STAGE}" == "stage2" && -z "${GPU_LIST}" ]]; then
+    GPU_LIST="0,1,2,3,4,5,6,7"
+fi
 
 for integer_value in "${NUM_NODES}" "${CURR_NODE_RANK}" "${PORT}"; do
     if ! [[ "${integer_value}" =~ ^[0-9]+$ ]]; then
@@ -145,7 +224,11 @@ if [[ "${STAGE}" == "stage1" && -n "${STAGE1_CHECKPOINT}" ]]; then
     echo "ERROR: --stage1-checkpoint is valid only for stage2." >&2
     exit 2
 fi
-if [[ "${STAGE}" == "stage2" && -z "${STAGE1_CHECKPOINT}" && -z "${RESUME_CHECKPOINT}" && "${DRY_RUN}" == 0 ]]; then
+if [[ "${STAGE}" == "stage2" && "${VARIANT}" == "no_pretrain" && -n "${STAGE1_CHECKPOINT}" ]]; then
+    echo "ERROR: no_pretrain forbids --stage1-checkpoint; its CDiT weights must start from random initialization." >&2
+    exit 2
+fi
+if [[ "${STAGE}" == "stage2" && "${VARIANT}" != "no_pretrain" && -z "${STAGE1_CHECKPOINT}" && -z "${RESUME_CHECKPOINT}" && "${DRY_RUN}" == 0 ]]; then
     echo "ERROR: a new stage-2 run needs --stage1-checkpoint; use --resume for an existing stage-2 checkpoint." >&2
     exit 2
 fi
@@ -209,6 +292,14 @@ if (( DRY_RUN == 0 )); then
     else
         require_env NWM_DATA_ROOT
         canonicalize_existing_dir_env NWM_DATA_ROOT
+        canonicalize_existing_dir_env NWM_FINETUNE_VAE_LATENT_ROOT
+        for cache_marker in metadata.json _SUCCESS.json; do
+            if [[ ! -r "${NWM_FINETUNE_VAE_LATENT_ROOT}/${cache_marker}" ]]; then
+                echo "ERROR: stage-2 precomputed VAE cache marker is not readable: ${NWM_FINETUNE_VAE_LATENT_ROOT}/${cache_marker}" >&2
+                echo "       Ask the cache owner to grant read/traverse permission, or set NWM_FINETUNE_VAE_LATENT_ROOT to another completed cache." >&2
+                exit 2
+            fi
+        done
         if [[ "${VARIANT}" == "latent_align" ]]; then
             require_env NWM_FINETUNE_LATENT_ROOT
             canonicalize_existing_dir_env NWM_FINETUNE_LATENT_ROOT
@@ -244,6 +335,7 @@ fi
 HYDRA_ARGS=(
     --config-name nwm
     "two_stage=${VARIANT}"
+    "model.tokenizer.model_path=${VAE_MODEL_PATH}"
 )
 if [[ -n "${STAGE1_CHECKPOINT}" ]]; then
     HYDRA_ARGS+=("finetune.stage1_checkpoint=${STAGE1_CHECKPOINT}")
@@ -271,6 +363,9 @@ echo "Two-stage NWM launch: stage=${STAGE}, variant=${VARIANT}, nproc/node=${NPR
 if [[ -n "${GPU_LIST}" ]]; then
     export CUDA_VISIBLE_DEVICES="${GPU_LIST}"
     echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+fi
+if [[ "${STAGE}" == "stage2" ]]; then
+    echo "Stage-2 VAE latent cache=${NWM_FINETUNE_VAE_LATENT_ROOT}"
 fi
 if (( DRY_RUN == 1 )); then
     printf 'Dry-run command:'

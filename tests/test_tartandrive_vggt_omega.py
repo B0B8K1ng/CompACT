@@ -206,6 +206,41 @@ def test_window_sim3_stitch_recovers_global_camera_poses() -> None:
     assert windows[1]["overlap_rotation_rmse_deg"] < 1e-6
 
 
+def test_window_sim3_stitch_treats_nonpositive_scale_as_degenerate() -> None:
+    global_c2w = np.repeat(np.eye(4, dtype=np.float64)[None], 9, axis=0)
+    global_c2w[:, 0, 3] = np.arange(9, dtype=np.float64)
+    local_c2w = global_c2w[3:].copy()
+    local_c2w[:, 0, 3] *= -1.0
+    intrinsics = np.repeat(np.eye(3, dtype=np.float64)[None], 6, axis=0)
+    predictions = [
+        {
+            "start_index": 0,
+            "end_index_exclusive": 6,
+            "extrinsics_w2c": c2w_to_w2c(global_c2w[:6]),
+            "intrinsics": intrinsics,
+            "image_size_hw": (384, 512),
+        },
+        {
+            "start_index": 3,
+            "end_index_exclusive": 9,
+            "extrinsics_w2c": c2w_to_w2c(local_c2w),
+            "intrinsics": intrinsics,
+            "image_size_hw": (384, 512),
+        },
+    ]
+
+    stitched, _, windows, _ = stitch_pose_windows(
+        predictions,
+        num_frames=9,
+        requested_overlap=3,
+        allow_degenerate_scale=True,
+    )
+
+    assert np.isfinite(stitched).all()
+    assert windows[1]["alignment_to_global"]["scale"] == 1.0
+    assert windows[1]["alignment_to_global"]["degenerate_scale"] is True
+
+
 def test_schema_and_resume_fingerprints(tmp_path: Path) -> None:
     extrinsics = _straight_w2c(68)
     extraction = raw_extraction_descriptor(

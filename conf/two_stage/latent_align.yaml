@@ -6,6 +6,9 @@ defaults:
 training_stage: real_finetune
 action_mode: real
 
+training:
+  num_workers: 8
+
 # This local DreamDojo cache is an alignment teacher target only. It is never
 # needed by inference or planning.
 proxy:

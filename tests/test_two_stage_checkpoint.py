@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import torch
@@ -32,9 +33,15 @@ from two_stage_checkpoint import (
     validate_stage1_checkpoint,
 )
 from two_stage_training import (
+    _atomic_update_latest_checkpoint,
+    _evaluation_due,
     _load_ema_and_training_state,
+    _periodic_checkpoint_due,
     _phase_progress_after_iteration,
+    _prepare_loader,
+    _retained_stage2_checkpoint_path,
     _restore_completed_phase_rng,
+    _save_training_checkpoint,
     _should_check_first_step_gradients,
     save_two_stage_checkpoint,
 )
@@ -71,6 +78,242 @@ class _StatefulScaler:
 
     def load_state_dict(self, state):
         self.state = copy.deepcopy(state)
+
+
+class Stage2CheckpointPublicationTests(unittest.TestCase):
+    def test_stage2_eval_schedule_matches_legacy_global_steps(self):
+        self.assertTrue(
+            _evaluation_due(
+                global_steps=1,
+                interval=5000,
+                eval_at_first_step=True,
+            )
+        )
+        self.assertTrue(
+            _evaluation_due(
+                global_steps=5000,
+                interval=5000,
+                eval_at_first_step=True,
+            )
+        )
+        self.assertFalse(
+            _evaluation_due(
+                global_steps=5001,
+                interval=5000,
+                eval_at_first_step=True,
+            )
+        )
+        self.assertFalse(
+            _evaluation_due(
+                global_steps=1,
+                interval=0,
+                eval_at_first_step=False,
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            _evaluation_due(
+                global_steps=-1,
+                interval=5000,
+                eval_at_first_step=True,
+            )
+
+    def test_finetune_loader_builds_a_separate_pixel_eval_loader(self):
+        config = SimpleNamespace(training_stage="real_finetune")
+        with mock.patch(
+            "two_stage_training.prepare_datasets",
+            return_value=("latent-train-dataset", "pixel-eval-dataset"),
+        ) as prepare, mock.patch(
+            "two_stage_training.create_dataloader",
+            side_effect=[
+                ("train-loader", "train-sampler"),
+                ("eval-loader", "eval-sampler"),
+            ],
+        ) as create:
+            result = _prepare_loader(
+                config,
+                rank=3,
+                substage="joint",
+                include_eval=True,
+            )
+
+        self.assertEqual(
+            result,
+            (
+                "train-loader",
+                "train-sampler",
+                "latent-train-dataset",
+                "eval-loader",
+                "pixel-eval-dataset",
+            ),
+        )
+        prepare.assert_called_once_with(
+            config,
+            finetune_substage="joint",
+            include_test=True,
+        )
+        self.assertEqual(create.call_count, 2)
+        self.assertTrue(create.call_args_list[0].kwargs["is_train"])
+        self.assertFalse(create.call_args_list[1].kwargs["is_train"])
+
+    def test_stage2_checkpoint_names_include_substage_steps(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(
+                Path(
+                    _retained_stage2_checkpoint_path(
+                        directory, "warmup", 10_000
+                    )
+                ).name,
+                "warmup_0010000.pth.tar",
+            )
+            self.assertEqual(
+                Path(
+                    _retained_stage2_checkpoint_path(
+                        directory, "joint", 100_000
+                    )
+                ).name,
+                "joint_0100000.pth.tar",
+            )
+        with self.assertRaisesRegex(ValueError, "Unsupported"):
+            _retained_stage2_checkpoint_path(".", "transition", 10_000)
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            _retained_stage2_checkpoint_path(".", "joint", -1)
+
+    def test_stage2_periodicity_uses_substage_steps_and_leaves_final_save_once(
+        self,
+    ):
+        self.assertTrue(
+            _periodic_checkpoint_due(
+                training_stage="real_finetune",
+                current_steps=10,
+                global_steps=13,
+                target_steps=100,
+                interval=10,
+            )
+        )
+        self.assertFalse(
+            _periodic_checkpoint_due(
+                training_stage="real_finetune",
+                current_steps=7,
+                global_steps=20,
+                target_steps=100,
+                interval=10,
+            )
+        )
+        self.assertFalse(
+            _periodic_checkpoint_due(
+                training_stage="real_finetune",
+                current_steps=100,
+                global_steps=110,
+                target_steps=100,
+                interval=10,
+            )
+        )
+        self.assertTrue(
+            _periodic_checkpoint_due(
+                training_stage="proxy_pretrain",
+                current_steps=7,
+                global_steps=20,
+                target_steps=100,
+                interval=10,
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "positive"):
+            _periodic_checkpoint_due(
+                training_stage="real_finetune",
+                current_steps=1,
+                global_steps=1,
+                target_steps=100,
+                interval=0,
+            )
+
+    def test_latest_checkpoint_is_an_atomically_replaced_relative_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint_dir = Path(directory)
+            latest = checkpoint_dir / "latest.pth.tar"
+            warmup = checkpoint_dir / "warmup_0010000.pth.tar"
+            joint = checkpoint_dir / "joint_0010000.pth.tar"
+            latest.write_text("legacy", encoding="utf-8")
+            warmup.write_text("warmup", encoding="utf-8")
+            joint.write_text("joint", encoding="utf-8")
+
+            _atomic_update_latest_checkpoint(str(warmup), str(latest))
+            self.assertTrue(latest.is_symlink())
+            self.assertEqual(latest.readlink(), Path(warmup.name))
+            self.assertEqual(latest.read_text(encoding="utf-8"), "warmup")
+
+            _atomic_update_latest_checkpoint(str(joint), str(latest))
+            self.assertTrue(latest.is_symlink())
+            self.assertEqual(latest.readlink(), Path(joint.name))
+            self.assertEqual(latest.read_text(encoding="utf-8"), "joint")
+            self.assertEqual(
+                list(checkpoint_dir.glob(".latest.pth.tar.*.tmp")),
+                [],
+            )
+
+    def test_stage2_retains_numbered_file_and_stage1_keeps_latest_only(self):
+        stage2_config = OmegaConf.create(
+            _config(
+                stage="real_finetune",
+                action_mode="real",
+                scheme="reset",
+                proxy_type="temporal_distance",
+            )
+        )
+        stage2_model = _TinyTwoStageModel()
+        with tempfile.TemporaryDirectory() as directory:
+            retained = Path(
+                _save_training_checkpoint(
+                    directory,
+                    training_stage="real_finetune",
+                    substage="joint",
+                    current_steps=10_000,
+                    model=stage2_model,
+                    ema=copy.deepcopy(stage2_model),
+                    optimizer=None,
+                    scheduler=None,
+                    scaler=None,
+                    config=stage2_config,
+                    completed_warmup_steps=10_000,
+                    completed_joint_steps=10_000,
+                    train_steps=20_000,
+                    epoch=1,
+                    include_optimizer=False,
+                )
+            )
+            latest = Path(directory) / "latest.pth.tar"
+            self.assertEqual(retained.name, "joint_0010000.pth.tar")
+            self.assertTrue(retained.is_file())
+            self.assertTrue(latest.is_symlink())
+            self.assertEqual(latest.resolve(), retained.resolve())
+
+        stage1_config = OmegaConf.create(
+            _config(stage="proxy_pretrain", action_mode="latent")
+        )
+        stage1_model = _TinyTwoStageModel()
+        with tempfile.TemporaryDirectory() as directory:
+            saved = Path(
+                _save_training_checkpoint(
+                    directory,
+                    training_stage="proxy_pretrain",
+                    substage="pretrain",
+                    current_steps=10_000,
+                    model=stage1_model,
+                    ema=copy.deepcopy(stage1_model),
+                    optimizer=None,
+                    scheduler=None,
+                    scaler=None,
+                    config=stage1_config,
+                    completed_warmup_steps=0,
+                    completed_joint_steps=0,
+                    train_steps=10_000,
+                    epoch=1,
+                    include_optimizer=False,
+                )
+            )
+            self.assertEqual(saved.name, "latest.pth.tar")
+            self.assertTrue(saved.is_file())
+            self.assertFalse(saved.is_symlink())
+            self.assertEqual(list(Path(directory).glob("pretrain_*.pth.tar")), [])
 
 
 class InferenceContextValidationTests(unittest.TestCase):

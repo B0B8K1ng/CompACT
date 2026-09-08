@@ -1,0 +1,137 @@
+% Paper tables; load tables/preamble.tex in the document preamble.
+% Each section below is an independent table with its own caption and label.
+
+% ============================================================================
+% lam_objective_single_step_recon
+% ============================================================================
+\begin{table}[t]
+  \centering
+  \caption{Single-step prediction on RECON at a 4\,s horizon. LAM objectives are compared with RECON, SCAND, and HuRoN training data; NWM pretraining and Reset fine-tuning are fixed.}
+  \label{tab:lam_objective_single_step_recon}
+  \small
+  \setlength{\tabcolsep}{5pt}
+  \renewcommand{\arraystretch}{1.08}
+  \begin{threeparttable}
+    \begin{tabular}{lccc}
+      \toprule
+      LAM objective & \CompACTLPIPS & \CompACTDreamSim & \CompACTPSNR \\
+      \midrule
+      Pixel & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+      Pixel + action & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+      DINO & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+      Action only & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+      \bottomrule
+    \end{tabular}
+    \begin{tablenotes}[flushleft]\footnotesize
+      \item \CompACTMissing{} denotes a result pending evaluation.
+    \end{tablenotes}
+  \end{threeparttable}
+\end{table}
+
+% ============================================================================
+% lam_objective_rollout_1fps_recon
+% ============================================================================
+\begin{table}[t]
+  \centering
+  \caption{Autoregressive prediction on RECON at 1\,FPS, evaluated at 4\,s. LAM objectives are compared with RECON, SCAND, and HuRoN training data; NWM pretraining and Reset fine-tuning are fixed.}
+  \label{tab:lam_objective_rollout_1fps_recon}
+  \small
+  \setlength{\tabcolsep}{5pt}
+  \renewcommand{\arraystretch}{1.08}
+  \begin{threeparttable}
+    \begin{tabular}{lccc}
+      \toprule
+      LAM objective & \CompACTLPIPS & \CompACTDreamSim & \CompACTPSNR \\
+      \midrule
+      Pixel & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+      Pixel + action & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+      DINO & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+      Action only & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+      \bottomrule
+    \end{tabular}
+    \begin{tablenotes}[flushleft]\footnotesize
+      \item \CompACTMissing{} denotes a result pending evaluation.
+    \end{tablenotes}
+  \end{threeparttable}
+\end{table}
+
+% ============================================================================
+% lam_objective_rollout_4fps_recon
+% ============================================================================
+\begin{table}[t]
+  \centering
+  \caption{Autoregressive prediction on RECON at 4\,FPS, evaluated at 4\,s. LAM objectives are compared with RECON, SCAND, and HuRoN training data; NWM pretraining and Reset fine-tuning are fixed.}
+  \label{tab:lam_objective_rollout_4fps_recon}
+  \small
+  \setlength{\tabcolsep}{5pt}
+  \renewcommand{\arraystretch}{1.08}
+  \begin{threeparttable}
+    \begin{tabular}{lccc}
+      \toprule
+      LAM objective & \CompACTLPIPS & \CompACTDreamSim & \CompACTPSNR \\
+      \midrule
+      Pixel & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+      Pixel + action & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+      DINO & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+      Action only & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+      \bottomrule
+    \end{tabular}
+    \begin{tablenotes}[flushleft]\footnotesize
+      \item \CompACTMissing{} denotes a result pending evaluation.
+    \end{tablenotes}
+  \end{threeparttable}
+\end{table}
+
+% ============================================================================
+% lam_objective_unseen_go_stanford
+% ============================================================================
+\begin{table}[t]
+  \centering
+  \caption{Unseen-domain prediction on \CompACTUnseenData{} at a 4\,s horizon. LAM objectives are compared with RECON, SCAND, and HuRoN training data; NWM pretraining and Reset fine-tuning are fixed.}
+  \label{tab:lam_objective_unseen_go_stanford}
+  \small
+  \setlength{\tabcolsep}{5pt}
+  \renewcommand{\arraystretch}{1.08}
+  \begin{threeparttable}
+    \begin{tabular}{lccc}
+      \toprule
+      LAM objective & \CompACTLPIPS & \CompACTDreamSim & \CompACTPSNR \\
+      \midrule
+      Pixel & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+      Pixel + action & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+      DINO & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+      Action only & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+      \bottomrule
+    \end{tabular}
+    \begin{tablenotes}[flushleft]\footnotesize
+      \item \CompACTMissing{} denotes a result pending evaluation.
+    \end{tablenotes}
+  \end{threeparttable}
+\end{table}
+
+% ============================================================================
+% lam_objective_navigation_planning
+% ============================================================================
+\begin{table*}[t]
+
+  \caption{Downstream NWM planning with different LAM objectives. Lower is
+  better.}
+  \label{tab:lam_downstream_planning}
+  \centering
+  \small
+  \setlength{\tabcolsep}{8pt}
+  \renewcommand{\arraystretch}{1.06}
+  \begin{tabular}{l cc cc}
+    \toprule
+    & \multicolumn{2}{c}{RECON} & \multicolumn{2}{c}{SCAND} \\
+    \cmidrule(lr){2-3}\cmidrule(l){4-5}
+    LAM objective & ATE $\downarrow$ & RPE $\downarrow$
+    & ATE $\downarrow$ & RPE $\downarrow$ \\
+    \midrule
+    Pixel & \CompACTMissing & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+    Pixel + action & \CompACTMissing & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+    DINO & \CompACTMissing & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+    Action only & \CompACTMissing & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+    \bottomrule
+  \end{tabular}
+\end{table*}

@@ -6,6 +6,9 @@ defaults:
 training_stage: real_finetune
 action_mode: real
 
+training:
+  num_workers: 8
+
 # Describes the stage-1 interface recorded in the source checkpoint. Reset does
 # not use this encoder in its forward path or optimizer.
 proxy:

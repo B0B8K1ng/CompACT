@@ -1,0 +1,132 @@
+% Paper tables; load tables/preamble.tex in the document preamble.
+% Each section below is an independent table with its own caption and label.
+
+% ============================================================================
+% finetuning_single_step_recon
+% ============================================================================
+\begin{table}[t]
+  \centering
+  \caption{Single-step prediction on RECON at a 4\,s horizon. All fine-tuning strategies start from the same pretrained checkpoint and use the same fine-tuning budget.}
+  \label{tab:finetuning_single_step_recon}
+  \small
+  \setlength{\tabcolsep}{5pt}
+  \renewcommand{\arraystretch}{1.08}
+  \begin{threeparttable}
+    \begin{tabular}{lccc}
+      \toprule
+      Fine-tuning & \CompACTLPIPS & \CompACTDreamSim & \CompACTPSNR \\
+      \midrule
+      Reset & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+      Align & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+      Action2Latent & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+      \bottomrule
+    \end{tabular}
+    \begin{tablenotes}[flushleft]\footnotesize
+      \item \CompACTMissing{} denotes a result pending evaluation. Reset replaces the latent-action encoder; Align aligns action embeddings; Action2Latent maps real actions into the latent-action space.
+    \end{tablenotes}
+  \end{threeparttable}
+\end{table}
+
+% ============================================================================
+% finetuning_rollout_1fps_recon
+% ============================================================================
+\begin{table}[t]
+  \centering
+  \caption{Autoregressive prediction on RECON at 1\,FPS, evaluated at 4\,s. All fine-tuning strategies start from the same pretrained checkpoint and use the same fine-tuning budget.}
+  \label{tab:finetuning_rollout_1fps_recon}
+  \small
+  \setlength{\tabcolsep}{5pt}
+  \renewcommand{\arraystretch}{1.08}
+  \begin{threeparttable}
+    \begin{tabular}{lccc}
+      \toprule
+      Fine-tuning & \CompACTLPIPS & \CompACTDreamSim & \CompACTPSNR \\
+      \midrule
+      Reset & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+      Align & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+      Action2Latent & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+      \bottomrule
+    \end{tabular}
+    \begin{tablenotes}[flushleft]\footnotesize
+      \item \CompACTMissing{} denotes a result pending evaluation. Reset replaces the latent-action encoder; Align aligns action embeddings; Action2Latent maps real actions into the latent-action space.
+    \end{tablenotes}
+  \end{threeparttable}
+\end{table}
+
+% ============================================================================
+% finetuning_rollout_4fps_recon
+% ============================================================================
+\begin{table}[t]
+  \centering
+  \caption{Autoregressive prediction on RECON at 4\,FPS, evaluated at 4\,s. All fine-tuning strategies start from the same pretrained checkpoint and use the same fine-tuning budget.}
+  \label{tab:finetuning_rollout_4fps_recon}
+  \small
+  \setlength{\tabcolsep}{5pt}
+  \renewcommand{\arraystretch}{1.08}
+  \begin{threeparttable}
+    \begin{tabular}{lccc}
+      \toprule
+      Fine-tuning & \CompACTLPIPS & \CompACTDreamSim & \CompACTPSNR \\
+      \midrule
+      Reset & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+      Align & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+      Action2Latent & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+      \bottomrule
+    \end{tabular}
+    \begin{tablenotes}[flushleft]\footnotesize
+      \item \CompACTMissing{} denotes a result pending evaluation. Reset replaces the latent-action encoder; Align aligns action embeddings; Action2Latent maps real actions into the latent-action space.
+    \end{tablenotes}
+  \end{threeparttable}
+\end{table}
+
+% ============================================================================
+% finetuning_unseen_go_stanford
+% ============================================================================
+\begin{table}[t]
+  \centering
+  \caption{Unseen-domain prediction on \CompACTUnseenData{} at a 4\,s horizon. All fine-tuning strategies start from the same pretrained checkpoint and use the same fine-tuning budget.}
+  \label{tab:finetuning_unseen_go_stanford}
+  \small
+  \setlength{\tabcolsep}{5pt}
+  \renewcommand{\arraystretch}{1.08}
+  \begin{threeparttable}
+    \begin{tabular}{lccc}
+      \toprule
+      Fine-tuning & \CompACTLPIPS & \CompACTDreamSim & \CompACTPSNR \\
+      \midrule
+      Reset & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+      Align & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+      Action2Latent & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+      \bottomrule
+    \end{tabular}
+    \begin{tablenotes}[flushleft]\footnotesize
+      \item \CompACTMissing{} denotes a result pending evaluation. Reset replaces the latent-action encoder; Align aligns action embeddings; Action2Latent maps real actions into the latent-action space.
+    \end{tablenotes}
+  \end{threeparttable}
+\end{table}
+
+% ============================================================================
+% finetuning_navigation_planning
+% ============================================================================
+\begin{table*}[t]
+
+  \caption{Navigation planning under different latent-action fine-tuning
+  strategies. Lower is better; \CompACTMissing{} denotes a result pending evaluation.}
+  \label{tab:finetuning_planning}
+  \centering
+  \small
+  \setlength{\tabcolsep}{8pt}
+  \renewcommand{\arraystretch}{1.06}
+  \begin{tabular}{l cc cc}
+    \toprule
+    & \multicolumn{2}{c}{RECON} & \multicolumn{2}{c}{SCAND} \\
+    \cmidrule(lr){2-3}\cmidrule(l){4-5}
+    Fine-tuning & ATE $\downarrow$ & RPE $\downarrow$
+    & ATE $\downarrow$ & RPE $\downarrow$ \\
+    \midrule
+    Reset & \CompACTMissing & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+    Align & \CompACTMissing & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+    Action2Latent & \CompACTMissing & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+    \bottomrule
+  \end{tabular}
+\end{table*}

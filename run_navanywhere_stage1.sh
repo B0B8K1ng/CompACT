@@ -9,7 +9,7 @@ cd "${SCRIPT_DIR}"
 
 STAGE1_MODE="${STAGE1_MODE:-timept}" # timept | geopt | idmpt | latentpt
 DRY_RUN="${DRY_RUN:-0}"
-DETACH="${DETACH:-1}"
+DETACH="${DETACH:-0}"
 RUN_TIMESTAMP="${RUN_TIMESTAMP:-$(date -u +%Y%m%d_%H%M%S)}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-${STAGE1_MODE}-$(date -u +%m%d-%H%M%S)}"
 if [[ "${DRY_RUN}" == "1" ]]; then
@@ -73,7 +73,7 @@ WANDB_NOTES="${WANDB_NOTES:-NavAnywhere-only ${STAGE1_MODE}; shared balanced rec
 # Proxy stores are read only for local pairs. TimePT ignores all three.
 GEOMETRY_PROXY_ROOT="${GEOMETRY_PROXY_ROOT:-${COMPACT_NAS_ROOT}/cache/navanywhere_geometry_proxy}"
 IDM_PROXY_ROOT="${IDM_PROXY_ROOT:-${COMPACT_NAS_ROOT}/cache/navanywhere_idm_proxy}"
-LATENT_PROXY_ROOT="${LATENT_PROXY_ROOT:-${COMPACT_NAS_ROOT}/cache/navanywhere_dreamdojo_latent_proxy}"
+LATENT_PROXY_ROOT="${LATENT_PROXY_ROOT:-${COMPACT_NAS_ROOT}/cache/navanywhere_nav1_pixel_action_step100000}"
 
 NWM_HF_HOME="${NWM_HF_HOME:-/file_system/nas/algorithm/dujun.nie/huggingface}"
 VAE_MODEL_PATH="${VAE_MODEL_PATH:-}"
@@ -141,9 +141,25 @@ if [[ "${DRY_RUN}" != "1" ]]; then
         done
     fi
     case "${STAGE1_MODE}" in
-        geopt) [[ -d "${GEOMETRY_PROXY_ROOT}" ]] || { echo "ERROR: ${GEOMETRY_PROXY_ROOT} missing" >&2; exit 2; } ;;
+        geopt)
+            for marker in "${GEOMETRY_PROXY_ROOT}/metadata.json" "${GEOMETRY_PROXY_ROOT}/_SUCCESS.json"; do
+                if [[ ! -r "${marker}" ]]; then
+                    echo "ERROR: precomputed geometry cache is incomplete: ${marker}" >&2
+                    echo "Wait for ./precompute_navanywhere_geometry_actions_7gpu.sh to finish." >&2
+                    exit 2
+                fi
+            done
+            ;;
         idmpt) [[ -d "${IDM_PROXY_ROOT}" ]] || { echo "ERROR: ${IDM_PROXY_ROOT} missing" >&2; exit 2; } ;;
-        latentpt) [[ -d "${LATENT_PROXY_ROOT}" ]] || { echo "ERROR: ${LATENT_PROXY_ROOT} missing" >&2; exit 2; } ;;
+        latentpt)
+            for marker in "${LATENT_PROXY_ROOT}/metadata.json" "${LATENT_PROXY_ROOT}/_SUCCESS.json"; do
+                if [[ ! -r "${marker}" ]]; then
+                    echo "ERROR: precomputed nav1 latent-action cache is incomplete: ${marker}" >&2
+                    echo "Run ./precompute_navanywhere_nav1_latent_actions_8gpu.sh first." >&2
+                    exit 2
+                fi
+            done
+            ;;
     esac
     if ! command -v nvidia-smi >/dev/null 2>&1; then
         echo "ERROR: nvidia-smi is required for the capacity check." >&2
@@ -241,7 +257,7 @@ HYDRA_ARGS=(
     "training.optimizer.weight_decay=${WEIGHT_DECAY}"
     "training.results_dir=${RESULTS_DIR}"
     "training.run_name=${WANDB_RUN_NAME}"
-    "training.notes=${WANDB_NOTES}"
+    "training.notes=\"${WANDB_NOTES}\""
     "training.wandb_enabled=${WANDB_ENABLED}"
     "training.wandb_project=${WANDB_PROJECT}"
     "training.wandb_tags=[NavAnywhere,Stage1,${STAGE1_MODE},shared-recipe,precomputed-VAE]"

@@ -6,6 +6,9 @@ defaults:
 training_stage: real_finetune
 action_mode: real
 
+training:
+  num_workers: 8
+
 proxy:
   type: idm
   max_abs_frame_offset: 8

@@ -196,7 +196,16 @@ def setup_diffusion(config: DictConfig, for_eval: bool, device: torch.device):
 
 def setup_optimizer(config: DictConfig, model_params):
     """Setup optimizer using hydra instantiation."""
-    return instantiate(config.training.optimizer, params=model_params)
+    # Param groups contain live ``torch.nn.Parameter`` objects.  Hydra's default
+    # conversion wraps the surrounding dictionaries in ``DictConfig`` objects,
+    # which PyTorch optimizers reject because parameter groups must be plain
+    # dictionaries.  Partial conversion preserves the tensors while converting
+    # their containers to native Python types.
+    return instantiate(
+        config.training.optimizer,
+        params=model_params,
+        _convert_="partial",
+    )
 
 
 def setup_scheduler(config: DictConfig, optimizer):

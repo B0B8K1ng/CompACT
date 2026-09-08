@@ -6,8 +6,10 @@ context_size: 4
 normalize: true
 
 precomputed_latents:
-  enabled: false
-  root: null
+  # Stage-2 fine-tuning uses the completed four-dataset posterior cache by
+  # default. Override the environment variable when using a relocated cache.
+  enabled: true
+  root: ${oc.env:NWM_FINETUNE_VAE_LATENT_ROOT,/file_system/nas/algorithm/dujun.nie/nwm/compact/cache/vae_latents_sd_vae_ft_ema_224_four_datasets}
   cache_size: 8
   vae_identifier: stabilityai/sd-vae-ft-ema
   scaling_factor: 0.18215

@@ -1,0 +1,68 @@
+% Paper table; load tables/preamble.tex in the document preamble.
+% Bibliography: tables/navigation_references.bib.
+% Protocol and source audit: tables/navigation_comparison_sources.md (2026-09-08).
+
+% One main table. Compare rows only within the same protocol and horizon.
+\begin{table*}[t]
+  \caption{Comparison with NWM on navigation planning and visual prediction.
+  Results are grouped by evaluation protocol and prediction horizon.
+  Each group retains its corresponding NWM baseline; comparisons are within
+  the same group and horizon. Lower is better for all metrics.}
+  \label{tab:main_sota_navigation}
+  \centering
+  \small
+  \setlength{\tabcolsep}{4pt}
+  \renewcommand{\arraystretch}{1.08}
+  \begin{threeparttable}
+    \begin{tabular}{lcccccc}
+      \toprule
+      Method & Horizon & ATE $\downarrow$ & RPE $\downarrow$ & \CompACTLPIPS & \CompACTDreamSim & FID$\downarrow$ \\
+      \midrule
+      \multicolumn{7}{l}{\textit{RECON: navigation planning, 4 FPS; CEM: 120 candidates, 1 iteration}} \\
+      \addlinespace[2pt]
+      GNM\tnote{a} & 2 s & $1.87{\pm}0.00$ & $0.73{\pm}0.00$ & \textemdash & \textemdash & \textemdash \\
+      NoMaD\tnote{a} & 2 s & $1.93{\pm}0.04$ & $0.52{\pm}0.00$ & \textemdash & \textemdash & \textemdash \\
+      NWM (planning)\tnote{a} & 2 s & $1.13{\pm}0.02$ & $0.35{\pm}0.01$ & \textemdash & \textemdash & \textemdash \\
+      Latent action WM (sparse)\tnote{b} & 2 s & $1.43$ & $0.42$ & \textemdash & \textemdash & \textemdash \\
+      Latent action WM (noisy)\tnote{b} & 2 s & $1.40$ & $0.40$ & \textemdash & \textemdash & \textemdash \\
+      Latent action WM (discrete)\tnote{b} & 2 s & $1.48$ & $0.42$ & \textemdash & \textemdash & \textemdash \\
+      \CompACTMethod{} (Ours) & 2 s & \CompACTMissing & \CompACTMissing & \textemdash & \textemdash & \textemdash \\
+      \midrule
+      \multicolumn{7}{l}{\textit{RECON: autoregressive visual prediction, 4 FPS}\tnote{c}} \\
+      \addlinespace[2pt]
+      NWM & 4 s & \textemdash & \textemdash & $0.423$ & $0.181$ & $63.0$ \\
+      AR Forcing & 4 s & \textemdash & \textemdash & $0.341$ & $0.125$ & $52.9$ \\
+      \CompACTMethod{} (Ours) & 4 s & \textemdash & \textemdash & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+      \addlinespace[3pt]
+      NWM & 16 s & \textemdash & \textemdash & $0.533$ & $0.319$ & $77.3$ \\
+      AR Forcing & 16 s & \textemdash & \textemdash & $0.463$ & $0.210$ & $66.0$ \\
+      \CompACTMethod{} (Ours) & 16 s & \textemdash & \textemdash & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+      \midrule
+      \multicolumn{7}{l}{\textit{SACSoN: direct single-step visual prediction}\tnote{d}} \\
+      \addlinespace[2pt]
+      NWM & 4 s & \textemdash & \textemdash & $0.407$ & $0.229$ & $26.15$ \\
+      RAE-NWM & 4 s & \textemdash & \textemdash & $0.303$ & $0.145$ & $15.09$ \\
+      \CompACTMethod{} (Ours) & 4 s & \textemdash & \textemdash & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+      \addlinespace[3pt]
+      NWM & 16 s & \textemdash & \textemdash & $0.470$ & $0.281$ & $33.06$ \\
+      RAE-NWM & 16 s & \textemdash & \textemdash & $0.349$ & $0.171$ & $15.90$ \\
+      \CompACTMethod{} (Ours) & 16 s & \textemdash & \textemdash & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+      \bottomrule
+    \end{tabular}
+    \begin{tablenotes}[flushleft]\footnotesize
+      \item[a] NWM~\cite{bar2025navigation}, Table~2; 8-step trajectories.
+      CEM settings apply to world-model planning, while GNM and NoMaD are direct policies.
+      \item[b] High-capacity variants from Garrido et al.~\cite{garrido2026latentaction},
+      Table~S2 (right), following the NWM planning protocol in their Appendix~A.
+      \item[c] AR Forcing~\cite{yang2026arforcing}, Table~1 (RECON).
+      Both methods use four context frames and 4 FPS autoregressive evaluation;
+      NWM is re-evaluated with the same data split and evaluation settings as AR Forcing.
+      \item[d] RAE-NWM~\cite{zhang2026raenwm}, Table~1 (SACSoN).
+      Both methods directly predict the target frame from aggregated actions,
+      without generating intermediate frames.
+      \item Statistics are reproduced as reported; unreported standard deviations are omitted.
+      \textemdash{} denotes an unreported or inapplicable metric.
+      Results for our method are pending evaluation under each corresponding protocol.
+    \end{tablenotes}
+  \end{threeparttable}
+\end{table*}

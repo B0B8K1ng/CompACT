@@ -20,6 +20,22 @@ def natural_key(path: Path) -> list[object]:
     return [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", path.name)]
 
 
+def sample_directories(root: Path) -> list[Path]:
+    """Return one directory per sample name in deterministic natural order.
+
+    The NAS can transiently return the same directory entry more than once after
+    a large distributed write.  Those entries have the same name/path and must
+    not turn an otherwise identical GT/prediction sample set into a false count
+    mismatch.
+    """
+    samples = {
+        path.name: path
+        for path in root.iterdir()
+        if path.is_dir()
+    }
+    return sorted(samples.values(), key=natural_key)
+
+
 def parse_frames(value: str) -> dict[str, int]:
     frames: dict[str, int] = {}
     for item in value.split(","):
@@ -52,8 +68,8 @@ def main() -> None:
     parser.add_argument("--fid", action="store_true")
     args = parser.parse_args()
 
-    gt_samples = sorted((path for path in args.gt_dir.iterdir() if path.is_dir()), key=natural_key)
-    pred_samples = sorted((path for path in args.pred_dir.iterdir() if path.is_dir()), key=natural_key)
+    gt_samples = sample_directories(args.gt_dir)
+    pred_samples = sample_directories(args.pred_dir)
     gt_names = [path.name for path in gt_samples]
     pred_names = [path.name for path in pred_samples]
     if gt_names != pred_names:

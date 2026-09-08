@@ -30,7 +30,11 @@ from two_stage_nwm import (
     build_optimizer_param_groups,
     configure_trainable_parameters,
 )
-from two_stage_training import save_two_stage_checkpoint, two_stage_train_step
+from two_stage_training import (
+    _defer_random_init_gradient_check,
+    save_two_stage_checkpoint,
+    two_stage_train_step,
+)
 
 
 SMOKE_DEVICE = torch.device(os.environ.get("TWO_STAGE_SMOKE_DEVICE", "cpu"))
@@ -166,7 +170,7 @@ def _config(
     )
 
 
-def _model(config) -> CDiT:
+def _model(config, *, open_zero_gates: bool = True) -> CDiT:
     torch.manual_seed(1103)
     model = CDiT(
         input_size=2,
@@ -183,7 +187,8 @@ def _model(config) -> CDiT:
         action_mode=str(config.action_mode),
         finetune=OmegaConf.to_container(config.finetune, resolve=True),
     ).to(SMOKE_DEVICE)
-    _open_zero_gates(model)
+    if open_zero_gates:
+        _open_zero_gates(model)
     return model
 
 
@@ -306,6 +311,44 @@ class TwoStageProductionSmokeTests(unittest.TestCase):
 
     def setUp(self) -> None:
         torch.manual_seed(3301)
+
+    def test_no_pretrain_opens_standard_zero_init_before_gradient_check(self):
+        config = _config(
+            training_stage="real_finetune", action_mode="real", scheme="reset"
+        )
+        config.finetune.random_init = True
+        config.finetune.warmup_steps = 0
+        config.finetune.joint_steps = 3
+        model = _model(config, open_zero_gates=False)
+        ema = _ema(model)
+        optimizer = _optimizer(
+            model,
+            training_stage="real_finetune",
+            action_mode="real",
+            scheme="reset",
+            substage="joint",
+        )
+        before = _state_copy(model, "motion_condition_encoder.real_")
+
+        for current in range(3):
+            logs, _ = _step(
+                model=model,
+                ema=ema,
+                diffusion=_diffusion(),
+                optimizer=optimizer,
+                batch=_batch(),
+                config=config,
+                scheme="reset",
+                substage="joint",
+                check_gradients=not _defer_random_init_gradient_check(
+                    config, "joint", current
+                ),
+            )
+            self.assertEqual(
+                bool(logs.get("gradient_check_performed", False)), current == 2
+            )
+
+        self.assertTrue(_any_changed(before, model))
 
     def test_timept_three_steps_checkpoint_and_exact_resume(self):
         config = _config(

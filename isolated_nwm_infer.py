@@ -507,6 +507,34 @@ def main(config: DictConfig):
             config, dataset_name, config.eval_type, predefined_index=True
         )
 
+        expected_full_count = config.get("eval_expected_full_count")
+        if expected_full_count is not None and len(dataset_val) != int(expected_full_count):
+            raise RuntimeError(
+                f"Evaluation split size changed for {dataset_name}/{config.eval_type}: "
+                f"expected {expected_full_count}, got {len(dataset_val)}"
+            )
+
+        sample_indices = config.get("eval_sample_indices")
+        if sample_indices is not None:
+            sample_indices = [int(index) for index in sample_indices]
+            if len(sample_indices) != len(set(sample_indices)):
+                raise ValueError("eval_sample_indices must be unique")
+            invalid = [
+                index for index in sample_indices if index < 0 or index >= len(dataset_val)
+            ]
+            if invalid:
+                raise IndexError(
+                    f"eval_sample_indices are outside [0, {len(dataset_val)}): {invalid}"
+                )
+            dataset_val = torch.utils.data.Subset(dataset_val, sample_indices)
+            logger.info(
+                "Selected %d fixed samples for %s/%s: %s",
+                len(sample_indices),
+                dataset_name,
+                config.eval_type,
+                sample_indices,
+            )
+
         if len(dataset_val) % num_tasks != 0:
             logger.warning(
                 "Enabling distributed evaluation with an eval dataset not divisible by process number. "

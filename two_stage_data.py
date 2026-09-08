@@ -24,9 +24,12 @@ from torch.utils.data import Dataset
 
 from navanywhere_recipe import (
     DEFAULT_GOAL_STRATA,
+    affine_observation_slot,
     coprime_stride,
     frame_indices_sha256,
     load_sampling_recipe,
+    scan_trajectory_frames,
+    sample_recipe_goal_offsets,
     validate_sampling_recipe,
 )
 
@@ -806,7 +809,10 @@ class NavAnywhereDataset(Dataset):
         entries = self._read_manifest(manifest)
         if entries is None:
             entries = self._discover_trajectory_entries()
-        self._trajectories = self._build_trajectories(entries)
+        if self.sampling_recipe is not None and precomputed_latent_root is not None:
+            self._trajectories = self._build_precomputed_recipe_trajectories()
+        else:
+            self._trajectories = self._build_trajectories(entries)
         if not self._trajectories:
             raise ValueError(f"No usable NavAnywhere trajectories found under {self.root}")
         self._cumulative_observations: list[int] = []
@@ -1051,13 +1057,10 @@ class NavAnywhereDataset(Dataset):
     ) -> list[tuple[int, str]]:
         supplied = entry.get("frames", entry.get("frame_paths"))
         if supplied is None:
-            frames = []
-            for frame in os.scandir(trajectory_path):
-                if frame.is_file(follow_symlinks=False) and frame.name.lower().endswith(
-                    ".jpg"
-                ):
-                    frames.append((self._frame_index(frame.name), frame.path))
-            return frames
+            # Keep training inventory discovery identical to recipe generation
+            # and latent precomputation, including retries for transient NAS
+            # directory-listing duplicates.
+            return scan_trajectory_frames(trajectory_path)
 
         if isinstance(supplied, Mapping):
             supplied = [
@@ -1155,6 +1158,47 @@ class NavAnywhereDataset(Dataset):
             )
         return records
 
+    def _build_precomputed_recipe_trajectories(self) -> list[_TrajectoryRecord]:
+        """Restore a frozen contiguous inventory without rescanning raw JPEGs.
+
+        Precomputed-latent training never reads ``frame_paths``.  The validated
+        recipe and latent manifests are therefore the source of truth, and
+        reconstructing their contiguous indices avoids every DDP rank listing
+        millions of raw files on NAS during startup.
+        """
+        assert self.sampling_recipe is not None
+        records: list[_TrajectoryRecord] = []
+        for item in self.sampling_recipe["trajectories"]:
+            source = str(item["source_id"])
+            trajectory = str(item["trajectory_id"])
+            first = int(item["first_frame_index"])
+            last = int(item["last_frame_index"])
+            frame_count = int(item["frame_count"])
+            if last - first + 1 != frame_count:
+                raise ValueError(
+                    "Precomputed NavAnywhere startup requires contiguous recipe "
+                    f"frame indices for {source!r}/{trajectory!r}"
+                )
+            indices = np.arange(first, last + 1, dtype=np.int64)
+            if frame_indices_sha256(indices) != str(item["frame_indices_sha256"]):
+                raise ValueError(
+                    "Reconstructed NavAnywhere frame inventory does not match "
+                    f"the frozen recipe for {source!r}/{trajectory!r}"
+                )
+            positions = self._observation_positions(indices)
+            if positions.size == 0:
+                continue
+            records.append(
+                _TrajectoryRecord(
+                    source_id=source,
+                    trajectory_id=trajectory,
+                    frame_indices=indices,
+                    frame_paths=(),
+                    observation_positions=positions,
+                )
+            )
+        return records
+
     def __len__(self) -> int:
         if self.sampling_recipe is not None:
             return int(self.sampling_recipe["samples_per_epoch"])
@@ -1191,14 +1235,16 @@ class NavAnywhereDataset(Dataset):
                 if trajectory_slot < source_draws_per_epoch
                 else 0
             )
-            global_draw = (
-                int(self.epoch) * trajectory_draws_per_epoch + trajectory_draw
-            )
             stride, shift = self._recipe_affine[
                 (record.source_id, record.trajectory_id)
             ]
-            observation_slot = (shift + stride * global_draw) % int(
-                observations.size
+            observation_slot = affine_observation_slot(
+                epoch=self.epoch,
+                trajectory_draw=trajectory_draw,
+                trajectory_draws_per_epoch=trajectory_draws_per_epoch,
+                observation_count=int(observations.size),
+                stride=stride,
+                shift=shift,
             )
             return record, int(observations[observation_slot])
         trajectory_position = bisect.bisect_right(
@@ -1235,37 +1281,20 @@ class NavAnywhereDataset(Dataset):
         if available.size == 0:
             raise RuntimeError("Indexed observation unexpectedly has no valid goals")
         if self.sampling_recipe is not None:
-            generator = np.random.default_rng(
-                np.random.SeedSequence(
-                    (int(self.sampling_recipe["seed"]), self.epoch, int(dataset_index))
-                )
-            )
             strata = tuple(
                 tuple(map(int, bounds))
                 for bounds in self.sampling_recipe["goal_sampling"]["strata"]
             )
             if strata != DEFAULT_GOAL_STRATA:
                 raise RuntimeError("Validated goal strata changed unexpectedly")
-            selected: list[int] = []
-            unused = set(map(int, available.tolist()))
-            for goal_index in range(self.goals_per_obs):
-                low, high = strata[goal_index % len(strata)]
-                candidates = [
-                    value for value in unused if low <= value <= high
-                ]
-                if not candidates:
-                    candidates = [
-                        value
-                        for value in map(int, available.tolist())
-                        if low <= value <= high
-                    ]
-                if not candidates:
-                    candidates = list(unused) or list(map(int, available.tolist()))
-                candidates.sort()
-                choice = candidates[int(generator.integers(0, len(candidates)))]
-                selected.append(choice)
-                unused.discard(choice)
-            return np.asarray(selected, dtype=np.int64)
+            return sample_recipe_goal_offsets(
+                available,
+                seed=int(self.sampling_recipe["seed"]),
+                epoch=self.epoch,
+                dataset_index=int(dataset_index),
+                goals_per_obs=self.goals_per_obs,
+                strata=strata,
+            )
         if self.seed is None:
             selected = np.random.randint(0, available.size, size=self.goals_per_obs)
         else:

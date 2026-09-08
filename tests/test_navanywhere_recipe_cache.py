@@ -10,6 +10,8 @@ import torch
 from omegaconf import OmegaConf
 from PIL import Image
 
+import navanywhere_recipe
+import precompute_navanywhere_vae_latents
 from navanywhere_latent_cache import validate_navanywhere_latent_cache
 from navanywhere_recipe import (
     build_sampling_recipe,
@@ -24,6 +26,134 @@ import two_stage_training
 def _fingerprinted(**values):
     values["fingerprint"] = hashlib.sha256(canonical_json(values)).hexdigest()
     return values
+
+
+def test_frame_scan_retries_a_transient_duplicate(tmp_path: Path, monkeypatch) -> None:
+    trajectory = tmp_path / "trajectory"
+    trajectory.mkdir()
+    for frame_index in range(2):
+        Image.new("RGB", (4, 4)).save(trajectory / f"{frame_index}.jpg")
+
+    real_scan = navanywhere_recipe._scan_trajectory_frames_once
+    calls = 0
+
+    def flaky_scan(path: str):
+        nonlocal calls
+        calls += 1
+        frames = real_scan(path)
+        return [frames[0], frames[0], *frames[1:]] if calls == 1 else frames
+
+    monkeypatch.setattr(navanywhere_recipe, "_scan_trajectory_frames_once", flaky_scan)
+    monkeypatch.setattr(navanywhere_recipe, "FRAME_SCAN_RETRY_DELAY_SECONDS", 0)
+
+    frames = navanywhere_recipe.scan_trajectory_frames(trajectory)
+    assert [index for index, _ in frames] == [0, 1]
+    assert calls == 2
+
+
+def test_single_scan_collapses_repeated_identical_directory_entries(
+    tmp_path: Path, monkeypatch
+) -> None:
+    trajectory = tmp_path / "trajectory"
+    trajectory.mkdir()
+    for frame_index in range(2):
+        Image.new("RGB", (4, 4)).save(trajectory / f"{frame_index}.jpg")
+
+    entries = list(navanywhere_recipe.os.scandir(trajectory))
+    monkeypatch.setattr(
+        navanywhere_recipe.os,
+        "scandir",
+        lambda _path: [*entries, *entries],
+    )
+
+    frames = navanywhere_recipe._scan_trajectory_frames_once(str(trajectory))
+    assert [index for index, _ in frames] == [0, 1]
+
+
+def test_frame_scan_rejects_persistent_duplicate_indices(
+    tmp_path: Path, monkeypatch
+) -> None:
+    trajectory = tmp_path / "trajectory"
+    trajectory.mkdir()
+    Image.new("RGB", (4, 4)).save(trajectory / "0.jpg")
+    Image.new("RGB", (4, 4)).save(trajectory / "frame_0.jpg")
+    monkeypatch.setattr(navanywhere_recipe, "FRAME_SCAN_RETRY_DELAY_SECONDS", 0)
+
+    try:
+        navanywhere_recipe.scan_trajectory_frames(trajectory)
+    except ValueError as exc:
+        assert "persisted across 3 scans" in str(exc)
+    else:
+        raise AssertionError("persistent duplicate frame indices were accepted")
+
+
+def test_unreadable_frame_uses_previous_nearest_frame(
+    tmp_path: Path, monkeypatch
+) -> None:
+    frames = []
+    for frame_index, color in enumerate((11, 22, 33)):
+        path = tmp_path / f"{frame_index}.jpg"
+        if frame_index == 1:
+            path.touch()
+        else:
+            Image.new("RGB", (4, 4), color=(color,) * 3).save(path)
+        frames.append((frame_index, str(path)))
+
+    monkeypatch.setattr(
+        precompute_navanywhere_vae_latents,
+        "IMAGE_READ_RETRY_DELAY_SECONDS",
+        0,
+    )
+    tensor, substitution = (
+        precompute_navanywhere_vae_latents._load_frame_with_fallback(
+            frames,
+            1,
+            lambda image: torch.tensor(image.getpixel((0, 0))),
+        )
+    )
+
+    assert tensor.tolist() == [11, 11, 11]
+    assert substitution is not None
+    assert substitution["frame_index"] == 1
+    assert substitution["replacement_frame_index"] == 0
+    assert "UnidentifiedImageError" in substitution["reason"]
+
+
+def test_transient_image_read_is_retried_without_substitution(
+    tmp_path: Path, monkeypatch
+) -> None:
+    path = tmp_path / "0.jpg"
+    Image.new("RGB", (4, 4), color=(7, 7, 7)).save(path)
+    frames = [(0, str(path))]
+    real_load = precompute_navanywhere_vae_latents.load_image_tensor
+    calls = 0
+
+    def flaky_load(image_path: Path, transform):
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise OSError("transient NAS read")
+        return real_load(image_path, transform)
+
+    monkeypatch.setattr(
+        precompute_navanywhere_vae_latents, "load_image_tensor", flaky_load
+    )
+    monkeypatch.setattr(
+        precompute_navanywhere_vae_latents,
+        "IMAGE_READ_RETRY_DELAY_SECONDS",
+        0,
+    )
+    tensor, substitution = (
+        precompute_navanywhere_vae_latents._load_frame_with_fallback(
+            frames,
+            0,
+            lambda image: torch.tensor(image.getpixel((0, 0))),
+        )
+    )
+
+    assert tensor.tolist() == [7, 7, 7]
+    assert substitution is None
+    assert calls == 3
 
 
 def _write_completed_cache(tmp_path: Path):
