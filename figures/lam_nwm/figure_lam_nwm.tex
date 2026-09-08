@@ -4,17 +4,19 @@
   \centering
   \includegraphics[width=\textwidth]{figures/lam_nwm/overview.pdf}
   \caption{\textbf{Design choices for transferable latent actions and navigation world models.}
-  \textbf{(a) LAM objectives.} A frame-pair encoder $E_{\mathrm{LAM}}$ produces a latent action $z$.
-  Action only reconstructs the ground-truth navigation action; Pixel reconstructs the future frame from $z$ and the initial frame; DINO encodes both frames into features and reconstructs future features from $z$ and initial-frame features; Pixel + action combines pixel and action reconstruction.
-  \textbf{(b) NWM pretraining.} NWM-Real trains directly on action-labeled Base data.
-  TimePT, GeoPT, and LatentPT pretrain on NavAnywhere using time conditioning without action labels, VGGT-derived geometric actions, and LAM-derived latent actions, respectively, before adaptation on Base data.
-  NavAnywhere v2 extends v1 with Ego4D and GO to study data scale.
-  Base data comprises RECON, SCAND, TartanDrive, and HuRoN; the LAM experiments train on RECON, SCAND, and HuRoN, holding out TartanDrive for out-of-domain evaluation.
-  \textbf{(c) Two-step fine-tuning of LatentPT.} $E_z$ maps latent actions to NWM conditioning embeddings and is distinct from $E_{\mathrm{LAM}}$.
-  Reset replaces $E_z$ with $E_a$; Align matches $E_a(a)$ to a frozen $E_z(z)$ teacher; Action2Latent uses $E_z(E_a(a))$.
-  Step 1 trains only $E_a$: Reset and Action2Latent use the NWM objective, while Align uses embedding alignment.
-  Step 2 jointly trains the active NWM path; Align retains its frozen teacher and alignment objective, whereas Action2Latent also updates $E_z$.
-  All three inference paths condition on real actions without requiring future frames or the LAM extractor.
-  Loss symbols denote training objectives without specifying their implementation or weights.}
+  \textbf{(a) LAM objectives.} $E_{\mathrm{LAM}}$ extracts latent action $z$ from a frame pair.
+  Four variants reconstruct navigation actions, future pixels, future DINO features, or pixels and actions jointly.
+  \textbf{(b) NWM architecture and pretraining.} A shared frozen VAE encodes context and target frames.
+  Shared patch embedding with positional embeddings produces clean context tokens and noisy target tokens.
+  Each CDiT block in $F_\theta$ applies target self-attention, cross-attention with context keys and values, and an FFN.
+  Diffusion timestep $\tau$, relative frame offset $\Delta t$, and motion condition $h_m$ form
+  $c=E_\tau(\tau)+E_\Delta(\Delta t)+h_m$, which controls adaptive normalization and block gates.
+  The output predicts noise and variance for the diffusion objective; inference iteratively denoises and decodes with the frozen VAE.
+  NWM-Real trains on Base data with $a\!\rightarrow\!E_a$.
+  NavAnywhere pretraining uses no motion branch (TimePT), $g\!\rightarrow\!E_g$ (GeoPT), or $z\!\rightarrow\!E_z$ (LatentPT).
+  Dashed VGGT and LAM paths denote offline annotation.
+  \textbf{(c) Two-step fine-tuning on Base data.} Reset replaces $E_z$ with $E_a$; Align matches $E_a(a)$ to frozen $E_z(z)$; Action2Latent uses $E_z(E_a(a))$.
+  Step 1 trains only $E_a$; Step 2 trains the active NWM path, retaining the frozen teacher for Align and updating $E_z$ for Action2Latent.
+  Inference requires real actions without the LAM extractor.}
   \label{fig:lam-nwm-design}
 \end{figure}

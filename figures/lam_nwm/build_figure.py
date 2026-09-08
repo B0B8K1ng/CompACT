@@ -13,7 +13,7 @@ import cairosvg
 from PIL import ImageFont
 
 OUT = Path(__file__).resolve().parent
-W, H = 1600, 1580
+W, H = 1600, 1984
 C = {
     'ink': '#202B3A', 'muted': '#566475', 'line': '#64748B',
     'border': '#D4DDE5', 'paper': '#FFFFFF', 'neutral': '#F6F8FA',
@@ -63,7 +63,7 @@ def text(x, y, s, size=24, color=None, weight=400, anchor='start', italic=False)
     # Position math runs explicitly: avoids SVG renderer inconsistencies with
     # nested tspan anchors and missing combining-accent glyphs in PDF fonts.
     segments=runs(s,size,weight,italic)
-    cleaned=lambda q:q.replace('x̂','x').replace('f̂','f').replace('ẑ','z')
+    cleaned=lambda q:q.replace('x̂','x').replace('f̂','f').replace('ẑ','z').replace('ε̂','ε').replace('Σ̂','Σ').replace('û','u')
     widths=[length(cleaned(q),z,weight,it) for q,z,dy,it in segments]
     total=sum(widths)
     cursor=x-(total/2 if anchor=='middle' else total if anchor=='end' else 0)
@@ -72,7 +72,7 @@ def text(x, y, s, size=24, color=None, weight=400, anchor='start', italic=False)
         add(f'<text xml:space="preserve" x="{cursor:.3f}" y="{y+dy:.3f}" font-family="Liberation Sans, Arial, sans-serif" '
             f'font-size="{z}" font-weight="{weight}" fill="{color or C["ink"]}"'
             + (' font-style="italic"' if it else '') + f'>{escape(content)}</text>')
-        if q in ['x̂','f̂','ẑ']:
+        if q in ['x̂','f̂','ẑ','ε̂','Σ̂','û']:
             path([(cursor+width*.17,y+dy-z*.80),(cursor+width*.57,y+dy-z*.97),
                   (cursor+width*.98,y+dy-z*.80)],color=color or C['ink'],width=1.5)
         cursor+=width
@@ -185,10 +185,10 @@ def panel_a():
     block(x+456, cy-28, 123, 56, '{D_pix}', 'blue')
     arrow(x+585, cy, x+629, cy)
     scene(x+642, cy-21, 58, 40, True)
-    text(x+671, cy+54, '{x̂_t+Δt}', 24, anchor='middle')
+    text(x+671, cy+49, '{x̂_t+Δt}', 24, anchor='middle')
     path([(x+44,cy+44),(x+44,y+151),(x+517,y+151),(x+517,cy+34)], arrow=True)
     text(x+291, y+145, 'Start-frame condition {x_t}', 22, C['muted'], anchor='middle')
-    loss(x+675, y+161, '{L_pix}', 'blue')
+    loss(x+675, y+170, '{L_pix}', 'blue')
 
     # DINO.
     x, y = 24, 268
@@ -254,8 +254,7 @@ def panel_a():
 
 
 def panel_b():
-    section(590,'b','NWM pretraining','Which pretraining signal transfers best?')
-    # Dataset cards keep data scale separate from the model choice.
+    section(590,'b','NWM architecture and pretraining','Alternative action interfaces · same backbone architecture')
     for x,w,title,sub,kind in [
         (24,619,'Base data · GT navigation actions','RECON · SCAND · TartanDrive · HuRoN','orange'),
         (658,420,'NavAnywhere v1','13 datasets · 322 h','blue'),
@@ -265,41 +264,125 @@ def panel_b():
         text(x+16,641,title,24,C[kind],700)
         text(x+16,669,sub,23,C['muted'])
 
-    text(43,716,'MODEL',20,C['muted'],700)
-    text(368,716,'CONDITIONING SIGNAL',20,C['muted'],700,anchor='middle')
-    text(666,716,'PRETRAINING',20,C['muted'],700,anchor='middle')
-    text(977,716,'BASE-DATA TRAINING',20,C['muted'],700,anchor='middle')
+    # Four mutually exclusive motion branches, not a mixture of action sources.
+    recipes=[('nwm-real','GT actions · no pretraining','Train on Base from scratch','orange'),
+             ('nwm-timept','Pretrain on NavAnywhere v1','Base: Reset fine-tuning','blue'),
+             ('nwm-geopt','Pretrain on NavAnywhere v1','Base: Reset fine-tuning','teal'),
+             ('nwm-latentpt','Pretrain on NavAnywhere v1','Base: strategies in (c)','purple')]
+    for i,(name,sub,ft,kind) in enumerate(recipes):
+        x,y=24+i*394,707
+        rect(x,y,370,167,'white',C['border'],10)
+        rect(x,y,370,5,C[kind],radius=2)
+        text(x+17,y+33,name,25,C[kind],700)
+        text(x+17,y+60,sub,22,C['muted'])
+        text(x+185,y+151,ft,22,C['muted'],anchor='middle')
+        cy=813
+        if i==1:
+            text(x+185,cy+7,'No action branch',25,C['blue'],anchor='middle')
+            continue
+        if i==0:
+            text(x+82,cy+8,'a',29,C['orange'],anchor='middle',italic=True)
+            arrow(x+106,cy,x+173,cy)
+        else:
+            block(x+15,cy-25,91,50,'VGGT' if i==2 else '{E_LAM}',kind,size=23)
+            arrow(x+112,cy,x+134,cy,dash='5 4')
+            text(x+150,cy+8,'g' if i==2 else 'z',27,C[kind],anchor='middle',italic=True)
+            arrow(x+166,cy,x+176,cy)
+        block(x+182,cy-25,87,50,['{E_a}','','{E_g}','{E_z}'][i],kind,size=26)
+        arrow(x+275,cy,x+298,cy)
+        text(x+327,cy+8,'{h_m}',26,C[kind],anchor='middle')
+        path([(x+327,cy+15),(x+327,892)],color=C['purple'])
+    path([(351,892),(1533,892)],color=C['purple'])
+    text(24,916,'Dashed arrows: offline video labeling',21,C['muted'])
+    text(1090,916,'Select one motion branch; TimePT omits {h_m}',22,C['purple'],anchor='middle')
 
-    rows=[
-        ('nwm-real','a → {E_a}','None','Train from scratch','orange'),
-        ('nwm-timept','Time Δt only','NA-v1 → NWM','Reset fine-tuning','blue'),
-        ('nwm-geopt','VGGT → ã → {E_geo}','NA-v1 → NWM','Reset fine-tuning','teal'),
-        ('nwm-latentpt','{E_LAM} → z → {E_z}','NA-v1 → NWM','3 strategies in (c)','purple'),
-    ]
-    for i,(name,signal,pt,ft,kind) in enumerate(rows):
-        y=729+i*59
-        rect(24,y,1108,50,'#FFFFFF',C['border'],8)
-        rect(24,y,7,50,C[kind],radius=3)
-        text(44,y+33,name,24,C[kind],700)
-        text(369,y+32,signal,23,anchor='middle')
-        arrow(505,y+25,543,y+25)
-        rect(554,y+7,226,36,C[kind+'_bg'],radius=5)
-        text(667,y+32,pt,23,anchor='middle')
-        arrow(791,y+25,831,y+25)
-        text(979,y+32,ft,23,anchor='middle')
+    # Diffusion step and prediction horizon have distinct learned embeddings.
+    text(24,952,'Diffusion step τ',22)
+    arrow(178,944,197,944)
+    block(203,920,83,48,'{E_τ}','blue')
+    text(321,952,'Frame offset Δt',22)
+    arrow(469,944,486,944)
+    block(492,920,91,48,'{E_Δ}','blue')
+    path([(292,944),(306,944),(306,980),(627,980),(627,966)],arrow=True)
+    arrow(589,944,607,944)
+    arrow(627,892,627,924,color=C['purple'])
+    add(f'<circle cx="627" cy="944" r="16" fill="white" stroke="{C["purple"]}" stroke-width="2"/>')
+    text(627,953,'+',30,C['purple'],anchor='middle')
+    arrow(649,944,711,944,color=C['purple'])
+    text(680,935,'c',25,C['purple'],anchor='middle',italic=True)
+    rect(718,920,858,49,C['purple_bg'],C['purple'],8)
+    text(1147,952,'adaLN conditioning: shift / scale · residual gates in CDiT blocks',24,C['purple'],anchor='middle')
 
-    rect(1151,704,425,252,C['neutral'],C['border'],10)
-    text(1363,735,'Shared NWM prediction',24,weight=700,anchor='middle')
-    text(1363,777,'Visual context {x_≤t}',23,anchor='middle')
-    arrow(1363,787,1363,806)
-    block(1294,812,139,72,'NWM','blue',subtitle='{F_θ}')
-    text(1200,855,'c',28,anchor='middle',italic=True)
-    arrow(1220,847,1288,847)
-    arrow(1440,847,1470,847)
-    text(1521,854,'{x̂_t+Δt}',25,anchor='middle')
-    arrow(1363,923,1363,890)
-    text(1363,945,'Δt · diffusion time · noise',22,C['muted'],anchor='middle')
-    text(24,985,'TimePT: no action labels.   GeoPT / LatentPT: proxy actions from video.   c denotes action conditioning.',23,C['muted'])
+    text(24,1018,'NWM {F_θ}: visual latent diffusion',25,C['blue'],700)
+    # Target tokens traverse SA -> CA -> FFN. Context tokens are K/V only.
+    rect(719,1006,598,133,C['blue_bg'],C['blue'],10)
+    text(912,1035,'CDiT block × L',23,C['blue'],700,anchor='middle')
+    for cx in [816,1012,1211]:
+        arrow(cx,975,cx,1046,color=C['purple'],width=1.7)
+    arrow(1455,975,1455,1034,color=C['purple'],width=1.7)
+
+    # Training target -> visual latent u0 -> forward diffusion -> noisy tokens.
+    scene(46,1056,49,37,True)
+    text(70,1047,'Target',21,anchor='middle')
+    text(70,1122,'train only',21,C['muted'],anchor='middle')
+    arrow(101,1076,119,1076)
+    block(125,1048,125,56,'VAE','blue',frozen=True,size=24,subtitle='encoder')
+    arrow(256,1076,272,1076)
+    text(291,1083,'{u_0}',25,anchor='middle')
+    arrow(308,1076,325,1076)
+    block(331,1050,112,52,'Add noise','blue',size=22)
+    text(387,1040,'τ, ε',23,C['muted'],anchor='middle')
+    arrow(387,1044,387,1048)
+    arrow(449,1076,466,1076)
+    text(484,1083,'{u_τ}',25,anchor='middle')
+    arrow(503,1076,519,1076)
+    block(525,1048,145,56,'Patch embed','blue',size=22,subtitle='+ position')
+    arrow(676,1076,735,1076)
+    block(741,1052,149,49,'Self-attn','blue',size=23)
+    arrow(896,1076,922,1076)
+    text(909,1065,'Q',20,C['muted'],anchor='middle')
+    block(928,1052,168,49,'Cross-attn','blue',size=23)
+    arrow(1102,1076,1137,1076)
+    block(1143,1052,136,49,'FFN','blue',size=24)
+    arrow(1285,1076,1350,1076)
+    block(1356,1040,198,73,'Final projection','blue',size=24,subtitle='+ unpatchify')
+    text(737,1128,'Residual + gating',21,C['blue'])
+
+    # Clean context uses the same VAE and patch embedding weights.
+    text(67,1165,'Context',21,anchor='middle')
+    scene(30,1177,33,28)
+    scene(70,1177,33,28,True)
+    arrow(109,1190,119,1190)
+    block(125,1162,125,56,'VAE','blue',frozen=True,size=24,subtitle='encoder')
+    arrow(256,1190,321,1190)
+    text(363,1198,'{u_ctx}',25,anchor='middle')
+    arrow(405,1190,519,1190)
+    block(525,1162,145,56,'Patch embed','blue',size=22,subtitle='+ position')
+    path([(676,1190),(1012,1190),(1012,1107)],arrow=True)
+    text(814,1180,'Clean context tokens',22,C['muted'],anchor='middle')
+    text(1030,1160,'K, V',22,C['blue'])
+
+    arrow(1455,1119,1455,1148)
+    text(1455,1178,'{ε̂_θ}, {Σ̂_θ}',28,anchor='middle')
+    arrow(1455,1189,1455,1209)
+    text(1455,1235,'{L_NWM} · diffusion loss',23,C['blue'],anchor='middle')
+    text(24,1243,'Shared, frozen VAE · shared patch embedding · context enters every cross-attention block',22,C['muted'])
+
+    # Generation is separate from the training graph: no future-frame input.
+    rect(24,1261,1552,71,C['neutral'],C['border'],9)
+    text(43,1291,'GENERATION',22,C['blue'],700)
+    text(43,1318,'at inference',21,C['muted'])
+    text(302,1304,'Gaussian noise',23,anchor='middle')
+    arrow(391,1296,430,1296)
+    block(436,1273,317,47,'Iterative denoising with {F_θ}','blue',size=23)
+    arrow(759,1296,809,1296)
+    text(841,1304,'{û_0}',27,anchor='middle')
+    arrow(867,1296,918,1296)
+    block(924,1271,206,50,'VAE decoder','blue',frozen=True,size=23)
+    arrow(1136,1296,1192,1296)
+    scene(1204,1279,50,36,True)
+    text(1388,1304,'Future frame {x̂_t+Δt}',25,anchor='middle')
+    text(24,1364,'The same context and time / action conditions guide each denoising step.  u: visual latent; z: latent action.',22,C['muted'])
 
 
 def train_legend(x,y):
@@ -428,9 +511,11 @@ def main():
         start=len(parts)
         fn()
         sections.append(''.join(parts[start:]))
-    export('overview',''.join(sections),0,1594)
+    # Expand the NWM panel while retaining the original standalone FT layout.
+    shifted_c='<g transform="translate(0 390)">'+sections[2]+'</g>'
+    export('overview',sections[0]+sections[1]+shifted_c,0,H)
     export('panel_a_lam',sections[0],0,560)
-    export('panel_b_pretraining',sections[1],553,446)
+    export('panel_b_pretraining',sections[1],553,826)
     export('panel_c_finetuning',sections[2],995,599)
 
 

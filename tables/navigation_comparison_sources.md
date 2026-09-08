@@ -4,9 +4,9 @@
 
 本次检索以完整标题 “Navigation World Models”、NWM、RECON、ATE/RPE、LPIPS、DreamSim、PSNR、FID 和 citing works 为线索，核查 arXiv 原文、补充材料及作者官方代码。Google Scholar 检索页访问失败，因此不声称覆盖其全部施引文献。下列数字均为论文报告值，没有运行新的模型评测。
 
-所有结果合并为一张主表，共用一个表头、标题和编号（`tab:main_sota_navigation`）。表内规划分组沿用原始 NWM 的 RECON 协议；视觉分组按论文的评测设置组织，每组同时引用该工作与其配套 NWM 基线。数据集、预测方式和时域不同的组不能直接排名。指标名称相同或都写作“4 秒”，不足以证明结果可比。合并只调整排版，原有数值及其来源保持不变。
+主结果分为两张独立表，仍放在同一个 tex 文件中，各有标题和编号。规划表（`tab:main_sota_navigation`）沿用原始 NWM 的 RECON 协议；视觉表（`tab:main_visual_prediction`）按论文的评测设置分组，每组同时引用该工作与其配套 NWM 基线。数据集、预测方式和时域不同的组不能直接排名。指标名称相同或都写作“4 秒”，不足以证明结果可比。拆分只调整排版，原有数值及其来源保持不变。
 
-## 规划分组采用的协议
+## 规划表采用的协议
 
 基准是 Bar 等人的 [Navigation World Models，arXiv:2412.03572v2](https://arxiv.org/html/2412.03572v2)，不是任意含有 NWM 行的导航表。
 
@@ -23,7 +23,7 @@
 
 筛选要求：论文引用 NWM，在数值表中与其比较，且明确沿用上述评测协议；公开信息出现设置差异，或只说明相同数据集和指标而关键协议仍不清楚时，暂不合并。模型架构、训练数据及模型内部的目标距离函数属于方法差异，本表并不宣称这些相同。
 
-## 规划分组已纳入：1 篇论文、3 个变体
+## 规划表已纳入：1 篇论文、3 个变体
 
 [Learning Latent Action World Models In The Wild](https://arxiv.org/html/2601.05230v2)，Quentin Garrido、Tushar Nagarajan、Basile Terver、Nicolas Ballas、Yann LeCun、Michael Rabbat，2026，arXiv:2601.05230v2。
 
@@ -41,7 +41,7 @@
 
 纳入依据是作者明确声明的协议一致性及相应数值表。本次未逐样本核对测试索引、随机种子或重跑模型，不能将这些文献引用值描述为本项目统一复现结果。
 
-## 未纳入规划分组的候选
+## 未纳入规划表的候选
 
 “待确认”表示证据不足，不等于已经证实设置不同。相同的 NWM 基线数字本身不能证明协议相同；重新评测的 NWM 数字不同也不能单独作为排除理由。
 
@@ -62,7 +62,7 @@
 | [Latent World Models with Monotone Planning Costs，v1](https://arxiv.org/html/2608.09073v1) | §4.1–4.4，Table 1 | GNM 数据集测试集、6 步轨迹，指标为 AOE/MAOE/ADE/MADE，非本表协议。暂不纳入。 |
 | [Beyond Language Modeling，v1](https://arxiv.org/html/2603.03276v1) | §5.1–5.2，Figures 12–13 | 使用 NWM 协议研究预训练，但相关结果是预训练配置曲线；未找到符合要求的、与 NWM 数值行直接比较的 ATE/RPE 表。没有从曲线估读数值。 |
 
-## 视觉分组已纳入：2 篇论文、各自的同设置 NWM 对比
+## 视觉表已纳入：2 篇论文、各自的同设置 NWM 对比
 
 视觉分组保留 LPIPS、DreamSim 和 FID，均为越低越好。选择 4 秒以衔接项目已有评测，另列 16 秒以展示长时域预测；两个方法均使用相同的时域选择。没有从曲线估读数据，也没有为未报告的 PSNR 或标准差补值。
 

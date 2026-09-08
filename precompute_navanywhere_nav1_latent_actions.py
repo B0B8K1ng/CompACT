@@ -80,6 +80,7 @@ def atomic_json_dump(value: Mapping[str, Any], path: Path) -> None:
             mode="w+b", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
         ) as handle:
             temporary = Path(handle.name)
+            os.fchmod(handle.fileno(), 0o640)
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
@@ -98,6 +99,7 @@ def atomic_torch_save(value: Mapping[str, Any], path: Path) -> None:
             mode="w+b", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
         ) as handle:
             temporary = Path(handle.name)
+            os.fchmod(handle.fileno(), 0o640)
             torch.save(dict(value), handle)
             handle.flush()
             os.fsync(handle.fileno())
@@ -650,8 +652,11 @@ def _cache_record(
     indices: np.ndarray,
     source_fingerprint: str,
     pair_bitmap: np.ndarray | None,
+    *,
+    payload: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    payload = safe_torch_load(path)
+    if payload is None:
+        payload = safe_torch_load(path)
     required = {
         "schema_version",
         "format",
@@ -983,6 +988,7 @@ def _write_completion(
         )
         temporary = manifest_path.with_name(f".{manifest_path.name}.{os.getpid()}.tmp")
         temporary.write_text(payload, encoding="utf-8")
+        temporary.chmod(0o640)
         os.replace(temporary, manifest_path)
         sources[source_id] = {
             "trajectories": len(source_records),

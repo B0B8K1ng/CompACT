@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import stat
 
 import numpy as np
 import pytest
@@ -8,6 +9,7 @@ import torch
 
 from precompute_navanywhere_nav1_latent_actions import (
     EXPECTED_CHECKPOINT_CLASS,
+    atomic_json_dump,
     atomic_torch_save,
     build_navanywhere_frame_pairs,
     build_planned_navanywhere_frame_pairs,
@@ -17,6 +19,16 @@ from precompute_navanywhere_nav1_latent_actions import (
     validate_checkpoint_metadata,
 )
 from two_stage_data import OfflineProxyStore
+
+
+def test_atomic_cache_outputs_are_readable_by_shared_group(tmp_path: Path) -> None:
+    tensor_path = tmp_path / 'trajectory.pt'
+    marker_path = tmp_path / 'metadata.json'
+    atomic_torch_save({'motion': torch.zeros(1, 32)}, tensor_path)
+    atomic_json_dump({'complete': True}, marker_path)
+    for path in (tensor_path, marker_path):
+        assert stat.S_IMODE(path.stat().st_mode) == 0o640
+    assert torch.load(tensor_path, weights_only=True)['motion'].shape == (1, 32)
 
 
 def test_frame_pairs_use_real_ids_and_cover_strict_local_domain() -> None:
@@ -122,6 +134,77 @@ def test_encode_pair_batches_compact_frame_bank_matches_full_bank() -> None:
         pair_chunk_size=2,
     )
     assert torch.equal(compact, full)
+
+
+def test_resumable_chunks_preserve_batch_membership_and_pair_order() -> None:
+    class BatchSensitiveAdapter(_FakeAdapter):
+        def encode(self, videos):
+            return super().encode(videos) + videos[:, 0].sum()
+
+    frames = torch.arange(9, dtype=torch.float32).reshape(9, 1, 1, 1)
+    pairs = np.asarray([[8, 1], [3, 8], [1, 2], [4, 3], [8, 0], [2, 5], [0, 7]])
+    full = encode_pair_batches(BatchSensitiveAdapter(), frames, pairs, batch_size=2, precision='32')
+    chunks = []
+    for start in range(0, len(pairs), 4):
+        needed, inverse = np.unique(pairs[start:start+4], return_inverse=True)
+        chunks.append(encode_pair_batches(BatchSensitiveAdapter(), frames[needed], inverse.reshape(-1, 2),
+                                          batch_size=2, precision='32'))
+    assert torch.equal(torch.cat(chunks), full)
+
+
+def test_saved_chunk_rejects_corruption() -> None:
+    from scripts.repair_navanywhere_latent_chunks import chunk_is_valid
+    pairs = np.asarray([[1, 0], [2, 1]], dtype=np.int64)
+    payload = dict(complete=True, start=0, end=2, metadata={'fingerprint': 'test'},
+                   frame_pairs=torch.from_numpy(pairs.copy()), motion=torch.ones(2, 32))
+    assert chunk_is_valid(payload, 0, 2, payload['metadata'], pairs)
+    assert not chunk_is_valid(payload, 0, 2, {'fingerprint': 'changed'}, pairs)
+    payload['motion'][0, 0] = float('nan')
+    assert not chunk_is_valid(payload, 0, 2, payload['metadata'], pairs)
+    payload['motion'] = torch.ones(2, 32)
+    payload['frame_pairs'][0, 1] = 9
+    assert not chunk_is_valid(payload, 0, 2, payload['metadata'], pairs)
+
+
+def test_complete_saved_chunk_assembles_training_compatible_shard(tmp_path, monkeypatch) -> None:
+    import json
+    import sys
+    import precompute_navanywhere_nav1_latent_actions as pre
+    from scripts import repair_navanywhere_latent_chunks as repair
+    indices = np.arange(6, dtype=np.int64)
+    pairs = pre.build_navanywhere_frame_pairs(indices, context_size=4, max_abs_frame_offset=8)
+    bits = np.zeros(3*17, dtype=np.uint8)
+    for current, goal in pairs:
+        bits[(current-3)*17+goal-current+8] = 1
+    bitmap_path = tmp_path/'pairs.bin'
+    bitmap_path.write_bytes(np.packbits(bits, bitorder='little').tobytes())
+    task = dict(source_id='source', trajectory_id='trajectory', observation_base=0)
+    state = dict(data_root=str(tmp_path), sampling_recipe_sha256='recipe',
+                 checkpoint=dict(sha256='checkpoint', latent_dim=32),
+                 policy=dict(fingerprint='policy', configuration=dict(context_size=4, max_abs_frame_offset=8)),
+                 extraction=dict(fingerprint='extract', configuration=dict(batch_size=64)),
+                 training_pair_plan=dict(pair_bitmap_path=str(bitmap_path)),
+                 legacy_full_policy_fingerprint='legacy')
+    task['frame_indices_sha256'] = 'indices'
+    source_fp = 'source'
+    metadata = pre._expected_metadata(state, task, source_fp)
+    state_path, tasks_path = tmp_path/'state.json', tmp_path/'tasks.json'
+    state_path.write_text(json.dumps(state))
+    tasks_path.write_text(json.dumps([task]))
+    chunk_root, staging = tmp_path/'chunks', tmp_path/'staging'
+    motion = torch.arange(len(pairs)*32, dtype=torch.float32).reshape(-1, 32)
+    pre.atomic_torch_save(dict(complete=True, start=0, end=len(pairs), metadata=metadata,
+        motion=motion, frame_pairs=torch.from_numpy(pairs), invalid_frame_substitutions=[]),
+        chunk_root/'source'/'trajectory'/f'{0:09d}_{len(pairs):09d}.pt')
+    monkeypatch.setattr(pre, '_scan_task', lambda *args: ([], indices, source_fp))
+    monkeypatch.setattr(repair, 'run_workers', lambda *args: pytest.fail('Completed chunks must not initialize GPUs'))
+    monkeypatch.setattr(sys, 'argv', ['repair', '--state', str(state_path), '--tasks', str(tasks_path),
+        '--staging-root', str(staging), '--chunk-root', str(chunk_root), '--devices', '0,1,2,3,4,5,6,7'])
+    repair.main()
+    store = OfflineProxyStore(root=staging, proxy_type='latent', dim=32, strict_loading=True, max_abs_frame_offset=8)
+    result = store.lookup('source', 'trajectory', int(pairs[-1, 0]), int(pairs[-1, 1]))
+    assert result.valid
+    assert torch.equal(result.proxy_action, motion[-1])
 
 
 def test_checkpoint_contract_rejects_non_pixel_action_model() -> None:
