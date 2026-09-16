@@ -18,6 +18,7 @@ from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
 from motion_condition import (
     MotionConditionEncoder,
     RealToLatentAdapter,
+    StateConditionedLatentController,
     make_motion_group,
 )
 
@@ -238,6 +239,9 @@ class CDiT(nn.Module):
             "align": "embedding_align",
             "alignment": "embedding_align",
             "embedding_alignment": "embedding_align",
+            "d": "state_conditioned_controller",
+            "state_controller": "state_conditioned_controller",
+            "latent_state_controller": "state_conditioned_controller",
         }.get(raw_finetune_scheme, raw_finetune_scheme)
         self.x_embedder = PatchEmbed(
             input_size, patch_size, in_channels, hidden_size, bias=True
@@ -266,6 +270,31 @@ class CDiT(nn.Module):
                 )
                 self.real_to_latent = RealToLatentAdapter(
                     real_dim, mapper_hidden, latent_dim
+                )
+            elif (
+                self.training_stage == "real_finetune"
+                and self.finetune_scheme == "state_conditioned_controller"
+            ):
+                real_dim = self.motion_condition_encoder.input_dims.get("real")
+                latent_dim = self.motion_condition_encoder.input_dims.get("latent")
+                if real_dim is None or latent_dim is None:
+                    raise ValueError(
+                        "state_conditioned_controller requires both real and "
+                        "latent motion adapters"
+                    )
+                self.state_conditioned_controller = StateConditionedLatentController(
+                    real_dim,
+                    hidden_size,
+                    latent_dim,
+                    num_heads=int(
+                        (finetune or {}).get("controller_num_heads", num_heads)
+                    ),
+                    num_state_blocks=int(
+                        (finetune or {}).get("controller_state_blocks", 2)
+                    ),
+                    mlp_ratio=float(
+                        (finetune or {}).get("controller_mlp_ratio", 4.0)
+                    ),
                 )
         else:
             # Preserve the original module and state-dict keys for old configs and
@@ -402,6 +431,46 @@ class CDiT(nn.Module):
         ).to(base_condition.dtype)
         return base_condition.index_add(0, indices, latent_embedding), predicted_latent
 
+    def _predict_state_conditioned_latent(self, state_tokens, real_action):
+        normalized_real = self.motion_condition_encoder.normalize("real", real_action)
+        return self.state_conditioned_controller(state_tokens, normalized_real)
+
+    def _group_state_conditioned_controller(
+        self,
+        base_condition,
+        motion,
+        state_tokens,
+    ):
+        if motion is None or len(motion) == 0:
+            return base_condition, None
+        if not isinstance(motion, Mapping) or set(motion).difference({"real"}):
+            raise ValueError(
+                "state_conditioned_controller inference accepts grouped real "
+                "action only"
+            )
+        payload = motion.get("real")
+        if payload is None:
+            return base_condition, None
+        indices = payload.get("indices")
+        values = payload.get("values")
+        if not isinstance(indices, torch.Tensor) or not isinstance(values, torch.Tensor):
+            raise TypeError("motion['real'] requires tensor indices and values")
+        indices = indices.to(device=base_condition.device, dtype=torch.int64)
+        if indices.ndim != 1 or values.ndim != 2 or values.shape[0] != indices.numel():
+            raise ValueError("Grouped real motion indices/values are misaligned")
+        if bool(((indices < 0) | (indices >= base_condition.shape[0])).any()):
+            raise ValueError("Grouped real motion indices are outside the model batch")
+        if indices.numel() != torch.unique(indices).numel():
+            raise ValueError("Grouped real motion indices contain duplicates")
+        predicted_latent = self._predict_state_conditioned_latent(
+            state_tokens.index_select(0, indices),
+            values,
+        )
+        latent_embedding = self.motion_condition_encoder.encode(
+            "latent", predicted_latent
+        ).to(base_condition.dtype)
+        return base_condition.index_add(0, indices, latent_embedding), predicted_latent
+
     def _alignment_embeddings(self, action, teacher_latent, teacher_valid=None):
         if action is None or teacher_latent is None:
             raise ValueError("Alignment requires real action and teacher_latent")
@@ -446,6 +515,7 @@ class CDiT(nn.Module):
         conditioning_mode=None,
         teacher_latent=None,
         teacher_valid=None,
+        state_tokens=None,
     ):
         base_condition = diffusion_embedding + relative_time_embedding
         auxiliary = {}
@@ -469,6 +539,8 @@ class CDiT(nn.Module):
             mode = self.action_mode.lower()
         elif self.finetune_scheme == "real_to_latent":
             mode = "real_to_latent"
+        elif self.finetune_scheme == "state_conditioned_controller":
+            mode = "state_conditioned_controller"
         else:
             mode = "real"
 
@@ -519,6 +591,46 @@ class CDiT(nn.Module):
                 auxiliary["predicted_latent"] = predicted_latent
             return condition, auxiliary
 
+        if mode == "state_conditioned_controller":
+            if state_tokens is None:
+                raise ValueError(
+                    "state_conditioned_controller requires current-state tokens"
+                )
+            if action is None:
+                condition, predicted_latent = (
+                    self._group_state_conditioned_controller(
+                        base_condition,
+                        motion,
+                        state_tokens,
+                    )
+                )
+            else:
+                predicted_latent = self._predict_state_conditioned_latent(
+                    state_tokens,
+                    action,
+                )
+                latent_embedding = self.motion_condition_encoder.encode(
+                    "latent", predicted_latent
+                )
+                if action_valid is not None:
+                    valid = torch.as_tensor(
+                        action_valid,
+                        dtype=torch.bool,
+                        device=latent_embedding.device,
+                    )
+                    if valid.shape != (latent_embedding.shape[0],):
+                        raise ValueError(
+                            f"action_valid must be [{latent_embedding.shape[0]}], "
+                            f"got {tuple(valid.shape)}"
+                        )
+                    latent_embedding = latent_embedding * valid.to(
+                        latent_embedding.dtype
+                    ).unsqueeze(-1)
+                condition = base_condition + latent_embedding.to(base_condition.dtype)
+            if predicted_latent is not None:
+                auxiliary["predicted_latent"] = predicted_latent
+            return condition, auxiliary
+
         if action is not None:
             condition, action_embedding = self._dense_action_condition(
                 base_condition, mode, action, action_valid
@@ -556,6 +668,7 @@ class CDiT(nn.Module):
         teacher_valid=None,
         return_aux=False,
         alignment_only=False,
+        state_controller_only=False,
     ):
         """
         Forward pass of DiT.
@@ -569,6 +682,8 @@ class CDiT(nn.Module):
                 raise ValueError("alignment_only is valid only for embedding_align")
             return self._alignment_embeddings(action, teacher_latent, teacher_valid)
 
+        if x_cond is None:
+            raise ValueError("CDiT requires x_cond")
         actual_context_size = int(x_cond.shape[1])
         if actual_context_size != self.context_size:
             raise ValueError(
@@ -578,14 +693,34 @@ class CDiT(nn.Module):
                 "dataset.context_size recorded by the checkpoint."
             )
 
+        if state_controller_only:
+            if self.finetune_scheme != "state_conditioned_controller":
+                raise ValueError(
+                    "state_controller_only is valid only for "
+                    "state_conditioned_controller"
+                )
+            if action is None:
+                raise ValueError("state_controller_only requires a dense real action")
+            state_tokens = (
+                self.x_embedder(x_cond[:, -1])
+                + self.pos_embed[self.context_size - 1]
+            )
+            predicted_latent = self._predict_state_conditioned_latent(
+                state_tokens,
+                action,
+            )
+            return {"predicted_latent": predicted_latent}
+
         x = self.x_embedder(x) + self.pos_embed[self.context_size :]
-        x_cond = (
+        x_cond_by_frame = (
             self.x_embedder(x_cond.flatten(0, 1)).unflatten(
                 0, (x_cond.shape[0], x_cond.shape[1])
             )
             + self.pos_embed[: self.context_size]
-        )  # (N, T, D), where T = H * W / patch_size ** 2.flatten(1, 2)
-        x_cond = x_cond.flatten(1, 2)
+        )
+        state_tokens = x_cond_by_frame[:, -1]
+        # (N, context * patches, D)
+        x_cond = x_cond_by_frame.flatten(1, 2)
         t = self.t_embedder(t[..., None])
         time_emb = self.time_embedder(rel_t[..., None])
         c, auxiliary = self._compute_condition(
@@ -598,6 +733,7 @@ class CDiT(nn.Module):
             conditioning_mode=conditioning_mode,
             teacher_latent=teacher_latent,
             teacher_valid=teacher_valid,
+            state_tokens=state_tokens,
         )
 
         for block in self.blocks:

@@ -179,6 +179,130 @@ class RealToLatentAdapter(nn.Module):
         return self.net(real_action)
 
 
+class _StateSelfAttentionBlock(nn.Module):
+    """Pre-norm self-attention block used only by the state controller."""
+
+    def __init__(self, hidden_dim: int, num_heads: int, mlp_ratio: float):
+        super().__init__()
+        mlp_dim = int(hidden_dim * float(mlp_ratio))
+        if mlp_dim < 1:
+            raise ValueError("controller MLP width must be positive")
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.attention = nn.MultiheadAttention(
+            hidden_dim,
+            num_heads,
+            dropout=0.0,
+            batch_first=True,
+        )
+        self.norm2 = nn.LayerNorm(hidden_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, mlp_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(mlp_dim, hidden_dim),
+        )
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        normalized = self.norm1(tokens)
+        tokens = tokens + self.attention(
+            normalized,
+            normalized,
+            normalized,
+            need_weights=False,
+        )[0]
+        return tokens + self.mlp(self.norm2(tokens))
+
+
+class StateConditionedLatentController(nn.Module):
+    """Predict a latent action from current visual state and a real action.
+
+    The visual tokens pass through two self-attention blocks.  A three-layer
+    action MLP supplies one cross-attention query, and the attended visual
+    value is projected directly to the latent-action coordinate system.  There
+    is deliberately no action-only output or residual bypass around the
+    cross-attention operation.
+    """
+
+    def __init__(
+        self,
+        real_action_dim: int,
+        hidden_dim: int,
+        latent_dim: int,
+        *,
+        num_heads: int,
+        num_state_blocks: int = 2,
+        mlp_ratio: float = 4.0,
+    ):
+        super().__init__()
+        if min(real_action_dim, hidden_dim, latent_dim, num_heads) < 1:
+            raise ValueError("controller dimensions and num_heads must be positive")
+        if hidden_dim % num_heads != 0:
+            raise ValueError("controller hidden_dim must be divisible by num_heads")
+        if int(num_state_blocks) != 2:
+            raise ValueError("state-conditioned controller requires two state blocks")
+        self.real_action_dim = int(real_action_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.latent_dim = int(latent_dim)
+        self.state_blocks = nn.ModuleList(
+            [
+                _StateSelfAttentionBlock(
+                    self.hidden_dim,
+                    int(num_heads),
+                    float(mlp_ratio),
+                )
+                for _ in range(int(num_state_blocks))
+            ]
+        )
+        self.action_mlp = nn.Sequential(
+            nn.Linear(self.real_action_dim, self.hidden_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+        )
+        self.query_norm = nn.LayerNorm(self.hidden_dim)
+        self.state_norm = nn.LayerNorm(self.hidden_dim)
+        self.cross_attention = nn.MultiheadAttention(
+            self.hidden_dim,
+            int(num_heads),
+            dropout=0.0,
+            batch_first=True,
+        )
+        self.output_norm = nn.LayerNorm(self.hidden_dim)
+        self.latent_head = nn.Linear(self.hidden_dim, self.latent_dim)
+
+    def forward(
+        self,
+        state_tokens: torch.Tensor,
+        normalized_real_action: torch.Tensor,
+    ) -> torch.Tensor:
+        if state_tokens.ndim != 3 or state_tokens.shape[-1] != self.hidden_dim:
+            raise ValueError(
+                "Expected state tokens [N, P, "
+                f"{self.hidden_dim}], got {tuple(state_tokens.shape)}"
+            )
+        if (
+            normalized_real_action.ndim != 2
+            or normalized_real_action.shape
+            != (state_tokens.shape[0], self.real_action_dim)
+        ):
+            raise ValueError(
+                "Expected normalized real action "
+                f"[{state_tokens.shape[0]}, {self.real_action_dim}], got "
+                f"{tuple(normalized_real_action.shape)}"
+            )
+        for block in self.state_blocks:
+            state_tokens = block(state_tokens)
+        query = self.query_norm(self.action_mlp(normalized_real_action)).unsqueeze(1)
+        state_tokens = self.state_norm(state_tokens)
+        attended = self.cross_attention(
+            query=query,
+            key=state_tokens,
+            value=state_tokens,
+            need_weights=False,
+        )[0].squeeze(1)
+        return self.latent_head(self.output_norm(attended))
+
+
 class MotionInputNormalizer(nn.Module):
     """Parameter-free normalization applied immediately before an adapter."""
 

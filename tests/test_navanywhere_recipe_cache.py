@@ -15,6 +15,7 @@ import precompute_navanywhere_vae_latents
 from navanywhere_latent_cache import validate_navanywhere_latent_cache
 from navanywhere_recipe import (
     build_sampling_recipe,
+    build_sampling_recipe_from_inventory,
     canonical_json,
     sha256_file,
     validate_sampling_recipe,
@@ -286,6 +287,77 @@ def test_completed_cache_is_bound_to_recipe_but_not_training_batch(
     )
     assert result["recipe_sha256"] == sha256_file(recipe_path)
     assert set(result["manifest_records"]["source_a"]) == {"trajectory_a"}
+
+
+def test_completed_cache_recipe_reuse_is_explicit_and_frame_bound(
+    tmp_path: Path,
+) -> None:
+    config, recipe_path, _ = _write_completed_cache(tmp_path)
+    original = json.loads(recipe_path.read_text(encoding="utf-8"))
+    subset_recipe = build_sampling_recipe_from_inventory(
+        original["trajectories"],
+        seed=23,
+        context_size=1,
+        goals_per_obs=4,
+        samples_per_epoch=int(original["samples_per_epoch"]) - 1,
+    )
+    subset_path = Path(
+        write_sampling_recipe(tmp_path / "subset_recipe.json", subset_recipe)
+    )
+
+    try:
+        validate_navanywhere_latent_cache(
+            config,
+            recipe_path=str(subset_path),
+            launch_dir=str(tmp_path),
+        )
+    except ValueError as exc:
+        assert "sampling_recipe.sha256" in str(exc)
+    else:
+        raise AssertionError("recipe reuse was accepted without an explicit opt-in")
+
+    config.dataset.precomputed_latents.allow_recipe_subset = True
+    result = validate_navanywhere_latent_cache(
+        config,
+        recipe_path=str(subset_path),
+        launch_dir=str(tmp_path),
+    )
+    assert result["recipe_relation"] == "cache_superset"
+    assert result["recipe_sha256"] == sha256_file(subset_path)
+    assert (
+        result["expected_file_metadata"]["sampling_recipe_sha256"]
+        == sha256_file(recipe_path)
+    )
+
+
+def test_cache_superset_mode_still_rejects_an_uncached_trajectory(
+    tmp_path: Path,
+) -> None:
+    config, recipe_path, _ = _write_completed_cache(tmp_path)
+    original = json.loads(recipe_path.read_text(encoding="utf-8"))
+    uncached_inventory = [dict(original["trajectories"][0])]
+    uncached_inventory[0]["trajectory_id"] = "trajectory_missing"
+    uncached_recipe = build_sampling_recipe_from_inventory(
+        uncached_inventory,
+        seed=23,
+        context_size=1,
+        goals_per_obs=4,
+    )
+    uncached_path = Path(
+        write_sampling_recipe(tmp_path / "uncached_recipe.json", uncached_recipe)
+    )
+    config.dataset.precomputed_latents.allow_recipe_subset = True
+
+    try:
+        validate_navanywhere_latent_cache(
+            config,
+            recipe_path=str(uncached_path),
+            launch_dir=str(tmp_path),
+        )
+    except ValueError as exc:
+        assert "trajectory_missing" in str(exc)
+    else:
+        raise AssertionError("an uncached trajectory was accepted as a cache subset")
 
 
 def test_existing_recipe_rejects_a_different_requested_epoch_size(

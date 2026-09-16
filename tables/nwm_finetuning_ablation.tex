@@ -1,0 +1,64 @@
+% Add to the document preamble:
+% \usepackage{booktabs,multirow,graphicx}
+
+\begin{table*}[t]
+  \centering
+  \caption{\textbf{Fine-tuning ablation.}
+  All strategies share the same pretrained checkpoint and fine-tuning budget.
+  Reset replaces the latent-action encoder; Align aligns action embeddings;
+  Action2Latent maps real actions to the latent-action space.
+  Prediction is evaluated at 4\,s on RECON or unseen Go Stanford.
+  DS: DreamSim.}
+  \label{tab:finetuning_ablation}
+  \footnotesize
+  \setlength{\tabcolsep}{2pt}
+  \renewcommand{\arraystretch}{1.2}
+
+  \resizebox{\linewidth}{!}{%
+    \begin{tabular}{@{}l*{16}{c}@{}}
+      \toprule
+      \multirow{3}{*}{Fine-tuning}
+      & \multicolumn{12}{c}{Prediction}
+      & \multicolumn{4}{c}{Planning} \\
+      \cmidrule(lr){2-13}\cmidrule(l){14-17}
+      & \multicolumn{3}{c}{Single-step}
+      & \multicolumn{3}{c}{Rollout (1\,FPS)}
+      & \multicolumn{3}{c}{Rollout (4\,FPS)}
+      & \multicolumn{3}{c}{Go Stanford}
+      & \multicolumn{2}{c}{RECON}
+      & \multicolumn{2}{c}{SCAND} \\
+      \cmidrule(lr){2-4}\cmidrule(lr){5-7}
+      \cmidrule(lr){8-10}\cmidrule(lr){11-13}
+      \cmidrule(lr){14-15}\cmidrule(l){16-17}
+      & LPIPS $\downarrow$ & DS $\downarrow$ & PSNR $\uparrow$
+      & LPIPS $\downarrow$ & DS $\downarrow$ & PSNR $\uparrow$
+      & LPIPS $\downarrow$ & DS $\downarrow$ & PSNR $\uparrow$
+      & LPIPS $\downarrow$ & DS $\downarrow$ & PSNR $\uparrow$
+      & ATE $\downarrow$ & RPE $\downarrow$
+      & ATE $\downarrow$ & RPE $\downarrow$ \\
+      \midrule
+
+      Reset
+      & -- & -- & --
+      & -- & -- & --
+      & -- & -- & --
+      & -- & -- & --
+      & -- & -- & -- & -- \\
+
+      Align
+      & -- & -- & --
+      & -- & -- & --
+      & -- & -- & --
+      & -- & -- & --
+      & -- & -- & -- & -- \\
+
+      Action2Latent
+      & -- & -- & --
+      & -- & -- & --
+      & -- & -- & --
+      & -- & -- & --
+      & -- & -- & -- & -- \\
+      \bottomrule
+    \end{tabular}%
+  }
+\end{table*}

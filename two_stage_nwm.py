@@ -19,7 +19,12 @@ import torch.nn.functional as F
 
 TRAINING_STAGES = ("legacy", "proxy_pretrain", "real_finetune")
 ACTION_MODES = ("none", "real", "geometry", "idm", "latent")
-FINETUNE_SCHEMES = ("reset", "embedding_align", "real_to_latent")
+FINETUNE_SCHEMES = (
+    "reset",
+    "embedding_align",
+    "real_to_latent",
+    "state_conditioned_controller",
+)
 FINETUNE_SUBSTAGES = ("warmup", "joint")
 LOCAL_PROXY_MAX_ABS_FRAME_OFFSET = 8
 
@@ -33,6 +38,10 @@ _SCHEME_ALIASES = {
     "embedding_align": "embedding_align",
     "real-to-latent": "real_to_latent",
     "real_to_latent": "real_to_latent",
+    "d": "state_conditioned_controller",
+    "state_controller": "state_conditioned_controller",
+    "latent_state_controller": "state_conditioned_controller",
+    "state_conditioned_controller": "state_conditioned_controller",
     "reset": "reset",
 }
 
@@ -127,6 +136,32 @@ def validate_two_stage_config(config: Any) -> tuple[str, str, str | None]:
     finetune = config_get(config, "finetune", {})
     scheme = normalize_finetune_scheme(config_get(finetune, "scheme", "reset"))
     random_init = bool(config_get(finetune, "random_init", False))
+    protocol = str(config_get(finetune, "dataset_protocol", "paper"))
+    if protocol not in {"paper", "go2"}:
+        raise ValueError(f"Unknown finetune.dataset_protocol: {protocol}")
+    if config_get(finetune, "init_checkpoint", None):
+        if random_init or config_get(finetune, "stage1_checkpoint", None):
+            raise ValueError("init_checkpoint forbids stage1_checkpoint and random_init")
+        if scheme != "reset":
+            raise ValueError("Complete real-action initialization requires scheme=reset")
+    if protocol == "go2":
+        training = config_get(config, "training", {})
+        if not (config_get(training, "wandb_enabled", False)
+                and config_get(training, "wandb_required", False)):
+            raise ValueError("Go2 adaptation requires online WandB training curves")
+        if not config_get(finetune, "init_checkpoint", None) and not config_get(
+            config_get(config, "training", {}), "from_checkpoint", None
+        ):
+            raise ValueError("Go2 adaptation requires init_checkpoint or from_checkpoint")
+        if scheme != "reset" or random_init or config_get(finetune, "stage1_checkpoint", None):
+            raise ValueError("Go2 adaptation must preserve the existing real-action adapter")
+        if int(config_get(config, "eval_every", 0)) > 0 or bool(
+            config_get(config, "eval_at_first_step", False)
+        ):
+            raise ValueError("Go2 adaptation must not evaluate the test set during training")
+    decay = float(config_get(config_get(config, "training", {}), "ema_decay", 0.9999))
+    if not 0 <= decay < 1:
+        raise ValueError("training.ema_decay must be in [0, 1)")
     if random_init:
         if scheme != "reset":
             raise ValueError(
@@ -144,7 +179,11 @@ def validate_two_stage_config(config: Any) -> tuple[str, str, str | None]:
                 "a fresh CDiT's zero-initialized output/adaLN layers block "
                 "adapter-only warmup gradients"
             )
-    if scheme in {"embedding_align", "real_to_latent"}:
+    if scheme in {
+        "embedding_align",
+        "real_to_latent",
+        "state_conditioned_controller",
+    }:
         if str(config_get(proxy, "type", "")) != "latent":
             raise ValueError(f"{scheme} requires proxy.type=latent")
         latent_config = config_get(motion, "latent", {})
@@ -155,10 +194,21 @@ def validate_two_stage_config(config: Any) -> tuple[str, str, str | None]:
                 f"proxy.dim={proxy_dim} must equal "
                 f"motion_condition.latent.latent_dim={latent_dim}"
             )
-    if scheme == "embedding_align" and not bool(
+    if scheme in {"embedding_align", "state_conditioned_controller"} and not bool(
         config_get(proxy, "use_precomputed_only", True)
     ):
-        raise ValueError("EmbeddingAlign teacher latents must be read offline")
+        raise ValueError(f"{scheme} teacher latents must be read offline")
+    if scheme == "state_conditioned_controller":
+        if int(config_get(finetune, "controller_state_blocks", 2)) != 2:
+            raise ValueError(
+                "state_conditioned_controller requires controller_state_blocks=2"
+            )
+        if float(config_get(finetune, "latent_l2_weight", 1.0)) < 0:
+            raise ValueError("finetune.latent_l2_weight must be non-negative")
+        if int(config_get(finetune, "controller_lr_warmup_steps", 300)) < 0:
+            raise ValueError(
+                "finetune.controller_lr_warmup_steps must be non-negative"
+            )
     return stage, action_mode, scheme
 
 
@@ -216,6 +266,48 @@ def alignment_loss(
         "alignment_cosine": cosine,
         "alignment_l1": l1,
         "alignment_valid_count": global_count,
+    }
+
+
+def latent_action_l2_loss(
+    predicted: torch.Tensor,
+    target: torch.Tensor,
+    valid: torch.Tensor,
+    *,
+    distributed_mean: bool = False,
+) -> dict[str, torch.Tensor]:
+    """Valid-only latent MSE with exact global normalization under DDP."""
+    if predicted.ndim != 2 or predicted.shape != target.shape:
+        raise ValueError(
+            "Latent L2 inputs must be equal [N,D] tensors; got "
+            f"{tuple(predicted.shape)} and {tuple(target.shape)}"
+        )
+    valid = torch.as_tensor(valid, dtype=torch.bool, device=predicted.device)
+    if valid.shape != (predicted.shape[0],):
+        raise ValueError(
+            f"Latent L2 valid mask must be [{predicted.shape[0]}], got "
+            f"{tuple(valid.shape)}"
+        )
+    local_count = valid.sum()
+    global_count = local_count.detach().clone()
+    world_size = 1
+    if distributed_mean and dist.is_available() and dist.is_initialized():
+        dist.all_reduce(global_count, op=dist.ReduceOp.SUM)
+        world_size = dist.get_world_size()
+    if int(global_count.item()) > 0:
+        selected_prediction = predicted[valid]
+        selected_target = target.detach()[valid].to(selected_prediction)
+        squared_sum = (selected_prediction - selected_target).square().sum()
+        mse = squared_sum * (
+            float(world_size)
+            / (global_count.to(squared_sum) * predicted.shape[-1])
+        )
+    else:
+        # Every rank retains the controller graph so DDP collectives stay aligned.
+        mse = predicted.sum() * 0.0
+    return {
+        "latent_l2": mse,
+        "latent_l2_valid_count": global_count,
     }
 
 
@@ -325,6 +417,10 @@ def _is_any_action_adapter(name: str) -> bool:
     return name.startswith("motion_condition_encoder.")
 
 
+def _is_state_controller(name: str) -> bool:
+    return name.startswith("state_conditioned_controller.")
+
+
 def configure_trainable_parameters(
     model: torch.nn.Module,
     *,
@@ -359,16 +455,27 @@ def configure_trainable_parameters(
         elif finetune_substage == "warmup":
             if scheme in {"reset", "embedding_align"}:
                 train = _is_real_adapter(name)
-            else:
+            elif scheme == "real_to_latent":
                 train = name.startswith("real_to_latent.")
+            else:
+                train = _is_state_controller(name)
         else:  # joint
             if scheme in {"reset", "embedding_align"}:
                 train = not _is_any_action_adapter(name) or _is_real_adapter(name)
-            else:
+            elif scheme == "real_to_latent":
                 train = (
                     not _is_any_action_adapter(name)
                     or _is_latent_adapter(name)
                     or name.startswith("real_to_latent.")
+                )
+            else:
+                # The controller and CDiT backbone train jointly.  The shared
+                # image patch embedder and every motion adapter (including E_z)
+                # retain their Stage-1 weights exactly.
+                train = _is_state_controller(name) or (
+                    not _is_any_action_adapter(name)
+                    and not name.startswith("x_embedder.")
+                    and not _is_state_controller(name)
                 )
         parameter.requires_grad_(train)
 
@@ -401,11 +508,12 @@ def build_optimizer_param_groups(
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
-        is_adapter = (
-            _is_real_adapter(name)
-            if scheme in {"reset", "embedding_align"}
-            else name.startswith("real_to_latent.")
-        )
+        if scheme in {"reset", "embedding_align"}:
+            is_adapter = _is_real_adapter(name)
+        elif scheme == "real_to_latent":
+            is_adapter = name.startswith("real_to_latent.")
+        else:
+            is_adapter = _is_state_controller(name)
         (adapter_parameters if is_adapter else backbone_parameters).append(parameter)
         optimizer_names.append(name)
     groups = []
@@ -422,7 +530,7 @@ def build_optimizer_param_groups(
     for group in groups:
         if not all(parameter.requires_grad for parameter in group["params"]):
             raise AssertionError("Optimizer received a frozen parameter")
-    if scheme == "embedding_align" or (
+    if scheme in {"embedding_align", "state_conditioned_controller"} or (
         scheme == "real_to_latent" and finetune_substage == "warmup"
     ):
         forbidden = [name for name in optimizer_names if _is_latent_adapter(name)]

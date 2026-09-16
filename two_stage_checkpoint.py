@@ -46,6 +46,9 @@ _REAL_TO_LATENT_PREFIXES = (
     "real_to_latent_encoder.",
     "G_real_to_latent.",
 )
+_STATE_CONTROLLER_PREFIXES = (
+    "state_conditioned_controller.",
+)
 
 
 def capture_rng_state() -> dict[str, Any]:
@@ -230,6 +233,12 @@ def build_data_resume_fingerprint(
                 "shuffle": True,
                 "drop_last": True,
                 "persistent_workers": False,
+                # The worker start method is deliberately not part of the
+                # sample/cursor contract.  With an explicit per-epoch loader
+                # generator and non-persistent workers, fork and spawn assign
+                # the same sampler indices and worker RNG seeds.  Keeping this
+                # operational detail out lets existing exact-resume
+                # checkpoints continue under the CUDA-safe spawn context.
             },
             "dataset": _get(config, "dataset", None),
             "dataset_selection": _get(config, "dataset_selection", None),
@@ -347,9 +356,17 @@ def _normalize_scheme(value: Any) -> str:
         "real2latent": "real_to_latent",
         "real_action_to_latent": "real_to_latent",
         "c": "real_to_latent",
+        "d": "state_conditioned_controller",
+        "state_controller": "state_conditioned_controller",
+        "latent_state_controller": "state_conditioned_controller",
     }
     scheme = aliases.get(scheme, scheme)
-    if scheme not in {"reset", "embedding_align", "real_to_latent"}:
+    if scheme not in {
+        "reset",
+        "embedding_align",
+        "real_to_latent",
+        "state_conditioned_controller",
+    }:
         raise ValueError(f"Unsupported finetune scheme: {value!r}")
     return scheme
 
@@ -487,6 +504,46 @@ def _latent_normalization(config: Any) -> dict[str, Any]:
     }
 
 
+def _state_controller_contract(
+    config: Any,
+    model: nn.Module | None = None,
+) -> dict[str, Any]:
+    """Serialize architecture and optimization semantics that affect Scheme D."""
+    model = _unwrap_model(model)
+    finetune = _finetune_config(config)
+    controller = (
+        getattr(model, "state_conditioned_controller", None)
+        if model is not None
+        else None
+    )
+    state_blocks = int(_get(finetune, "controller_state_blocks", 2))
+    num_heads = _get(finetune, "controller_num_heads", None)
+    mlp_ratio = float(_get(finetune, "controller_mlp_ratio", 4.0))
+    if controller is not None:
+        state_blocks = len(controller.state_blocks)
+        num_heads = int(controller.cross_attention.num_heads)
+        first_mlp = controller.state_blocks[0].mlp[0]
+        mlp_ratio = float(first_mlp.out_features) / float(controller.hidden_dim)
+    return _serializable(
+        {
+            "state_blocks": state_blocks,
+            "num_heads": None if num_heads is None else int(num_heads),
+            "mlp_ratio": mlp_ratio,
+            "latent_l2_weight": float(_get(finetune, "latent_l2_weight", 1.0)),
+            "controller_pretrain_lr": float(
+                _get(finetune, "controller_pretrain_lr", 1.0e-3)
+            ),
+            "controller_pretrain_weight_decay": float(
+                _get(finetune, "controller_pretrain_weight_decay", 0.04)
+            ),
+            "controller_lr_warmup_steps": int(
+                _get(finetune, "controller_lr_warmup_steps", 300)
+            ),
+            "joint_lr": float(_get(finetune, "joint_lr", 1.0e-4)),
+        }
+    )
+
+
 def build_checkpoint_metadata(
     config: Any,
     finetune_substage: str | None,
@@ -517,6 +574,8 @@ def build_checkpoint_metadata(
         finetune_initialization = (
             "random"
             if bool(_get(finetune, "random_init", False))
+            else "init_checkpoint" if (_get(finetune, "init_checkpoint", None)
+                                        or _get(finetune, "dataset_protocol", "paper") == "go2")
             else "stage1_checkpoint"
         )
     substage = _normalize_substage(finetune_substage)
@@ -545,6 +604,11 @@ def build_checkpoint_metadata(
         "completed_joint_steps": joint_steps,
         **signature,
     }
+    if scheme == "state_conditioned_controller":
+        metadata["state_controller"] = _state_controller_contract(config, model)
+    initialization = _get(_finetune_config(config), "initialization", None)
+    if initialization is not None:
+        metadata["initialization"] = _serializable(initialization)
     return _serializable(metadata)
 
 
@@ -620,7 +684,11 @@ def validate_stage1_checkpoint(
             f"action_mode={action_mode!r}, proxy_type={proxy_type!r}"
         )
 
-    if scheme in {"embedding_align", "real_to_latent"} and (
+    if scheme in {
+        "embedding_align",
+        "real_to_latent",
+        "state_conditioned_controller",
+    } and (
         action_mode != "latent" or proxy_type != "latent"
     ):
         raise ValueError(
@@ -790,7 +858,7 @@ def validate_resume_checkpoint(
         source_initialization = str(
             source.get("finetune_initialization", "stage1_checkpoint")
         ).strip().lower()
-        if source_initialization not in {"random", "stage1_checkpoint"}:
+        if source_initialization not in {"random", "stage1_checkpoint", "init_checkpoint"}:
             raise ValueError(
                 "Unknown checkpoint finetune_initialization: "
                 f"{source_initialization!r}"
@@ -867,9 +935,18 @@ def validate_resume_checkpoint(
             _assert_same(
                 "finetune_scheme", source_scheme, expected_scheme, required=True
             )
+            if expected_scheme == "state_conditioned_controller":
+                _assert_same(
+                    "state_controller",
+                    _serializable(source.get("state_controller")),
+                    _state_controller_contract(config, model),
+                    required=True,
+                )
             expected_initialization = (
                 "random"
                 if bool(_get(finetune, "random_init", False))
+                else "init_checkpoint" if (_get(finetune, "init_checkpoint", None)
+                                            or _get(finetune, "dataset_protocol", "paper") == "go2")
                 else "stage1_checkpoint"
             )
             _assert_same(
@@ -967,6 +1044,78 @@ def _module_names(keys: list[str]) -> list[str]:
     return sorted(modules)
 
 
+def load_finetune_weights(
+    model: nn.Module, checkpoint_or_path: Any, config: Any,
+) -> dict[str, Any]:
+    """Initialize from a trained real-action EMA without importing training state.
+
+    Unlike stage-1 transfer this requires the entire state, including inactive
+    adapters and normalization buffers. Legacy real-action checkpoints provide
+    their architecture contract through config instead of two_stage_metadata.
+    """
+    checkpoint = _load_checkpoint(checkpoint_or_path)
+    source = checkpoint.get("config")
+    if not isinstance(source, Mapping):
+        raise ValueError("Complete initialization requires the source checkpoint config")
+    if _get(source, "training_stage", "legacy") not in {"legacy", "real_finetune"}:
+        raise ValueError("Initialization must come from a trained real-action model")
+    if _get(source, "action_mode", "real") != "real":
+        raise ValueError("Initialization requires action_mode=real")
+    if _normalize_scheme(
+        _get(_finetune_config(source), "scheme", "reset")
+    ) in {"real_to_latent", "state_conditioned_controller"}:
+        raise ValueError(
+            "Controller checkpoints need their original inference interface"
+        )
+    metadata = checkpoint.get(TWO_STAGE_METADATA_KEY, {})
+    if metadata and (metadata.get("training_stage") != "real_finetune"
+                     or metadata.get("action_mode") != "real"):
+        raise ValueError("Source metadata must describe real-action fine-tuning")
+    fields = (
+        ("model", "generator"),
+        ("dataset", "context_size"), ("dataset", "image_size"),
+        ("motion_condition", "enabled"),
+        ("motion_condition", "real", "real_dim"),
+        ("motion_condition", "real", "normalization"),
+    )
+    for keys in fields:
+        expected, actual = _serializable(_path(config, *keys)), _serializable(_path(source, *keys))
+        if expected is None or actual != expected:
+            raise ValueError(f"Initialization config mismatch at {'.'.join(keys)}: {actual} != {expected}")
+    state = checkpoint.get("ema")
+    if not isinstance(state, Mapping) or not state:
+        raise ValueError("Initialization requires a nonempty ema state")
+    normalized = {_normalize_state_key(k): v for k, v in state.items()}
+    if len(normalized) != len(state):
+        raise ValueError("EMA keys collide after removing wrapper prefixes")
+    target = _unwrap_model(model)
+    current = target.state_dict()
+    if current.keys() != normalized.keys():
+        raise ValueError(f"EMA state keys differ: missing={sorted(current.keys() - normalized.keys())}, "
+                         f"unexpected={sorted(normalized.keys() - current.keys())}")
+    for key, value in current.items():
+        other = normalized[key]
+        if not isinstance(other, torch.Tensor) or value.shape != other.shape:
+            raise ValueError(f"EMA parameter shape mismatch: {key}")
+        if "motion_normalizer." in key and not torch.equal(value.cpu(), other.cpu()):
+            raise ValueError(f"EMA normalization buffer mismatch: {key}")
+    source_path = None
+    checksum = None
+    if not isinstance(checkpoint_or_path, Mapping):
+        source_path = str(Path(checkpoint_or_path).resolve())
+        digest = hashlib.sha256()
+        with open(source_path, "rb") as stream:
+            for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+                digest.update(chunk)
+        checksum = digest.hexdigest()
+        expected_hash = _get(_finetune_config(config), "init_sha256", None)
+        if expected_hash and checksum != expected_hash:
+            raise ValueError("Initialization checkpoint SHA-256 changed")
+    target.load_state_dict(normalized, strict=True)
+    return {"path": source_path, "sha256": checksum, "weight_key": "ema",
+            "source_train_steps": int(checkpoint.get("train_steps", 0))}
+
+
 def load_stage1_weights(
     model: nn.Module,
     checkpoint_or_path: Any,
@@ -984,8 +1133,14 @@ def load_stage1_weights(
     elif scheme == "embedding_align":
         new_module_prefixes = _REAL_ADAPTER_PREFIXES
         optional_inactive_prefixes = _INACTIVE_PROXY_PREFIXES
-    else:
+    elif scheme == "real_to_latent":
         new_module_prefixes = _REAL_TO_LATENT_PREFIXES
+        optional_inactive_prefixes = (
+            *_REAL_ADAPTER_PREFIXES,
+            *_INACTIVE_PROXY_PREFIXES,
+        )
+    else:
+        new_module_prefixes = _STATE_CONTROLLER_PREFIXES
         optional_inactive_prefixes = (
             *_REAL_ADAPTER_PREFIXES,
             *_INACTIVE_PROXY_PREFIXES,

@@ -7,7 +7,9 @@ import torch
 import torch.distributed as dist
 import logging
 import os
+import random
 import matplotlib.pyplot as plt
+import numpy as np
 from omegaconf import DictConfig, OmegaConf, open_dict
 from hydra.utils import instantiate, get_original_cwd
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
@@ -408,6 +410,7 @@ def evaluate(
     bfloat_enable,
     num_cond,
     unnormalize_fn,
+    offload_model=False,
 ):
     """Evaluate model on test dataset."""
     from isolated_nwm_infer import model_forward_wrapper
@@ -446,9 +449,22 @@ def evaluate(
         _eval_model_cache = _eval_model_cache.to(device)
         logger.info("Created and cached DreamSim evaluation model")
 
-    eval_model = _eval_model_cache
+    eval_model = _eval_model_cache.to(device)
     score = torch.tensor(0.0).to(device)
     n_samples = torch.tensor(0).to(device)
+
+    # Reuse the same per-rank examples, goal offsets, and diffusion noise at
+    # every evaluation. Callers preserve and restore the training RNG state,
+    # so this fixed evaluation stream cannot perturb optimization.
+    eval_seed = (int(seed) + 1_000_003 * int(rank)) % (2**32)
+    loader_generator = torch.Generator()
+    loader_generator.manual_seed(eval_seed)
+    loader.generator = loader_generator
+    random.seed(eval_seed)
+    np.random.seed(eval_seed)
+    torch.manual_seed(eval_seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed(eval_seed)
 
     # Run for 1 step. New datasets return a dictionary so heterogeneous
     # conditions are not padded; legacy configs retain their tuple contract.
@@ -557,6 +573,11 @@ def evaluate(
     if rank == 0:
         plt.close("all")  # Close any remaining matplotlib figures
         gc.collect()
+
+    if offload_model:
+        _eval_model_cache.to("cpu")
+        gc.collect()
+        torch.cuda.empty_cache()
 
     return sim_score
 

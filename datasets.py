@@ -494,11 +494,15 @@ class TrainingDataset(BaseDataset):
             "align": "embedding_align",
             "alignment": "embedding_align",
             "embedding_alignment": "embedding_align",
+            "d": "state_conditioned_controller",
+            "state_controller": "state_conditioned_controller",
+            "latent_state_controller": "state_conditioned_controller",
         }.get(raw_finetune_scheme, raw_finetune_scheme)
         self.finetune_substage = finetune_substage
         self.alignment_warmup = bool(
             self.training_stage == "real_finetune"
-            and self.finetune_scheme == "embedding_align"
+            and self.finetune_scheme
+            in {"embedding_align", "state_conditioned_controller"}
             and finetune_substage == "warmup"
         )
         self.alignment_proxy_store: Optional[OfflineProxyStore] = None
@@ -506,14 +510,15 @@ class TrainingDataset(BaseDataset):
         self.alignment_max_abs_frame_offset = 8
         if (
             self.training_stage == "real_finetune"
-            and self.finetune_scheme == "embedding_align"
+            and self.finetune_scheme
+            in {"embedding_align", "state_conditioned_controller"}
         ):
             proxy_config = (two_stage_config or {}).get("proxy", {})
             storage_path = proxy_config.get("storage_path")
             if storage_path is None:
                 raise ValueError(
-                    "embedding_align requires proxy.storage_path for the offline "
-                    "DreamDojo latent teacher cache"
+                    f"{self.finetune_scheme} requires proxy.storage_path for the "
+                    "offline latent teacher cache"
                 )
             storage_path = os.path.expanduser(str(storage_path))
             if not os.path.isabs(storage_path):
@@ -524,13 +529,15 @@ class TrainingDataset(BaseDataset):
                 storage_path = os.path.join(original_cwd, storage_path)
             self.alignment_latent_dim = int(proxy_config.get("dim", 0))
             if self.alignment_latent_dim < 1:
-                raise ValueError("embedding_align requires a positive proxy.dim")
+                raise ValueError(
+                    f"{self.finetune_scheme} requires a positive proxy.dim"
+                )
             self.alignment_max_abs_frame_offset = int(
                 proxy_config.get("max_abs_frame_offset", 8)
             )
             if self.alignment_max_abs_frame_offset != 8:
                 raise ValueError(
-                    "EmbeddingAlign teacher eligibility is fixed to "
+                    "Latent teacher eligibility is fixed to "
                     "abs(frame_offset)<=8"
                 )
             self.alignment_proxy_store = OfflineProxyStore(

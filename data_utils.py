@@ -702,7 +702,13 @@ def prepare_datasets(
         raise ValueError("At least one dataset must be enabled")
 
     if training_stage == "real_finetune":
-        expected_training_datasets = {"recon", "scand", "tartan_drive", "sacson"}
+        protocol = str(config.get("finetune", {}).get("dataset_protocol", "paper"))
+        if protocol not in {"paper", "go2"}:
+            raise ValueError(f"Unknown finetune.dataset_protocol: {protocol}")
+        expected_training_datasets = (
+            {"go2"} if protocol == "go2"
+            else {"recon", "scand", "tartan_drive", "sacson"}
+        )
         selected_training_datasets = {
             name
             for name, dataset_config in active_datasets.items()
@@ -711,8 +717,8 @@ def prepare_datasets(
         }
         if selected_training_datasets != expected_training_datasets:
             raise ValueError(
-                "real_finetune must train on exactly RECON, SCAND, TartanDrive, "
-                "and HuRoN (the repository key is 'sacson'); got "
+                f"real_finetune protocol={protocol} must train on exactly "
+                f"{sorted(expected_training_datasets)}; got "
                 f"{sorted(selected_training_datasets)}"
             )
         declared_selection = config.get("dataset_selection", {}).get(
@@ -722,8 +728,7 @@ def prepare_datasets(
             expected_training_datasets
         ):
             raise ValueError(
-                "dataset_selection.finetune must be exactly "
-                "[recon, scand, tartan_drive, sacson]"
+                f"dataset_selection.finetune must be exactly {sorted(expected_training_datasets)}"
             )
         global_distance = (
             int(config.dataset.distance.min_dist_cat),
@@ -1109,8 +1114,167 @@ def prepare_proxy_pretrain_dataset(config: DictConfig):
     return dataset
 
 
+def prepare_proxy_pretrain_validation_dataset(config: DictConfig):
+    """Build the opt-in, trajectory-disjoint pixel validation dataset.
+
+    Stage-1 training may use cached SD-VAE posteriors, but evaluation needs
+    pixels for prediction decoding and perceptual scoring.  The validation
+    recipe and proxy root are therefore separate from their training peers.
+    """
+
+    from navanywhere_recipe import load_sampling_recipe
+    from two_stage_data import NavAnywhereDataset
+
+    if str(config.get("training_stage", "legacy")) != "proxy_pretrain":
+        raise ValueError(
+            "prepare_proxy_pretrain_validation_dataset requires "
+            "training_stage=proxy_pretrain"
+        )
+    validation = config.dataset.get("validation", {})
+    if not bool(validation.get("enabled", False)):
+        raise ValueError("NavAnywhere Stage-1 validation is not enabled")
+    if int(validation.get("batches", 1)) != 1:
+        raise ValueError(
+            "The Stage-1 evaluator currently consumes exactly one batch; "
+            "dataset.validation.batches must be 1"
+        )
+
+    data_config = config.dataset.datasets.navanywhere
+    root = data_config.get("root", data_config.get("data_folder"))
+    if root is None:
+        raise ValueError("dataset.datasets.navanywhere.root is required")
+    root = os.path.expanduser(str(root))
+    if not os.path.isabs(root):
+        root = os.path.join(_original_cwd(), root)
+
+    recipe_config = validation.get("sampling_recipe", {})
+    recipe_path = recipe_config.get("path", None)
+    if recipe_path is None or str(recipe_path).strip().lower() in {
+        "",
+        "none",
+        "null",
+    }:
+        raise ValueError("dataset.validation.sampling_recipe.path is required")
+    recipe_path = os.path.expanduser(os.fspath(recipe_path))
+    if not os.path.isabs(recipe_path):
+        recipe_path = os.path.join(_original_cwd(), recipe_path)
+    recipe_path = os.path.realpath(recipe_path)
+    recipe, _, recipe_sha = load_sampling_recipe(
+        recipe_path,
+        seed=int(config.seed),
+        context_size=int(config.dataset.context_size),
+        goals_per_obs=int(data_config.get("goals_per_obs", 1)),
+        frame_offset_range=(-64, 64),
+    )
+    configured_sha = recipe_config.get("sha256", None)
+    if configured_sha not in (None, "", "null") and str(configured_sha) != recipe_sha:
+        raise ValueError(
+            "dataset.validation.sampling_recipe.sha256 does not match the "
+            f"recipe file: {configured_sha!r} != {recipe_sha!r}"
+        )
+    config.dataset.validation.sampling_recipe.sha256 = recipe_sha
+
+    train_recipe_path = config.dataset.get("sampling_recipe", {}).get("path", None)
+    if train_recipe_path not in (None, "", "null"):
+        train_recipe_path = os.path.expanduser(os.fspath(train_recipe_path))
+        if not os.path.isabs(train_recipe_path):
+            train_recipe_path = os.path.join(_original_cwd(), train_recipe_path)
+        train_recipe_path = os.path.realpath(train_recipe_path)
+        train_recipe, _, _ = load_sampling_recipe(
+            train_recipe_path,
+            seed=int(config.seed),
+            context_size=int(config.dataset.context_size),
+            goals_per_obs=int(data_config.get("goals_per_obs", 1)),
+            frame_offset_range=(-64, 64),
+        )
+        train_ids = {
+            (str(item["source_id"]), str(item["trajectory_id"]))
+            for item in train_recipe["trajectories"]
+        }
+        val_ids = {
+            (str(item["source_id"]), str(item["trajectory_id"]))
+            for item in recipe["trajectories"]
+        }
+        overlap = sorted(train_ids & val_ids)
+        if overlap:
+            raise ValueError(
+                "NavAnywhere train/validation recipes overlap by trajectory: "
+                f"{overlap[:5]}"
+            )
+
+    action_mode = str(config.get("action_mode", "none"))
+    raw_proxy = config.get("proxy", {})
+    proxy_config = (
+        OmegaConf.to_container(raw_proxy, resolve=True)
+        if OmegaConf.is_config(raw_proxy)
+        else dict(raw_proxy)
+    )
+    if not isinstance(proxy_config, dict):
+        raise TypeError("proxy configuration must be a mapping")
+    if action_mode != "none":
+        validation_proxy_root = validation.get("proxy_root", None)
+        if validation_proxy_root in (None, "", "null"):
+            raise ValueError(
+                "dataset.validation.proxy_root is required for action-conditioned "
+                "Stage-1 validation"
+            )
+        validation_proxy_root = os.path.expanduser(str(validation_proxy_root))
+        if not os.path.isabs(validation_proxy_root):
+            validation_proxy_root = os.path.join(
+                _original_cwd(), validation_proxy_root
+            )
+        proxy_config["storage_path"] = validation_proxy_root
+
+    source_ids = data_config.get("source_ids", None)
+    if source_ids is not None:
+        source_ids = list(source_ids)
+    dataset = NavAnywhereDataset(
+        root=root,
+        source_ids=source_ids,
+        sampling_recipe=recipe_path,
+        transform=get_transform(
+            config.dataset.image_size,
+            config.dataset.mean,
+            config.dataset.std,
+        ),
+        context_size=int(config.dataset.context_size),
+        goals_per_obs=int(data_config.get("goals_per_obs", 1)),
+        min_frame_offset=-64,
+        max_frame_offset=64,
+        action_mode=action_mode,
+        proxy=proxy_config,
+        proxy_dim=(None if action_mode == "none" else int(proxy_config["dim"])),
+        proxy_max_abs_frame_offset=int(proxy_config.get("max_abs_frame_offset", 8)),
+        strict_loading=bool(proxy_config.get("strict_loading", False)),
+        seed=int(config.seed),
+    )
+    logger.info(
+        "Stage-1 validation dataset: samples=%d, trajectories=%d, "
+        "sources=%d, action_mode=%s, recipe_sha256=%s",
+        len(dataset),
+        int(recipe["totals"]["trajectories"]),
+        int(recipe["totals"]["sources"]),
+        action_mode,
+        recipe_sha,
+    )
+    return dataset
+
+
 def create_dataloader(dataset, config: DictConfig, rank, is_train=True):
-    """Create dataloader for training or testing."""
+    """Create a deterministic, CUDA-safe dataloader for training or testing.
+
+    Two-stage training initializes CUDA before the loader iterator is created.
+    Linux's default ``fork`` context would therefore copy CUDA and pinned-host
+    allocator state into every worker.  A worker-side Python GC can later try
+    to release that inherited state and abort while reinitializing CUDA.  Spawn
+    workers start with a clean runtime and never inherit the parent's CUDA
+    state.
+
+    Workers intentionally remain non-persistent.  The training loop updates
+    the dataset epoch and the loader generator before every iterator is made;
+    recreating workers is what propagates both values and makes an in-epoch
+    checkpoint replay the same worker RNG streams from the start of the epoch.
+    """
     sampler = DistributedSampler(
         dataset,
         num_replicas=dist.get_world_size(),
@@ -1119,12 +1283,17 @@ def create_dataloader(dataset, config: DictConfig, rank, is_train=True):
         seed=config.seed,
     )
 
+    num_workers = int(config.training.num_workers)
+    worker_options = {}
+    if num_workers > 0:
+        worker_options["multiprocessing_context"] = "spawn"
+
     loader = DataLoader(
         dataset,
         batch_size=config.training.batch_size,
         shuffle=False,
         sampler=sampler,
-        num_workers=config.training.num_workers,
+        num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
         persistent_workers=False,
@@ -1135,6 +1304,7 @@ def create_dataloader(dataset, config: DictConfig, rank, is_train=True):
             )
             else None
         ),
+        **worker_options,
     )
 
     return loader, sampler

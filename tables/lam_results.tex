@@ -1,0 +1,107 @@
+% Required in the preamble:
+% \usepackage{booktabs,graphicx}
+\providecommand{\CompACTMissing}{\textemdash}
+
+% Aggregation: macro-average over offsets {-8,-6,-4,-2,2,4,6,8},
+% then over conditions within each protocol.
+% Pixel + action: nav1 checkpoint; single-checkpoint point estimates.
+% Parenthesized degradation uses matched oracle reconstructions:
+%   PSNR: oracle - swapped; LPIPS: swapped - oracle.
+% These are not differences between the aggregate ID/OOD and CD results.
+
+\begin{table*}[t]
+  \centering
+  \caption{\textbf{LAM reconstruction and cross-domain transfer.}
+  ID: held-out RECON/SCAND/HuRoN (training domains);
+  OOD: unseen TartanDrive.
+  CD: action-matched cross-domain latent transfer.
+  EPE: endpoint error.
+  Parentheses show degradation from matched oracle reconstructions
+  (lower is better).
+  \CompACTMissing{}: pending.}
+  \label{tab:lam_reconstruction}
+  \small
+  \setlength{\tabcolsep}{5pt}
+  \renewcommand{\arraystretch}{1.15}
+
+  \resizebox{\linewidth}{!}{%
+    \begin{tabular}{@{}l*{8}{c}@{}}
+      \toprule
+      Objective
+      & \multicolumn{2}{c}{ID}
+      & \multicolumn{2}{c}{ID-CD}
+      & \multicolumn{2}{c}{OOD}
+      & \multicolumn{2}{c@{}}{OOD-CD} \\
+      \cmidrule(lr){2-3}
+      \cmidrule(lr){4-5}
+      \cmidrule(lr){6-7}
+      \cmidrule(lr){8-9}
+
+      % RGB reconstruction.
+      \textit{RGB}
+      & PSNR $\uparrow$ & LPIPS $\downarrow$
+      & PSNR $\uparrow$ & LPIPS $\downarrow$
+      & PSNR $\uparrow$ & LPIPS $\downarrow$
+      & PSNR $\uparrow$ & LPIPS $\downarrow$ \\
+      \cmidrule(lr){2-9}
+
+      Pixel
+      & \CompACTMissing & \CompACTMissing
+      & \CompACTMissing & \CompACTMissing
+      & \CompACTMissing & \CompACTMissing
+      & \CompACTMissing & \CompACTMissing \\
+
+      Pixel + action
+      & 19.2250 & 0.5407
+      & \shortstack{14.7818\\(5.2853)}
+      & \shortstack{0.5899\\(0.0705)}
+      & 17.2198 & 0.7067
+      & \shortstack{14.2394\\(4.6937)}
+      & \shortstack{0.6610\\(0.0597)} \\
+
+      \midrule
+
+      % DINO feature reconstruction.
+      \textit{DINO features}
+      & MSE $\downarrow$ & Cosine $\uparrow$
+      & MSE $\downarrow$ & Cosine $\uparrow$
+      & MSE $\downarrow$ & Cosine $\uparrow$
+      & MSE $\downarrow$ & Cosine $\uparrow$ \\
+      \cmidrule(lr){2-9}
+
+      DINO
+      & \CompACTMissing & \CompACTMissing
+      & \CompACTMissing & \CompACTMissing
+      & \CompACTMissing & \CompACTMissing
+      & \CompACTMissing & \CompACTMissing \\
+
+      \midrule
+
+      % Action reconstruction.
+      \textit{Action}
+      & \shortstack{EPE\\(m) $\downarrow$}
+      & \shortstack{Yaw MAE\\($^\circ$) $\downarrow$}
+      & \shortstack{EPE\\(m) $\downarrow$}
+      & \shortstack{Yaw MAE\\($^\circ$) $\downarrow$}
+      & \shortstack{EPE\\(m) $\downarrow$}
+      & \shortstack{Yaw MAE\\($^\circ$) $\downarrow$}
+      & \shortstack{EPE\\(m) $\downarrow$}
+      & \shortstack{Yaw MAE\\($^\circ$) $\downarrow$} \\
+      \cmidrule(lr){2-9}
+
+      Pixel + action
+      & 0.3753 & 6.3057
+      & 0.2621 & 3.6505
+      & 3.2526 & 5.4041
+      & 0.7269 & 3.4042 \\
+
+      Action only
+      & \CompACTMissing & \CompACTMissing
+      & \CompACTMissing & \CompACTMissing
+      & \CompACTMissing & \CompACTMissing
+      & \CompACTMissing & \CompACTMissing \\
+
+      \bottomrule
+    \end{tabular}%
+  }
+\end{table*}

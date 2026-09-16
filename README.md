@@ -147,6 +147,13 @@ updates one append-only-style JSON registry, and renders a comparison against
 previous models and the NWM/CompACT paper baselines:
 
 ```bash
+# Recommended: run the complete standard suite in the background. When GPU IDs
+# are omitted, four GPUs with less than 1 GiB allocated are selected automatically.
+scripts/start_nwm_benchmark.sh nwm-latentpt-ft
+
+# The launcher prints PID/log/status paths; follow progress with its printed command.
+tail -f /file_system/nas/algorithm/dujun.nie/nwm/results/nwm_benchmark/logs/<LOG_FILE>
+
 # Reuse completed results and run every missing task for all registered models.
 scripts/run_nwm_benchmark.sh --gpus 0,1,2,3
 

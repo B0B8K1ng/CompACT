@@ -239,3 +239,34 @@ def test_ten_trajectory_rollout_dry_run_is_isolated(tmp_path: Path, monkeypatch)
     assert "eval_sample_indices=[0,1,2,3,4,5,6,7,8,9]" in flattened
     assert "eval_expected_full_count=150" in flattened
     assert any("go_stanford_unseen_rollout_10_v1" in argument for argument in flattened)
+
+
+def test_rollout_visualization_reads_shared_ground_truth(
+    tmp_path: Path, monkeypatch
+) -> None:
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    monkeypatch.syspath_prepend(str(scripts))
+    runner = importlib.import_module("run_nwm_benchmark")
+    seed_root = tmp_path / "evaluation_seeds" / "seed1"
+    monkeypatch.setattr(runner, "BENCHMARK_ROOT", seed_root)
+    monkeypatch.setattr(runner, "SHARED_BENCHMARK_ROOT", tmp_path)
+
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        runner,
+        "run",
+        lambda command, env, dry_run: commands.append(command),
+    )
+    runner.run_rollout_visualization(
+        ["nwm-real"], seed_root / "benchmark_results.json", {}, True
+    )
+
+    command = commands[0]
+    gt_index = command.index("--gt-root") + 1
+    benchmark_index = command.index("--benchmark-root") + 1
+    assert command[gt_index] == str(
+        tmp_path / "protocol_runs" / runner.UNSEEN_ROLLOUT_PROTOCOL / "gt"
+    )
+    assert command[benchmark_index] == str(
+        seed_root / "protocol_runs" / runner.UNSEEN_ROLLOUT_PROTOCOL
+    )

@@ -191,18 +191,67 @@ def build_sampling_recipe(
     inventory = discover_inventory(
         root, context_size=context_size, source_ids=source_ids
     )
-    total_observations = sum(item["observation_count"] for item in inventory)
+    return build_sampling_recipe_from_inventory(
+        inventory,
+        seed=seed,
+        context_size=context_size,
+        goals_per_obs=goals_per_obs,
+        samples_per_epoch=samples_per_epoch,
+    )
+
+
+def build_sampling_recipe_from_inventory(
+    inventory: Sequence[Mapping[str, Any]],
+    *,
+    seed: int,
+    context_size: int = 4,
+    goals_per_obs: int = 4,
+    samples_per_epoch: int = 0,
+) -> dict[str, Any]:
+    """Build a recipe from an already fingerprinted trajectory inventory.
+
+    This is used for deterministic trajectory-level train/validation splits.
+    It deliberately retains the exact v1 sampling algorithms and recipe
+    schema; only the supplied trajectory inventory differs.
+    """
+
+    context_size = int(context_size)
+    goals_per_obs = int(goals_per_obs)
+    if context_size < 1 or goals_per_obs < 1:
+        raise ValueError("context_size and goals_per_obs must be positive")
+    normalized = [dict(item) for item in inventory]
+    identities = [
+        (str(item.get("source_id")), str(item.get("trajectory_id")))
+        for item in normalized
+    ]
+    if not normalized:
+        raise ValueError("Sampling recipe inventory must not be empty")
+    if identities != sorted(identities) or len(identities) != len(set(identities)):
+        raise ValueError("Sampling recipe inventory must be sorted and unique")
+    for item, identity in zip(normalized, identities):
+        frame_count = int(item.get("frame_count", 0))
+        observation_count = int(item.get("observation_count", 0))
+        if frame_count < context_size or observation_count < 1:
+            raise ValueError(f"Invalid trajectory inventory entry {identity}")
+        if observation_count != frame_count - context_size + 1:
+            raise ValueError(
+                f"Trajectory observation count does not match context size for {identity}"
+            )
+        if len(str(item.get("frame_indices_sha256", ""))) != 64:
+            raise ValueError(f"Invalid frame fingerprint for {identity}")
+
+    total_observations = sum(int(item["observation_count"]) for item in normalized)
     samples_per_epoch = int(samples_per_epoch) or total_observations
     if samples_per_epoch < 1:
         raise ValueError("samples_per_epoch must be positive")
     source_summary: dict[str, dict[str, int]] = {}
-    for item in inventory:
+    for item in normalized:
         summary = source_summary.setdefault(
             item["source_id"], {"trajectories": 0, "observations": 0}
         )
         summary["trajectories"] += 1
         summary["observations"] += int(item["observation_count"])
-    inventory_digest = hashlib.sha256(canonical_json(inventory)).hexdigest()
+    inventory_digest = hashlib.sha256(canonical_json(normalized)).hexdigest()
     return {
         "schema_version": RECIPE_SCHEMA_VERSION,
         "format": RECIPE_FORMAT,
@@ -225,12 +274,12 @@ def build_sampling_recipe(
         "inventory_sha256": inventory_digest,
         "totals": {
             "sources": len(source_summary),
-            "trajectories": len(inventory),
+            "trajectories": len(normalized),
             "observations": total_observations,
             "samples_per_epoch": samples_per_epoch,
         },
         "sources": source_summary,
-        "trajectories": inventory,
+        "trajectories": normalized,
     }
 
 

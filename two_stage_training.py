@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import math
 import os
 import uuid
 from collections.abc import Mapping, Sequence
@@ -42,6 +43,7 @@ from two_stage_checkpoint import (
     capture_rng_state,
     extract_checkpoint_metadata,
     load_stage1_weights,
+    load_finetune_weights,
     load_two_stage_resume,
     restore_rng_state,
     validate_data_resume_fingerprint,
@@ -54,6 +56,7 @@ from two_stage_nwm import (
     configure_trainable_parameters,
     dense_motion_from_collated,
     flatten_goal_tensor,
+    latent_action_l2_loss,
     LOCAL_PROXY_MAX_ABS_FRAME_OFFSET,
     normalize_finetune_scheme,
     predicted_latent_metrics,
@@ -239,7 +242,11 @@ def _periodic_checkpoint_due(
             and current_steps % interval == 0
             and current_steps < target_steps
         )
-    return global_steps > 0 and global_steps % interval == 0
+    return (
+        global_steps > 0
+        and global_steps % interval == 0
+        and current_steps < target_steps
+    )
 
 
 def _evaluation_due(
@@ -259,6 +266,87 @@ def _evaluation_due(
     )
 
 
+def _phase_evaluation_due(
+    *,
+    training_stage: str,
+    scheme: str | None,
+    substage: str,
+    current_steps: int,
+    global_steps: int,
+    config: Any,
+) -> bool:
+    """Keep legacy scheduling, except for the controller's independent axes."""
+    if (
+        training_stage == "real_finetune"
+        and scheme == "state_conditioned_controller"
+    ):
+        interval = int(
+            config.finetune.get("controller_eval_every", 1000)
+            if substage == "warmup"
+            else config.get("eval_every", 5000)
+        )
+        return _evaluation_due(
+            global_steps=current_steps,
+            interval=interval,
+            eval_at_first_step=bool(config.get("eval_at_first_step", True)),
+        )
+    return _evaluation_due(
+        global_steps=global_steps,
+        interval=int(config.get("eval_every", 0)),
+        eval_at_first_step=bool(config.get("eval_at_first_step", True)),
+    )
+
+
+def _controller_phase_name(scheme: str | None, substage: str) -> str | None:
+    if scheme != "state_conditioned_controller":
+        return None
+    return "controller_pretrain" if substage == "warmup" else "joint"
+
+
+def _define_controller_wandb_metrics(config: Any, rank: int) -> None:
+    if not _wandb_active(config, rank):
+        return
+    for phase in ("controller_pretrain", "joint"):
+        step_name = f"{phase}/step"
+        wandb.define_metric(step_name)
+        wandb.define_metric(f"{phase}/train/*", step_metric=step_name)
+        wandb.define_metric(f"{phase}/eval/*", step_metric=step_name)
+
+
+def _distributed_cuda_memory_gib(device: torch.device) -> dict[str, float] | None:
+    """Return the largest current/peak CUDA footprint across all ranks."""
+
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return None
+    torch.cuda.synchronize(device)
+    values = torch.tensor(
+        [
+            torch.cuda.memory_allocated(device),
+            torch.cuda.memory_reserved(device),
+            torch.cuda.max_memory_allocated(device),
+            torch.cuda.max_memory_reserved(device),
+        ],
+        dtype=torch.float64,
+        device=device,
+    )
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(values, op=dist.ReduceOp.MAX)
+    current_allocated, current_reserved, peak_allocated, peak_reserved = (
+        value / 1024**3 for value in values.tolist()
+    )
+    return {
+        "current_allocated_gib": current_allocated,
+        "current_reserved_gib": current_reserved,
+        "peak_allocated_gib": peak_allocated,
+        "peak_reserved_gib": peak_reserved,
+    }
+
+
+def _reset_cuda_peak_memory(device: torch.device) -> None:
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats(device)
+
+
 def _retained_stage2_checkpoint_path(
     checkpoint_dir: str,
     substage: str,
@@ -272,6 +360,19 @@ def _retained_stage2_checkpoint_path(
     return os.path.join(
         checkpoint_dir,
         f"{substage}_{current_steps:07d}.pth.tar",
+    )
+
+
+def _retained_stage1_checkpoint_path(
+    checkpoint_dir: str,
+    current_steps: int,
+) -> str:
+    """Build a retained periodic Stage-1 checkpoint filename."""
+    if current_steps < 0:
+        raise ValueError("current_steps must be non-negative")
+    return os.path.join(
+        checkpoint_dir,
+        f"pretrain_{current_steps:07d}.pth.tar",
     )
 
 
@@ -301,7 +402,7 @@ def _save_training_checkpoint(
     current_steps: int,
     **kwargs: Any,
 ) -> str:
-    """Save a retained Stage-2 checkpoint or the legacy Stage-1 latest file."""
+    """Save a retained numbered checkpoint and atomically update latest."""
     latest_path = os.path.join(checkpoint_dir, "latest.pth.tar")
     if training_stage == "real_finetune":
         checkpoint_path = _retained_stage2_checkpoint_path(
@@ -309,15 +410,19 @@ def _save_training_checkpoint(
             substage,
             current_steps,
         )
+    elif training_stage == "proxy_pretrain":
+        checkpoint_path = _retained_stage1_checkpoint_path(
+            checkpoint_dir,
+            current_steps,
+        )
     else:
-        checkpoint_path = latest_path
+        raise ValueError(f"Unsupported training_stage: {training_stage!r}")
     save_two_stage_checkpoint(
         checkpoint_path,
         substage=substage,
         **kwargs,
     )
-    if training_stage == "real_finetune":
-        _atomic_update_latest_checkpoint(checkpoint_path, latest_path)
+    _atomic_update_latest_checkpoint(checkpoint_path, latest_path)
     return checkpoint_path
 
 
@@ -430,6 +535,15 @@ def _make_optimizer(
     if training_stage == "real_finetune":
         adapter_lr = float(finetune.get("adapter_lr", base_lr))
         backbone_lr = float(finetune.get("backbone_lr", base_lr))
+        if scheme == "state_conditioned_controller":
+            if substage == "warmup":
+                adapter_lr = float(
+                    finetune.get("controller_pretrain_lr", 1.0e-3)
+                )
+            else:
+                joint_lr = float(finetune.get("joint_lr", 1.0e-4))
+                adapter_lr = joint_lr
+                backbone_lr = joint_lr
     groups = build_optimizer_param_groups(
         model,
         training_stage=training_stage,
@@ -438,7 +552,58 @@ def _make_optimizer(
         adapter_lr=adapter_lr,
         backbone_lr=backbone_lr,
     )
+    if (
+        training_stage == "real_finetune"
+        and scheme == "state_conditioned_controller"
+        and substage == "warmup"
+    ):
+        controller_weight_decay = float(
+            finetune.get("controller_pretrain_weight_decay", 0.04)
+        )
+        for group in groups:
+            group["weight_decay"] = controller_weight_decay
     return setup_optimizer(config, groups)
+
+
+def _make_scheduler(
+    config: Any,
+    optimizer: torch.optim.Optimizer,
+    *,
+    training_stage: str,
+    scheme: str | None,
+    substage: str | None,
+):
+    """Use the paper schedule only for controller pretraining."""
+    if (
+        training_stage != "real_finetune"
+        or scheme != "state_conditioned_controller"
+    ):
+        return setup_scheduler(config, optimizer)
+    if substage == "joint":
+        # The requested joint protocol is a fixed 1e-4, matching nwm-real.
+        return None
+    finetune = config.get("finetune", {})
+    total_steps = int(finetune.get("warmup_steps", 0))
+    lr_warmup_steps = int(finetune.get("controller_lr_warmup_steps", 300))
+    if total_steps < 1:
+        raise ValueError("Controller pretraining requires warmup_steps > 0")
+    if not 0 <= lr_warmup_steps <= total_steps:
+        raise ValueError(
+            "controller_lr_warmup_steps must be within [0, warmup_steps]"
+        )
+
+    def multiplier(completed_steps: int) -> float:
+        completed_steps = int(completed_steps)
+        if lr_warmup_steps > 0 and completed_steps < lr_warmup_steps:
+            return float(completed_steps + 1) / float(lr_warmup_steps)
+        cosine_steps = total_steps - lr_warmup_steps
+        if cosine_steps <= 0:
+            return 1.0
+        progress = (completed_steps - lr_warmup_steps) / float(cosine_steps)
+        progress = min(max(progress, 0.0), 1.0)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=multiplier)
 
 
 def _log_trainability(model, optimizer, stage, substage, log):
@@ -573,7 +738,8 @@ def _alignment_targets(batch, raw_model, batch_size, num_goals, device):
     )
     if teacher is None or valid is None:
         raise ValueError(
-            "embedding_align requires teacher_latent and latent_valid dataset fields"
+            "Latent-teacher training requires teacher_latent and latent_valid "
+            "dataset fields"
         )
     if teacher.shape != (batch_size * num_goals, latent_dim):
         raise ValueError(
@@ -601,8 +767,10 @@ def _assert_first_step_gradients(raw_model, scheme, substage):
     named = list(raw_model.named_parameters())
     if scheme in {"reset", "embedding_align"}:
         adapter_prefix = "motion_condition_encoder.real_"
-    else:
+    elif scheme == "real_to_latent":
         adapter_prefix = "real_to_latent."
+    else:
+        adapter_prefix = "state_conditioned_controller."
     if not _finite_nonzero_gradient(named, adapter_prefix):
         raise AssertionError(
             f"{adapter_prefix} has no nonzero finite gradient in {substage}"
@@ -634,7 +802,7 @@ def _assert_first_step_gradients(raw_model, scheme, substage):
             named, "motion_condition_encoder.latent_"
         ):
             raise AssertionError("Joint E_z has no nonzero finite gradient")
-    if scheme == "embedding_align" or (
+    if scheme in {"embedding_align", "state_conditioned_controller"} or (
         scheme == "real_to_latent" and substage == "warmup"
     ):
         teacher_grads = [
@@ -664,11 +832,11 @@ def _should_check_first_step_gradients(
     """
     if not check_gradients or training_stage != "real_finetune":
         return False
-    if scheme == "embedding_align" and substage == "warmup":
+    if scheme in {"embedding_align", "state_conditioned_controller"} and substage == "warmup":
         if local_alignment_has_target is None:
             raise AssertionError(
-                "EmbeddingAlign warm-up gradient validation needs the local "
-                "alignment-valid mask"
+                "Latent-teacher warm-up gradient validation needs the local "
+                "teacher-valid mask"
             )
         return bool(local_alignment_has_target)
     return True
@@ -747,7 +915,12 @@ def two_stage_train_step(
     local_alignment_has_target: bool | None = None
     optimizer.zero_grad(set_to_none=True)
 
-    if training_stage == "real_finetune" and scheme == "embedding_align" and substage == "warmup":
+    teacher_warmup = bool(
+        training_stage == "real_finetune"
+        and scheme in {"embedding_align", "state_conditioned_controller"}
+        and substage == "warmup"
+    )
+    if teacher_warmup:
         rel_shape = torch.as_tensor(batch["k"]).shape
         if len(rel_shape) != 2:
             raise ValueError("Warmup temporal tensor must be [B,G]")
@@ -765,28 +938,65 @@ def two_stage_train_step(
             torch.int64,
         )
         if frame_offset is None:
-            raise ValueError("EmbeddingAlign warm-up requires raw frame_offset")
+            raise ValueError("Latent-teacher warm-up requires raw frame_offset")
         valid = valid & (
             frame_offset.abs() <= LOCAL_PROXY_MAX_ABS_FRAME_OFFSET
         )
         local_alignment_has_target = bool(valid.any().item())
-        auxiliary = model(
-            None,
-            None,
-            action=action,
-            teacher_latent=teacher,
-            teacher_valid=valid,
-            alignment_only=True,
-        )
-        loss_terms = alignment_loss(
-            auxiliary["real_embedding"],
-            auxiliary["target_embedding"],
-            auxiliary["alignment_valid"],
-            cosine_weight=float(config.finetune.get("align_cos_weight", 1.0)),
-            l1_weight=float(config.finetune.get("align_l1_weight", 0.0)),
-            distributed_mean=True,
-        )
-        loss = loss_terms["alignment"]
+        if scheme == "embedding_align":
+            auxiliary = model(
+                None,
+                None,
+                action=action,
+                teacher_latent=teacher,
+                teacher_valid=valid,
+                alignment_only=True,
+            )
+            loss_terms = alignment_loss(
+                auxiliary["real_embedding"],
+                auxiliary["target_embedding"],
+                auxiliary["alignment_valid"],
+                cosine_weight=float(config.finetune.get("align_cos_weight", 1.0)),
+                l1_weight=float(config.finetune.get("align_l1_weight", 0.0)),
+                distributed_mean=True,
+            )
+            loss = loss_terms["alignment"]
+        else:
+            with torch.amp.autocast(
+                device_type="cuda",
+                enabled=bfloat and device.type == "cuda",
+                dtype=torch.bfloat16,
+            ):
+                (
+                    _,
+                    context,
+                    _,
+                    encoded_frame_offset,
+                    encoded_batch_size,
+                    encoded_num_goals,
+                ) = _encode_batch(tokenizer, batch, config, device)
+                if (encoded_batch_size, encoded_num_goals) != (
+                    batch_size,
+                    num_goals,
+                ):
+                    raise ValueError("Controller warm-up batch layout changed")
+                if not torch.equal(encoded_frame_offset, frame_offset):
+                    raise ValueError("Controller warm-up frame offsets are misaligned")
+                auxiliary = model(
+                    None,
+                    None,
+                    x_cond=context,
+                    action=action,
+                    state_controller_only=True,
+                )
+                loss_terms = latent_action_l2_loss(
+                    auxiliary["predicted_latent"],
+                    teacher,
+                    valid,
+                    distributed_mean=True,
+                )
+                loss = loss_terms["latent_l2"]
+            logs.update(predicted_latent_metrics(auxiliary["predicted_latent"]))
         logs.update({key: value.detach() for key, value in loss_terms.items()})
         logs["diffusion"] = loss.detach() * 0
     else:
@@ -863,6 +1073,14 @@ def two_stage_train_step(
                     )
                 elif scheme == "real_to_latent":
                     kwargs["return_aux"] = True
+                elif scheme == "state_conditioned_controller":
+                    teacher, latent_valid = _alignment_targets(
+                        batch, raw_model, batch_size, num_goals, device
+                    )
+                    latent_valid = latent_valid & (
+                        frame_offset.abs() <= LOCAL_PROXY_MAX_ABS_FRAME_OFFSET
+                    )
+                    kwargs["return_aux"] = True
 
             losses = diffusion.training_losses(model, target, timesteps, kwargs)
             diffusion_loss = losses["loss"].mean()
@@ -881,6 +1099,21 @@ def two_stage_train_step(
                 loss = loss + loss_terms["alignment"]
                 logs.update({key: value.detach() for key, value in loss_terms.items()})
             if scheme == "real_to_latent" and "predicted_latent" in auxiliary:
+                logs.update(predicted_latent_metrics(auxiliary["predicted_latent"]))
+            if scheme == "state_conditioned_controller":
+                loss_terms = latent_action_l2_loss(
+                    auxiliary["predicted_latent"],
+                    teacher,
+                    latent_valid,
+                    distributed_mean=True,
+                )
+                latent_weight = float(config.finetune.get("latent_l2_weight", 1.0))
+                weighted_latent = latent_weight * loss_terms["latent_l2"]
+                loss = loss + weighted_latent
+                logs.update(
+                    {key: value.detach() for key, value in loss_terms.items()}
+                )
+                logs["latent_l2_weighted"] = weighted_latent.detach()
                 logs.update(predicted_latent_metrics(auxiliary["predicted_latent"]))
 
     if not torch.isfinite(loss):
@@ -918,7 +1151,7 @@ def two_stage_train_step(
         scaler.update()
     if scheduler is not None:
         scheduler.step()
-    update_ema(ema, raw_model)
+    update_ema(ema, raw_model, decay=float(config.training.get("ema_decay", 0.9999)))
     logs["loss"] = loss.detach()
     return logs, proxy_accounting
 
@@ -937,13 +1170,26 @@ def _load_ema_and_training_state(checkpoint_path, ema, scheduler, scaler):
     return checkpoint
 
 
-def _prepare_loader(config, rank, substage, *, include_eval=False):
+def _prepare_loader(
+    config,
+    rank,
+    substage,
+    *,
+    include_eval=False,
+):
     stage = str(config.training_stage)
     if stage == "proxy_pretrain":
-        from data_utils import prepare_proxy_pretrain_dataset
+        from data_utils import (
+            prepare_proxy_pretrain_dataset,
+            prepare_proxy_pretrain_validation_dataset,
+        )
 
         dataset = prepare_proxy_pretrain_dataset(config)
-        eval_dataset = None
+        eval_dataset = (
+            prepare_proxy_pretrain_validation_dataset(config)
+            if include_eval
+            else None
+        )
     else:
         dataset, eval_dataset = prepare_datasets(
             config,
@@ -965,6 +1211,8 @@ def run_two_stage_training(config, device, rank, local_gpu, experiment_dir, log=
     training_stage, action_mode, scheme = validate_two_stage_config(config)
     if training_stage == "legacy":
         raise ValueError("run_two_stage_training must not be used for legacy configs")
+    if scheme == "state_conditioned_controller":
+        _define_controller_wandb_metrics(config, rank)
     checkpoint_dir = os.path.join(experiment_dir, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
 
@@ -983,6 +1231,8 @@ def run_two_stage_training(config, device, rank, local_gpu, experiment_dir, log=
             str(resume_path), map_location="cpu", weights_only=False
         )
         resume_metadata = extract_checkpoint_metadata(resume_checkpoint)
+        if resume_metadata.get("initialization") is not None:
+            OmegaConf.update(config, "finetune.initialization", resume_metadata["initialization"], force_add=True)
         _validate_resume_metadata(
             resume_metadata, training_stage, action_mode, scheme
         )
@@ -998,8 +1248,13 @@ def run_two_stage_training(config, device, rank, local_gpu, experiment_dir, log=
         )
     elif training_stage == "real_finetune":
         stage1_path = config.finetune.get("stage1_checkpoint", None)
+        init_path = config.finetune.get("init_checkpoint", None)
         random_init = bool(config.finetune.get("random_init", False))
-        if random_init:
+        if init_path:
+            summary = load_finetune_weights(raw_model, _resolve_user_path(init_path), config)
+            OmegaConf.update(config, "finetune.initialization", summary, force_add=True)
+            log.info("Complete EMA initialization (fresh training state): %s", summary)
+        elif random_init:
             # setup_model constructs CDiT and every motion adapter with their
             # standard fresh initialization. Deliberately do not touch any NWM
             # checkpoint here; validate_two_stage_config also rejects a path.
@@ -1032,12 +1287,29 @@ def run_two_stage_training(config, device, rank, local_gpu, experiment_dir, log=
         _load_ema_and_training_state(resume_path, ema, None, scaler)
 
     eval_interval = int(config.get("eval_every", 0))
+    controller_eval_interval = int(
+        config.get("finetune", {}).get("controller_eval_every", 0)
+    )
     eval_at_first_step = bool(config.get("eval_at_first_step", True))
+    log_cuda_memory = bool(config.get("log_cuda_memory", False))
+    eval_offload_models = bool(config.get("eval_offload_models", False))
+    proxy_validation_enabled = bool(
+        training_stage == "proxy_pretrain"
+        and config.dataset.get("validation", {}).get("enabled", False)
+    )
     eval_enabled = bool(
-        training_stage == "real_finetune"
-        and (eval_interval > 0 or eval_at_first_step)
+        (training_stage == "real_finetune" or proxy_validation_enabled)
+        and (
+            eval_interval > 0
+            or (
+                scheme == "state_conditioned_controller"
+                and controller_eval_interval > 0
+            )
+            or eval_at_first_step
+        )
     )
     eval_tokenizer = None
+    eval_tokenizer_offloaded = False
     if eval_enabled:
         # Cached posteriors are a training-only optimization. The legacy
         # evaluator needs RGB inputs and a real VAE to encode conditions and
@@ -1055,10 +1327,19 @@ def run_two_stage_training(config, device, rank, local_gpu, experiment_dir, log=
         eval_tokenizer.eval()
         for parameter in eval_tokenizer.parameters():
             parameter.requires_grad_(False)
+        if eval_offload_models and eval_tokenizer is not tokenizer:
+            eval_tokenizer.to("cpu")
+            eval_tokenizer_offloaded = True
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         log.info(
-            "Stage-2 legacy eval enabled: first_step=%s interval=%d model=EMA",
+            "Evaluation enabled: stage=%s first_step=%s interval=%d "
+            "controller_interval=%d model=EMA offload_models=%s",
+            training_stage,
             eval_at_first_step,
             eval_interval,
+            controller_eval_interval,
+            eval_offload_models,
         )
 
     completed_warmup = int((resume_metadata or {}).get("completed_warmup_steps", 0))
@@ -1117,7 +1398,13 @@ def run_two_stage_training(config, device, rank, local_gpu, experiment_dir, log=
             scheme=scheme,
             substage=configured_substage,
         )
-        scheduler = setup_scheduler(config, optimizer)
+        scheduler = _make_scheduler(
+            config,
+            optimizer,
+            training_stage=training_stage,
+            scheme=scheme,
+            substage=configured_substage,
+        )
         current = (
             completed_warmup
             if substage == "warmup"
@@ -1157,7 +1444,9 @@ def run_two_stage_training(config, device, rank, local_gpu, experiment_dir, log=
             config,
             rank,
             substage,
-            include_eval=eval_enabled,
+            include_eval=(
+                training_stage == "real_finetune" or proxy_validation_enabled
+            ),
         )
         if rank == 0 and getattr(dataset, "recipe_summary", None) is not None:
             recipe_summary = dataset.recipe_summary
@@ -1172,11 +1461,23 @@ def run_two_stage_training(config, device, rank, local_gpu, experiment_dir, log=
                         wandb.run.summary[f"sampling_recipe/{key}"] = value
                 for key, value in recipe_summary["totals"].items():
                     wandb.run.summary[f"sampling_recipe/totals/{key}"] = value
+        if rank == 0 and getattr(eval_dataset, "recipe_summary", None) is not None:
+            val_recipe_summary = eval_dataset.recipe_summary
+            log.info(
+                "Frozen NavAnywhere validation recipe: %s", val_recipe_summary
+            )
+            if _wandb_active(config, rank):
+                wandb.config.update(
+                    {"navanywhere_validation_recipe": val_recipe_summary},
+                    allow_val_change=True,
+                )
         if len(loader) == 0:
             raise ValueError(
                 "Training DataLoader has no full batch; lower training.batch_size "
                 "or provide more samples"
             )
+        if log_cuda_memory:
+            _reset_cuda_peak_memory(device)
         phase_resume = (
             resume_info
             if resume_info is not None
@@ -1223,6 +1524,11 @@ def run_two_stage_training(config, device, rank, local_gpu, experiment_dir, log=
             current, target_steps, resume_rng_state
         )
         checked_gradients = False
+        # Match the legacy nwm-real logging contract: each published train
+        # metric is an average over all optimizer steps since the previous
+        # log point, rather than the loss of one sampled minibatch.
+        running_log_sums: dict[str, torch.Tensor] = {}
+        running_log_counts: dict[str, int] = {}
         while current < target_steps:
             sampler.set_epoch(epoch)
             _set_dataset_epoch(dataset, epoch)
@@ -1251,7 +1557,8 @@ def run_two_stage_training(config, device, rank, local_gpu, experiment_dir, log=
                 batch_in_epoch += 1
                 if (
                     training_stage == "real_finetune"
-                    and scheme == "embedding_align"
+                    and scheme
+                    in {"embedding_align", "state_conditioned_controller"}
                     and substage == "warmup"
                 ):
                     raw_latent_valid = torch.as_tensor(
@@ -1313,10 +1620,31 @@ def run_two_stage_training(config, device, rank, local_gpu, experiment_dir, log=
                     completed_joint = current
                 if accounting is not None:
                     proxy_metrics.update(**accounting)
-                if global_steps % int(config.get("log_every", 100)) == 0:
+                for key, value in logs.items():
+                    detached = torch.as_tensor(value, device=device).detach().float()
+                    if key in running_log_sums:
+                        running_log_sums[key] += detached
+                    else:
+                        running_log_sums[key] = detached.clone()
+                    running_log_counts[key] = running_log_counts.get(key, 0) + 1
+                phase_name = _controller_phase_name(scheme, substage)
+                log_step = current if phase_name is not None else global_steps
+                log_due = log_step % int(config.get("log_every", 100)) == 0
+                evaluation_due = bool(
+                    eval_enabled
+                    and _phase_evaluation_due(
+                        training_stage=training_stage,
+                        scheme=scheme,
+                        substage=substage,
+                        current_steps=current,
+                        global_steps=global_steps,
+                        config=config,
+                    )
+                )
+                if log_due:
                     scalar_logs = {}
-                    for key, value in logs.items():
-                        reduced = torch.as_tensor(value, device=device).float().clone()
+                    for key, value in running_log_sums.items():
+                        reduced = value / running_log_counts[key]
                         dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
                         reduced /= dist.get_world_size()
                         scalar_logs[key] = reduced.item()
@@ -1342,9 +1670,53 @@ def run_two_stage_training(config, device, rank, local_gpu, experiment_dir, log=
                                 )
                             }
                         )
+                        if config.get("finetune", {}).get("dataset_protocol", "paper") == "go2":
+                            wandb_values["train/joint_phase"] = int(substage == "joint")
+                        if phase_name is not None:
+                            wandb_values[f"{phase_name}/step"] = current
+                            wandb_values.update(
+                                {
+                                    f"{phase_name}/train/{key}": value
+                                    for key, value in scalar_logs.items()
+                                }
+                            )
+                            wandb_values.update(
+                                {
+                                    f"{phase_name}/train/lr_group_{group_index}": float(
+                                        group["lr"]
+                                    )
+                                    for group_index, group in enumerate(
+                                        optimizer.param_groups
+                                    )
+                                }
+                            )
                         _wandb_log(
                             config, rank, wandb_values, global_steps
                         )
+                    running_log_sums.clear()
+                    running_log_counts.clear()
+                if log_cuda_memory and (log_due or evaluation_due):
+                    train_memory = _distributed_cuda_memory_gib(device)
+                    if train_memory is not None and rank == 0:
+                        log.info(
+                            "CUDA training memory (max across ranks): "
+                            "current_allocated=%.2f GiB current_reserved=%.2f GiB "
+                            "peak_allocated=%.2f GiB peak_reserved=%.2f GiB",
+                            train_memory["current_allocated_gib"],
+                            train_memory["current_reserved_gib"],
+                            train_memory["peak_allocated_gib"],
+                            train_memory["peak_reserved_gib"],
+                        )
+                        _wandb_log(
+                            config,
+                            rank,
+                            {
+                                f"memory/train_{key}": value
+                                for key, value in train_memory.items()
+                            },
+                            global_steps,
+                        )
+                    _reset_cuda_peak_memory(device)
                 if _periodic_checkpoint_due(
                     training_stage=training_stage,
                     current_steps=current,
@@ -1377,63 +1749,167 @@ def run_two_stage_training(config, device, rank, local_gpu, experiment_dir, log=
                             data_fingerprint=phase_data_fingerprint,
                         )
                     dist.barrier()
-                if eval_enabled and _evaluation_due(
-                    global_steps=global_steps,
-                    interval=eval_interval,
-                    eval_at_first_step=eval_at_first_step,
-                ):
-                    if eval_loader is None or eval_tokenizer is None:
+                if evaluation_due:
+                    evaluation_jobs = []
+                    if eval_loader is not None:
+                        evaluation_jobs.append(
+                            (
+                                (
+                                    "navanywhere"
+                                    if training_stage == "proxy_pretrain"
+                                    else "nwm_real"
+                                ),
+                                eval_loader,
+                                int(config.seed),
+                            )
+                        )
+                    if not evaluation_jobs or eval_tokenizer is None:
                         raise RuntimeError(
-                            "Stage-2 evaluation is enabled but its pixel eval "
-                            "loader or tokenizer was not created"
+                            "Evaluation is enabled but no pixel eval loader or "
+                            "tokenizer was created"
                         )
                     eval_start_time = time()
-                    save_dir = os.path.join(
-                        experiment_dir, "viz", str(global_steps)
-                    )
+                    # This step's gradients have already been consumed. Free
+                    # them before loading the infrequently used evaluation
+                    # VAE and DreamSim ensemble.
+                    optimizer.zero_grad(set_to_none=True)
+                    logs.clear()
+                    accounting = None
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    _reset_cuda_peak_memory(device)
+                    if eval_tokenizer_offloaded:
+                        eval_tokenizer.to(device)
                     # Sampling consumes Python/NumPy/torch RNG. Restore every
                     # stream afterward so eval cannot alter training or exact
                     # checkpoint-resume behavior.
                     training_rng_state = capture_rng_state()
+                    eval_scores = {}
+                    eval_times = {}
                     try:
-                        sim_score = evaluate(
-                            ema,
-                            eval_tokenizer,
-                            diffusion,
-                            eval_loader,
-                            rank,
-                            int(config.model.generator.input_size),
-                            device,
-                            save_dir,
-                            int(config.seed),
-                            bool(config.get("bfloat16", False)),
-                            int(config.dataset.context_size),
-                            get_unnormalize(
-                                config.dataset.mean, config.dataset.std
-                            ),
-                        )
+                        for (
+                            eval_name,
+                            current_eval_loader,
+                            eval_seed,
+                        ) in evaluation_jobs:
+                            current_eval_start = time()
+                            save_dir = (
+                                os.path.join(
+                                    experiment_dir,
+                                    "viz",
+                                    eval_name,
+                                    str(global_steps),
+                                )
+                                if training_stage == "proxy_pretrain"
+                                else os.path.join(
+                                    experiment_dir,
+                                    "viz",
+                                    phase_name,
+                                    str(current),
+                                )
+                                if phase_name is not None
+                                else os.path.join(
+                                    experiment_dir, "viz", str(global_steps)
+                                )
+                            )
+                            eval_scores[eval_name] = evaluate(
+                                ema,
+                                eval_tokenizer,
+                                diffusion,
+                                current_eval_loader,
+                                rank,
+                                int(config.model.generator.input_size),
+                                device,
+                                save_dir,
+                                eval_seed,
+                                bool(config.get("bfloat16", False)),
+                                int(config.dataset.context_size),
+                                get_unnormalize(
+                                    config.dataset.mean, config.dataset.std
+                                ),
+                                offload_model=eval_offload_models,
+                            )
+                            eval_times[eval_name] = time() - current_eval_start
                     finally:
                         restore_rng_state(training_rng_state)
+                        if eval_tokenizer_offloaded:
+                            eval_tokenizer.to("cpu")
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
                     dist.barrier()
                     eval_time = time() - eval_start_time
-                    log.info(
-                        "(step=%07d) Perceptual Loss: %.4f, Eval Time: %.2f",
-                        global_steps,
-                        float(sim_score),
-                        eval_time,
+                    eval_memory = (
+                        _distributed_cuda_memory_gib(device)
+                        if log_cuda_memory
+                        else None
                     )
+                    for eval_name, sim_score in eval_scores.items():
+                        log.info(
+                            "(step=%07d) %s Perceptual Loss: %.4f, "
+                            "Eval Time: %.2f",
+                            global_steps,
+                            eval_name,
+                            float(sim_score),
+                            eval_times[eval_name],
+                        )
+                    if eval_memory is not None and rank == 0:
+                        log.info(
+                            "CUDA evaluation memory (max across ranks): "
+                            "peak_allocated=%.2f GiB peak_reserved=%.2f GiB",
+                            eval_memory["peak_allocated_gib"],
+                            eval_memory["peak_reserved_gib"],
+                        )
                     if rank == 0:
+                        eval_values = {
+                            "eval/eval_time": eval_time,
+                            "eval/step": global_steps,
+                            "epoch": epoch,
+                        }
+                        if training_stage == "proxy_pretrain":
+                            eval_values.update(
+                                {
+                                    f"eval/{name}_perceptual_loss": score
+                                    for name, score in eval_scores.items()
+                                }
+                            )
+                            eval_values.update(
+                                {
+                                    f"eval/{name}_time": eval_times[name]
+                                    for name in eval_scores
+                                }
+                            )
+                            # Backward-compatible primary curve.
+                            if "navanywhere" in eval_scores:
+                                eval_values["eval/perceptual_loss"] = (
+                                    eval_scores["navanywhere"]
+                                )
+                        else:
+                            eval_values["eval/perceptual_loss"] = eval_scores[
+                                "nwm_real"
+                            ]
+                            if phase_name is not None:
+                                eval_values[f"{phase_name}/step"] = current
+                                eval_values[
+                                    f"{phase_name}/eval/perceptual_loss"
+                                ] = eval_scores["nwm_real"]
+                                eval_values[
+                                    f"{phase_name}/eval/eval_time"
+                                ] = eval_time
+                        if eval_memory is not None:
+                            eval_values.update(
+                                {
+                                    f"memory/eval_{key}": value
+                                    for key, value in eval_memory.items()
+                                }
+                            )
                         _wandb_log(
                             config,
                             rank,
-                            {
-                                "eval/perceptual_loss": sim_score,
-                                "eval/eval_time": eval_time,
-                                "eval/step": global_steps,
-                                "epoch": epoch,
-                            },
+                            eval_values,
                             global_steps,
                         )
+                    _reset_cuda_peak_memory(device)
                 if current >= target_steps:
                     break
             finished_epoch = epoch
@@ -1443,12 +1919,13 @@ def run_two_stage_training(config, device, rank, local_gpu, experiment_dir, log=
             if epoch_exhausted:
                 if (
                     training_stage == "real_finetune"
-                    and scheme == "embedding_align"
+                    and scheme
+                    in {"embedding_align", "state_conditioned_controller"}
                     and substage == "warmup"
                     and valid_alignment_batches == 0
                 ):
                     raise RuntimeError(
-                        "EmbeddingAlign warm-up found no valid local latent target in "
+                        "Latent-teacher warm-up found no valid local target in "
                         "an entire epoch; verify the cache keys or enable strict_loading"
                     )
                 if training_stage == "proxy_pretrain":

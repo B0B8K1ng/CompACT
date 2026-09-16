@@ -169,11 +169,15 @@ def render(
     models: list[str],
     dataset: str,
     protocol_name: str = DEFAULT_PROTOCOL,
+    gt_root: Path | None = None,
 ) -> Path:
     registry = json.loads(registry_path.read_text(encoding="utf-8"))
     protocol, sample_ids = validate_protocol(registry, models, protocol_name)
     labels = ["Ground truth", *models]
-    inputs = [benchmark_root / "gt", *[benchmark_root / "predictions" / model for model in models]]
+    inputs = [
+        gt_root or benchmark_root / "gt",
+        *[benchmark_root / "predictions" / model for model in models],
+    ]
     artifacts: list[dict[str, object]] = []
 
     for sample_id in sample_ids:
@@ -225,6 +229,7 @@ def render(
         "protocol_config": protocol,
         "registry": str(registry_path.resolve()),
         "benchmark_root": str(benchmark_root.resolve()),
+        "gt_root": str((gt_root or benchmark_root / "gt").resolve()),
         "dataset": dataset,
         "models": {
             model: {
@@ -248,6 +253,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--registry", type=Path, required=True)
     parser.add_argument("--benchmark-root", type=Path, default=DEFAULT_BENCHMARK_ROOT)
+    parser.add_argument(
+        "--gt-root",
+        type=Path,
+        default=None,
+        help="Optional shared ground-truth root when predictions use an isolated seed directory.",
+    )
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--models", type=csv, required=True)
     parser.add_argument("--dataset", default="go_stanford")
@@ -264,6 +275,7 @@ def main() -> None:
         args.models,
         args.dataset,
         args.protocol,
+        args.gt_root,
     )
     print(manifest)
 

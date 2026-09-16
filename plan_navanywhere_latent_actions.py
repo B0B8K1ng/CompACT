@@ -121,6 +121,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--world-size", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--max-train-steps", type=int, default=200_000)
+    parser.add_argument(
+        "--usage",
+        choices=("training", "validation"),
+        default="training",
+        help=(
+            "Training replays shuffled epochs and advances the recipe epoch; "
+            "validation replays the unshuffled evaluation loader at recipe epoch 0."
+        ),
+    )
     parser.add_argument("--max-abs-frame-offset", type=int, default=8)
     parser.add_argument(
         "--workers",
@@ -315,6 +324,7 @@ def distributed_epoch_indices(
     world_size: int,
     batch_size: int,
     steps: int,
+    shuffle: bool = True,
 ) -> np.ndarray:
     """Return the global multiset consumed by synchronous DDP for an epoch.
 
@@ -331,7 +341,7 @@ def distributed_epoch_indices(
         _LengthOnlyDataset(dataset_length),
         num_replicas=1,
         rank=0,
-        shuffle=True,
+        shuffle=bool(shuffle),
         seed=int(seed),
         drop_last=False,
     )
@@ -538,6 +548,7 @@ def build_plan_report(
     local_limit: int,
     workers: int,
     chunk_size: int,
+    usage: str = "training",
     pair_bitmap_output: Path | None = None,
     references: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
@@ -545,6 +556,10 @@ def build_plan_report(
         raise ValueError(
             f"Plan seed={seed} does not match recipe seed={recipe['seed']}"
         )
+    if usage not in {"training", "validation"}:
+        raise ValueError(f"Unknown pair-plan usage: {usage!r}")
+    if references and usage != "training":
+        raise ValueError("Reference training logs cannot validate a validation plan")
     if min(world_size, batch_size, max_train_steps, chunk_size) < 1 or workers < 0:
         raise ValueError("Invalid plan execution or training contract")
     plan = RecipePlanIndex(recipe, local_limit)
@@ -583,6 +598,7 @@ def build_plan_report(
     try:
         while remaining_steps:
             epoch_steps = min(remaining_steps, steps_per_epoch)
+            recipe_epoch = epoch if usage == "training" else 0
             indices = distributed_epoch_indices(
                 plan.dataset_length,
                 seed=seed,
@@ -590,8 +606,9 @@ def build_plan_report(
                 world_size=world_size,
                 batch_size=batch_size,
                 steps=epoch_steps,
+                shuffle=usage == "training",
             )
-            tasks = ((epoch, chunk) for chunk in _chunks(indices, chunk_size))
+            tasks = ((recipe_epoch, chunk) for chunk in _chunks(indices, chunk_size))
             results: Iterable[dict[str, Any]]
             if executor is None:
                 results = map(_process_chunk, tasks)
@@ -674,6 +691,7 @@ def build_plan_report(
             "packed_byte_count": int(pair_bitmap.nbytes),
         }
     contract = {
+        "usage": usage,
         "seed": int(seed),
         "world_size": int(world_size),
         "batch_size_per_rank": int(batch_size),
@@ -682,7 +700,7 @@ def build_plan_report(
         "steps_per_epoch": steps_per_epoch,
         "sampler": {
             "class": "torch.utils.data.DistributedSampler",
-            "shuffle": True,
+            "shuffle": usage == "training",
             "drop_last": False,
             "dataloader_drop_last": True,
             "set_epoch": True,
@@ -737,6 +755,7 @@ def build_plan_report(
             else [],
         },
         "totals": {
+            "planned_batches": int(max_train_steps),
             "train_steps": int(max_train_steps),
             "epochs_touched": len(per_epoch),
             "sample_draws": total_goal_draws // plan.goals_per_obs,
@@ -817,6 +836,7 @@ def main() -> None:
         local_limit=int(args.max_abs_frame_offset),
         workers=int(args.workers),
         chunk_size=int(args.chunk_size),
+        usage=str(args.usage),
         pair_bitmap_output=pair_bitmap_output,
         references=references,
     )

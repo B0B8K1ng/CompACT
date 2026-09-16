@@ -82,10 +82,13 @@ rebuilt at the transition and contain only parameters with
 | A, `*_reset` | train new `E_real`; frozen NWM remains in the autograd graph; diffusion loss | train `E_real` at `adapter_lr` and NWM/time modules at `backbone_lr`; diffusion loss |
 | B, `latent_align` | train `E_real`; frozen `E_z` supplies local teacher embeddings; alignment loss only | train `E_real` + NWM/time modules; diffusion loss on all offsets plus local valid alignment |
 | C, `latent_real_to_latent` | train `G_real_to_latent`; gradients traverse frozen `E_z` and NWM; diffusion loss | train `G_real_to_latent`, `E_z`, and NWM/time modules; diffusion loss only |
+| D, `latent_state_controller` | train the state-conditioned controller for 3,000 steps with local latent L2; freeze all Stage-1 modules | train controller + CDiT backbone for 200,000 steps at fixed `1e-4`; freeze `x_embedder` and `E_z`; diffusion loss on all offsets plus local latent L2 |
 
 The VAE stays frozen. Unused stage-1 proxy encoders are frozen and excluded from
 the optimizer. In B, `E_z` is frozen in both steps and is absent from inference.
 In C, it is frozen during warm-up and becomes trainable in joint fine-tuning.
+In D, `x_embedder` and `E_z` remain frozen throughout; only the controller is
+trainable in warm-up, then the rest of the CDiT backbone joins it in joint.
 These freeze policies and the transition-checkpoint save are enforced by the
 scheme/substage state machine, so the example overlays intentionally do not
 expose misleading `freeze_latent_action_encoder` or
@@ -97,7 +100,8 @@ optimizer step. Its first-step nonzero-gradient assertion is rank-local: a rank
 with no local teacher pair participates through the zero graph without being
 mistakenly rejected when another rank supplies the valid pair.
 
-Scheme A can initialize from TimePT, GeoPT, IDMPT, or LatentPT. Schemes B and C
+Scheme A can initialize from TimePT, GeoPT, IDMPT, or LatentPT. Schemes B, C,
+and D
 require a LatentPT checkpoint and fail before training if the checkpoint action
 mode, latent dimension/normalization, hidden dimension, model size, context size,
 or other required metadata is incompatible.
@@ -141,6 +145,64 @@ LatentPT's `E_z` consumes standardized latent coordinates,
 uses another established convention, C preserves that convention unchanged.
 Inference uses this identical path.
 
+### Scheme D: state-conditioned latent controller
+
+Scheme C remains action-only and diffusion-supervised, so it is not the
+controller used in [Learning Latent Action World Models In The
+Wild](https://arxiv.org/html/2601.05230v2). The paper uses the final previous
+frame's frozen V-JEPA representation, two self-attention blocks, a three-layer
+real-action MLP, cross-attention, and direct latent L2 supervision. It does not
+use an SD-VAE latent or CDiT's patch embedder. D is therefore a separate
+CompACT-native adaptation and leaves C unchanged.
+
+The implemented path is:
+
+```text
+last context-frame SD-VAE latent
+  -> frozen CDiT patch embedder -> 2 self-attention blocks -> visual tokens
+normalized real action
+  -> 3-layer MLP -> action query
+action query cross-attends to visual tokens
+  -> linear projection -> predicted 32-D latent action -> frozen E_z -> NWM
+```
+
+Reusing the CDiT patch embedder is an engineering hypothesis: it exposes the
+same spatial token coordinates consumed by the pretrained NWM and avoids a
+second visual encoder. It is not implied by the paper, and should be compared
+against a frozen LAM/V-JEPA-style representation. Treating the action token as
+the single cross-attention query is likewise a natural way to obtain one latent
+token through action-dependent spatial pooling, not a uniquely justified
+architecture; pooled concatenation, FiLM, or a joint `[ACT]` transformer token
+are valid controls.
+
+The teacher is the frozen PixelActionLAM latent for the same
+`(current_frame, goal_frame)` pair. The existing four-dataset cache at
+`/file_system/nas/algorithm/dujun.nie/nwm/compact/cache/finetune_nav1_pixel_action_step100000_four_datasets`
+already stores raw 32-D `z_mu` targets for eligible
+`abs(frame_offset) <= 8` pairs. Controller pretraining minimizes direct L2 on
+valid targets while freezing SD-VAE, the Stage-1 NWM, and `E_z`. It runs 3,000
+steps with AdamW at `1e-3`, weight decay `0.04`, a 300-step linear warm-up, and
+cosine decay.
+
+Use the last context frame rather than the first frame of the whole trajectory:
+the controller must see the camera state from which the real action is applied.
+The latent L2 term is available only inside the cache's local window, but that
+does not require long-range samples to be time-only during Stage 2. The existing
+fine-tuning contract conditions all `[-64, 64]` samples on real actions and
+applies diffusion loss everywhere; only teacher alignment is locally masked.
+A repository-compatible controller run should follow the same rule:
+
+```text
+all offsets:          diffusion loss using controller(state, real_action)
+abs(offset) <= 8:   + latent L2 against the cached teacher
+```
+
+The overlay then runs 200,000 joint steps. Controller and CDiT backbone both
+use a fixed `1e-4`, matching nwm-real, while `x_embedder` and `E_z` remain
+frozen. This architecture and auxiliary supervision cannot guarantee an
+improvement over the end-to-end nwm-real baseline; controller L2, perceptual
+loss, and downstream navigation must all be reported.
+
 CDiT checkpoints also fix the number of context frames through their learned
 positional embeddings. Therefore `eval_context_size` and, for planning,
 `trajectory_eval_context_size` must equal the training
@@ -162,6 +224,7 @@ Stage 2:
 - `conf/two_stage/latent_reset.yaml`
 - `conf/two_stage/latent_align.yaml`
 - `conf/two_stage/latent_real_to_latent.yaml`
+- `conf/two_stage/latent_state_controller.yaml`
 - `conf/two_stage/time_reset.yaml`
 - `conf/two_stage/geo_reset.yaml`
 - `conf/two_stage/idm_reset.yaml`
@@ -171,10 +234,10 @@ Every overlay uses top-level `training_stage`, `action_mode`, `proxy`, and
 rates, and alignment weights are ordinary Hydra overrides.
 
 `proxy.max_abs_frame_offset=8` and the dataset range `[-64,64]` are invariants,
-not tuning knobs. Proxy-bearing stage-1 runs and B set
+not tuning knobs. Proxy-bearing stage-1 runs, B, and D set
 `proxy.use_precomputed_only=true`; the training process never launches an
-extractor. The suffixless `proxy.file_pattern` is shared by stage 1 and B, so
-both accept exactly one `.pt` or `.npz` shard per source/trajectory without a
+extractor. The suffixless `proxy.file_pattern` is shared by stage 1, B, and D,
+so they accept exactly one `.pt` or `.npz` shard per source/trajectory without a
 format-specific configuration change.
 
 Cache environment variables are:
@@ -185,14 +248,15 @@ Cache environment variables are:
 | IDMPT | `NWM_IDM_PROXY_ROOT` |
 | LatentPT | `NWM_LATENT_PROXY_ROOT` |
 | EmbeddingAlign | `NWM_FINETUNE_LATENT_ROOT` |
+| State-conditioned controller | `NWM_FINETUNE_LATENT_ROOT` (shared NAS default available) |
 | Every stage-2 run (SD-VAE posterior) | `NWM_FINETUNE_VAE_LATENT_ROOT` (optional override) |
 
 The current latent adapter uses its existing parameter-free, per-sample
 `layer_norm`, so these overlays do not invent an external statistics file. Its
 normalization identifier is still saved in checkpoint metadata and checked by
-B/C. If an experiment explicitly switches to a mean/std implementation, those
+B/C/D. If an experiment explicitly switches to a mean/std implementation, those
 statistics must come only from the NavAnywhere 1000-hour train split, their
-path/statistics must be saved in stage 1, and B/C must reuse them unchanged.
+path/statistics must be saved in stage 1, and B/C/D must reuse them unchanged.
 
 ## 5. Launch commands
 
@@ -235,6 +299,8 @@ export NWM_FINETUNE_LATENT_ROOT=/path/to/proxy-cache/finetune-dreamdojo-latent
 conda run -n "${NWM_CONDA_ENV}" ./two_stage_nwm.sh stage2 latent_align --stage1-checkpoint="${NWM_STAGE1_CHECKPOINT}"
 
 conda run -n "${NWM_CONDA_ENV}" ./two_stage_nwm.sh stage2 latent_real_to_latent --stage1-checkpoint="${NWM_STAGE1_CHECKPOINT}"
+
+conda run -n "${NWM_CONDA_ENV}" ./two_stage_nwm.sh stage2 latent_state_controller --stage1-checkpoint="${NWM_STAGE1_CHECKPOINT}"
 
 conda run -n "${NWM_CONDA_ENV}" ./two_stage_nwm.sh stage2 latent_reset --stage1-checkpoint="${NWM_STAGE1_CHECKPOINT}"
 ```
@@ -286,12 +352,13 @@ Minimal one-GPU smoke launch (two warm-up and three joint steps):
 WANDB_MODE=offline conda run -n "${NWM_CONDA_ENV}" ./two_stage_nwm.sh stage2 latent_real_to_latent --gpus=0 --nproc=1 --stage1-checkpoint="${NWM_STAGE1_CHECKPOINT}" -- training.batch_size=2 training.num_workers=0 finetune.warmup_steps=2 finetune.joint_steps=3 eval_at_first_step=false
 ```
 
-The repository's data-free synthetic smoke suite runs TimePT, LatentPT, and
-the warm-up/joint paths for A/B/C with batch size 2. It is the quickest check
+The repository's data-free synthetic smoke suites run TimePT, LatentPT, and
+the warm-up/joint paths for A/B/C/D with batch size 2. They are the quickest check
 of masking, gradients, finite losses, save, and resume:
 
 ```bash
 TWO_STAGE_SMOKE_DEVICE=cuda:0 conda run -n "${NWM_CONDA_ENV}" python tests/test_two_stage_smoke.py -q
+conda run -n "${NWM_CONDA_ENV}" python -m unittest tests.test_state_conditioned_controller
 ```
 
 Command-only checks do not require a GPU, data mount, or cache:
@@ -299,6 +366,7 @@ Command-only checks do not require a GPU, data mount, or cache:
 ```bash
 ./two_stage_nwm.sh stage1 latentpt --gpus=0 --nproc=1 --dry-run -- training.batch_size=2 max_train_steps=3
 ./two_stage_nwm.sh stage2 latent_align --dry-run --stage1-checkpoint=/path/to/checkpoints/latentpt.pt
+./two_stage_nwm.sh stage2 latent_state_controller --dry-run --stage1-checkpoint=/path/to/checkpoints/latentpt.pt
 ```
 
 For multi-node DDP, run one launcher per node with the same host/port and the
@@ -327,8 +395,8 @@ Each selected sample is a fixed `[D]` tensor. Store metadata records source,
 proxy type, dimension, pair direction (`current_to_target`), normalization
 identity/statistics, and extractor checkpoint identity.
 
-The stage-2 alignment cache follows the same key/shape contract but only needs
-valid pairs in [-8, 8]. Scheme C does not read it. With
+The stage-2 teacher cache follows the same key/shape contract but only needs
+valid pairs in [-8, 8]. Schemes B and D read it; Scheme C does not. With
 `proxy.strict_loading=true`, a missing, malformed, non-finite, or otherwise
 invalid eligible record raises an error containing the full logical key.
 
@@ -361,16 +429,39 @@ substage. A phase target that is not an exact interval multiple still gets one
 phase-final retained checkpoint. `latest.pth.tar` is an atomically replaced
 relative symlink to the newest retained file and is intended as a convenient
 resume path; retained files are never overwritten by later intervals. Stage 1
-keeps its prior latest-only behavior.
+uses the same publication contract: with 200,000 steps and
+`ckpt_every=10000`, it retains `pretrain_0010000.pth.tar` through
+`pretrain_0200000.pth.tar`, while `latest.pth.tar` points to the newest file.
 
-Stage 2 runs the same lightweight inline evaluation as legacy training. With
-the shared defaults it evaluates the EMA model at global step 1 and every
-`eval_every=5000` steps, computes DreamSim on the first distributed test batch,
-writes up to ten condition/ground-truth/prediction panels under `viz/<step>`,
-and logs `eval/perceptual_loss` plus timing to W&B. Cached SD-VAE posteriors
-remain training-only: the eval loader reads RGB frames and a frozen SD-VAE is
-loaded for encoding and decoding. Evaluation RNG consumption is restored so it
-does not change the training or exact-resume trajectory.
+Scheme D instead retains its phase-final `warmup_0003000.pth.tar`, then
+`joint_0010000.pth.tar` through `joint_0200000.pth.tar`; the complete run is
+3,000 + 200,000 optimizer steps.
+
+Stage 1 and Stage 2 both run lightweight inline evaluation. With the shared
+defaults they evaluate the EMA model at global step 1 and every
+`eval_every=5000` steps, compute DreamSim on the first distributed test batch,
+and write up to ten condition/ground-truth/prediction panels. Stage 1 uses only
+the trajectory-disjoint NavAnywhere split with its cached latent actions, writes
+to `viz/navanywhere/<step>`, and logs
+`eval/navanywhere_perceptual_loss` plus the compatibility alias
+`eval/perceptual_loss`. It deliberately does not run Base/nwm-real test data
+through the unadapted real-action path. Stage 2 evaluates the normal Base test
+loader, writes to `viz/<step>`, and logs `eval/perceptual_loss`. Cached SD-VAE
+posteriors remain training-only: each eval loader reads RGB frames and a frozen
+SD-VAE is loaded for encoding and decoding. Evaluation RNG consumption is
+restored so it does not change the training or exact-resume trajectory.
+
+Scheme D uses phase-local evaluation axes. Controller pretraining evaluates at
+steps 1, 1,000, 2,000, and 3,000 under `controller_pretrain/*`; joint evaluates
+at step 1 and every 5,000 joint steps under `joint/*`. Visualizations go to
+`viz/controller_pretrain/<step>` and `viz/joint/<step>`. The unprefixed
+compatibility metrics remain available, while phase-prefixed curves align the
+joint 0--200,000 step range directly with nwm-real.
+
+"First distributed batch" is not one sample. For the standard 8-rank,
+batch-16 Stage-1 run it contains 128 observation sequences; four goals per
+sequence produce 512 predictions in the reported DreamSim mean. It remains a
+fast regression curve rather than a full-validation estimate.
 
 This inline score is a quick regression signal, not a complete checkpoint
 selection benchmark. Evaluate retained checkpoints offline by passing their

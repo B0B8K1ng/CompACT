@@ -15,6 +15,7 @@ hydra:
     chdir: true
 
 # Base configuration
+seed: 42                         # Top-level stochastic planning evaluation seed
 exp_dir: null                      # Experiment config file path
 ckp: "0100000"                 # Checkpoint ID to use
 datasets_to_eval: [recon,scand]                 # Comma-separated list of dataset names

@@ -1,0 +1,73 @@
+\begin{table*}[t]
+  \caption{Visual prediction on RECON (autoregressive) and SACSoN (direct),
+  and navigation on RECON. Lower is better.}
+  \label{tab:main_prediction_navigation}
+  \centering
+  \small
+  \setlength{\tabcolsep}{6pt}
+  \renewcommand{\arraystretch}{1.10}
+  \begin{tabular}{@{}lcccccc@{}}
+    \toprule
+    \multicolumn{7}{@{}l}{\textbf{(a) Visual prediction}} \\
+    \addlinespace[4pt]
+    \multirow{2}{*}{Method}
+      & \multicolumn{3}{c}{4 s}
+      & \multicolumn{3}{c}{16 s} \\
+    \cmidrule(lr){2-4}\cmidrule(lr){5-7}
+      & \CompACTLPIPS & \CompACTDreamSim & FID$\downarrow$
+      & \CompACTLPIPS & \CompACTDreamSim & FID$\downarrow$ \\
+    \midrule
+
+    \multicolumn{7}{@{}l}{\textit{Autoregressive}} \\
+    \addlinespace[2pt]
+    NWM~\cite{yang2026arforcing}
+      & $0.423$ & $0.181$ & $63.0$
+      & $0.533$ & $0.319$ & $77.3$ \\
+    AR Forcing~\cite{yang2026arforcing}
+      & $0.341$ & $0.125$ & $52.9$
+      & $0.463$ & $0.210$ & $66.0$ \\
+    \textbf{\CompACTMethod{} (Ours)}
+      & \CompACTMissing & \CompACTMissing & \CompACTMissing
+      & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+
+    \addlinespace[6pt]
+    \multicolumn{7}{@{}l}{\textit{Direct}} \\
+    \addlinespace[2pt]
+    NWM~\cite{zhang2026raenwm}
+      & $0.407$ & $0.229$ & $26.15$
+      & $0.470$ & $0.281$ & $33.06$ \\
+    RAE-NWM~\cite{zhang2026raenwm}
+      & $0.303$ & $0.145$ & $15.09$
+      & $0.349$ & $0.171$ & $15.90$ \\
+    \textbf{\CompACTMethod{} (Ours)}
+      & \CompACTMissing & \CompACTMissing & \CompACTMissing
+      & \CompACTMissing & \CompACTMissing & \CompACTMissing \\
+
+    \midrule
+    \multicolumn{7}{@{}l}{\textbf{(b) Navigation}} \\
+    \addlinespace[4pt]
+    Method
+      & \multicolumn{3}{c}{ATE $\downarrow$}
+      & \multicolumn{3}{c}{RPE $\downarrow$} \\
+    \midrule
+
+    GNM~\cite{bar2025navigation}
+      & \multicolumn{3}{c}{$1.87{\pm}0.00$}
+      & \multicolumn{3}{c}{$0.73{\pm}0.00$} \\
+    NoMaD~\cite{bar2025navigation}
+      & \multicolumn{3}{c}{$1.93{\pm}0.04$}
+      & \multicolumn{3}{c}{$0.52{\pm}0.00$} \\
+    NWM~\cite{bar2025navigation}
+      & \multicolumn{3}{c}{$1.13{\pm}0.02$}
+      & \multicolumn{3}{c}{$0.35{\pm}0.01$} \\
+    LAM~\cite{garrido2026latentaction}
+      & \multicolumn{3}{c}{$1.40$}
+      & \multicolumn{3}{c}{$0.40$} \\
+
+    \addlinespace[4pt]
+    \textbf{\CompACTMethod{} (Ours)}
+      & \multicolumn{3}{c}{\CompACTMissing}
+      & \multicolumn{3}{c}{\CompACTMissing} \\
+    \bottomrule
+  \end{tabular}
+\end{table*}

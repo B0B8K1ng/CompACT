@@ -21,6 +21,7 @@ STAGE2_VARIANTS = (
     "latent_reset",
     "latent_align",
     "latent_real_to_latent",
+    "latent_state_controller",
 )
 DEFAULT_VAE_LATENT_ROOT = Path(
     "/file_system/nas/algorithm/dujun.nie/nwm/compact/cache/"
@@ -37,6 +38,34 @@ DEFAULT_DREAMSIM_CACHE = Path(
 
 
 class Stage2DefaultTests(unittest.TestCase):
+    def test_navanywhere_stage1_validation_is_opt_in(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with initialize_config_dir(config_dir=str(ROOT / "conf"), version_base=None):
+                config = compose(config_name="nwm", overrides=["two_stage=latentpt"])
+            self.assertIs(config.dataset.validation.enabled, False)
+            self.assertIs(config.dataset.precomputed_latents.allow_recipe_subset, False)
+            self.assertIs(config.eval_offload_models, False)
+
+    def test_navanywhere_stage1_validation_environment_resolves_typed_values(self):
+        environment = {
+            "NWM_NAVANYWHERE_VAL_ENABLED": "true",
+            "NWM_NAVANYWHERE_VAL_RECIPE": "/tmp/navanywhere-v2-val.json",
+            "NWM_NAVANYWHERE_VAL_PROXY_ROOT": "/tmp/navanywhere-v2-val-cache",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with initialize_config_dir(config_dir=str(ROOT / "conf"), version_base=None):
+                config = compose(config_name="nwm", overrides=["two_stage=latentpt"])
+            self.assertIs(config.dataset.validation.enabled, True)
+            self.assertEqual(config.dataset.validation.batches, 1)
+            self.assertEqual(
+                config.dataset.validation.sampling_recipe.path,
+                environment["NWM_NAVANYWHERE_VAL_RECIPE"],
+            )
+            self.assertEqual(
+                config.dataset.validation.proxy_root,
+                environment["NWM_NAVANYWHERE_VAL_PROXY_ROOT"],
+            )
+
     def test_every_finetune_overlay_uses_eight_workers(self):
         with initialize_config_dir(config_dir=str(ROOT / "conf"), version_base=None):
             for variant in STAGE2_VARIANTS:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 from collections.abc import Mapping
 from typing import Any
 
@@ -66,6 +67,13 @@ def _resolve_path(value: Any, launch_dir: str) -> str:
     return os.path.realpath(path)
 
 
+def _safe_identity_component(value: str, field: str) -> str:
+    value = str(value)
+    if not value or value in {".", ".."} or os.path.basename(value) != value:
+        raise ValueError(f"Unsafe NavAnywhere latent {field}: {value!r}")
+    return value
+
+
 def _validate_local(
     config: Any,
     *,
@@ -110,12 +118,17 @@ def _validate_local(
     recipe_meta = metadata.get("sampling_recipe")
     if not isinstance(recipe_meta, Mapping):
         raise TypeError("metadata.sampling_recipe must be an object")
-    _equal(recipe_meta.get("sha256"), recipe_sha, "sampling_recipe.sha256")
-    _equal(
-        recipe_meta.get("inventory_sha256"),
-        recipe["inventory_sha256"],
-        "sampling_recipe.inventory_sha256",
-    )
+    cache_recipe_sha = str(recipe_meta.get("sha256", ""))
+    exact_recipe = cache_recipe_sha == recipe_sha
+    allow_recipe_subset = bool(latent_config.get("allow_recipe_subset", False))
+    if not exact_recipe and not allow_recipe_subset:
+        _equal(cache_recipe_sha, recipe_sha, "sampling_recipe.sha256")
+    if exact_recipe:
+        _equal(
+            recipe_meta.get("inventory_sha256"),
+            recipe["inventory_sha256"],
+            "sampling_recipe.inventory_sha256",
+        )
 
     vae = metadata.get("vae")
     transform = metadata.get("transform")
@@ -163,17 +176,25 @@ def _validate_local(
     _equal(storage.get("file_pattern"), "{source_id}/{trajectory_id}.pt", "storage.file_pattern")
 
     records: dict[str, dict[str, dict[str, Any]]] = {}
+    source_roots: dict[str, str] = {}
+    source_file_sizes: dict[str, dict[str, int]] = {}
     expected_identities = {
         (str(item["source_id"]), str(item["trajectory_id"])): item
         for item in recipe["trajectories"]
     }
     for source_id in sorted({key[0] for key in expected_identities}):
+        _safe_identity_component(source_id, "source_id")
         source_meta = sources.get(source_id)
         if not isinstance(source_meta, Mapping):
             raise KeyError(f"metadata.sources has no entry for {source_id!r}")
-        manifest_path = os.path.realpath(
-            os.path.join(root, source_id, "manifest.jsonl")
-        )
+        # Resolve each source directory once. Calling realpath for every one of
+        # ~68K trajectory files causes repeated NAS metadata walks through all
+        # parent components and can add tens of minutes to launch validation.
+        source_root = os.path.realpath(os.path.join(root, source_id))
+        if os.path.commonpath((root, source_root)) != root or source_root == root:
+            raise ValueError(f"Unsafe NavAnywhere latent source path: {source_root}")
+        source_roots[source_id] = source_root
+        manifest_path = os.path.join(source_root, "manifest.jsonl")
         if not os.path.isfile(manifest_path):
             raise FileNotFoundError(f"NavAnywhere latent manifest is missing: {manifest_path}")
         _equal(
@@ -194,19 +215,61 @@ def _validate_local(
                     raise ValueError(f"Duplicate/empty trajectory at {manifest_path}:{line_number}")
                 source_records[trajectory_id] = value
         records[source_id] = source_records
+        expected_source_trajectories = {
+            trajectory
+            for source, trajectory in expected_identities
+            if source == source_id
+        }
+        file_sizes: dict[str, int] = {}
+        if len(expected_source_trajectories) * 2 < len(source_records):
+            # A tiny validation subset should not enumerate a source directory
+            # containing tens of thousands of cache shards.
+            for trajectory_id in expected_source_trajectories:
+                file_path = os.path.join(source_root, f"{trajectory_id}.pt")
+                try:
+                    file_stat = os.stat(file_path, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if not stat.S_ISREG(file_stat.st_mode):
+                    raise ValueError(
+                        f"NavAnywhere latent cache is not a regular file: {file_path}"
+                    )
+                file_sizes[trajectory_id] = file_stat.st_size
+        else:
+            # Readdir once for a nearly complete training subset; independent
+            # path lookups for all 68K files are much slower on the shared NAS.
+            with os.scandir(source_root) as entries:
+                for entry in entries:
+                    if not entry.name.endswith(".pt"):
+                        continue
+                    trajectory_id = entry.name[:-3]
+                    if trajectory_id not in expected_source_trajectories:
+                        continue
+                    if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                        raise ValueError(
+                            f"NavAnywhere latent cache is not a regular file: {entry.path}"
+                        )
+                    file_sizes[trajectory_id] = entry.stat(
+                        follow_symlinks=False
+                    ).st_size
+        source_file_sizes[source_id] = file_sizes
 
     actual_identities = {
         (source, trajectory)
         for source, source_records in records.items()
         for trajectory in source_records
     }
-    if actual_identities != set(expected_identities):
+    missing_identities = set(expected_identities) - actual_identities
+    unexpected_identities = actual_identities - set(expected_identities)
+    if missing_identities or (unexpected_identities and not allow_recipe_subset):
         raise ValueError(
-            "NavAnywhere latent manifests do not exactly cover the sampling recipe: "
-            f"missing={sorted(set(expected_identities) - actual_identities)[:5]}, "
-            f"unexpected={sorted(actual_identities - set(expected_identities))[:5]}"
+            "NavAnywhere latent manifests do not cover the sampling recipe under "
+            f"the configured policy: missing={sorted(missing_identities)[:5]}, "
+            f"unexpected={sorted(unexpected_identities)[:5]}, "
+            f"allow_recipe_subset={allow_recipe_subset}"
         )
     for identity, recipe_record in expected_identities.items():
+        _safe_identity_component(identity[1], "trajectory_id")
         record = records[identity[0]][identity[1]]
         _equal(record.get("source_id"), identity[0], f"manifest.{identity}.source_id")
         _equal(record.get("trajectory_id"), identity[1], f"manifest.{identity}.trajectory_id")
@@ -220,19 +283,23 @@ def _validate_local(
             recipe_record["frame_indices_sha256"],
             f"manifest.{identity}.frame_indices_sha256",
         )
-        file_path = os.path.realpath(
-            os.path.join(root, identity[0], f"{identity[1]}.pt")
+        file_path = os.path.join(
+            source_roots[identity[0]], f"{identity[1]}.pt"
         )
-        if not os.path.isfile(file_path):
+        file_size = source_file_sizes[identity[0]].get(identity[1])
+        if file_size is None:
             raise FileNotFoundError(f"NavAnywhere latent file is missing: {file_path}")
-        if int(record.get("file_size_bytes", -1)) != os.path.getsize(file_path):
+        if int(record.get("file_size_bytes", -1)) != file_size:
             raise ValueError(f"NavAnywhere latent file size changed: {file_path}")
 
     expected_file_metadata = {
         "vae_fingerprint": vae["fingerprint"],
         "transform_fingerprint": transform["fingerprint"],
         "encoding_fingerprint": encoding["fingerprint"],
-        "sampling_recipe_sha256": recipe_sha,
+        # Per-trajectory files remain bound to the immutable recipe that
+        # created the cache. A requested train/validation subset has a new
+        # recipe hash even though every selected frame posterior is identical.
+        "sampling_recipe_sha256": cache_recipe_sha,
         "storage_dtype": "bfloat16",
     }
     _equal(
@@ -240,7 +307,11 @@ def _validate_local(
         encoding["fingerprint"],
         "success.encoding_fingerprint",
     )
-    _equal(success.get("sampling_recipe_sha256"), recipe_sha, "success.sampling_recipe_sha256")
+    _equal(
+        success.get("sampling_recipe_sha256"),
+        cache_recipe_sha,
+        "success.sampling_recipe_sha256",
+    )
     return {
         "root": root,
         "metadata": metadata,
@@ -249,6 +320,8 @@ def _validate_local(
         "recipe": recipe,
         "recipe_path": resolved_recipe,
         "recipe_sha256": recipe_sha,
+        "cache_recipe_sha256": cache_recipe_sha,
+        "recipe_relation": "exact" if exact_recipe else "cache_superset",
     }
 
 

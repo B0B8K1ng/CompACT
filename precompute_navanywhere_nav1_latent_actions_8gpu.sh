@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Resumable 8-GPU extraction of raw 32-D nav1 PixelActionLAM posterior means.
+# Resumable 8-GPU extraction of raw 32-D navigation-LAM posterior means.
 # The default launch is detached and monitored by codex-exp.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_PATH="${SCRIPT_DIR}/$(basename -- "${BASH_SOURCE[0]}")"
@@ -41,6 +41,8 @@ if [[ "${DETACH}" == "1" && "${RUN_UNDER_CODEX_EXP:-0}" != "1" ]]; then
         REQUIRE_IDLE_GPUS="${REQUIRE_IDLE_GPUS:-}" \
         MAX_GPU_UTILIZATION="${MAX_GPU_UTILIZATION:-}" MIN_FREE_GPU_MB="${MIN_FREE_GPU_MB:-}" \
         BATCH_SIZE="${BATCH_SIZE:-}" LOADER_THREADS="${LOADER_THREADS:-}" \
+        DINO_FRAME_BATCH_SIZE="${DINO_FRAME_BATCH_SIZE:-}" \
+        DINO_LAM_BATCH_SIZE="${DINO_LAM_BATCH_SIZE:-}" \
         PRECISION="${PRECISION:-}" MAX_TRAJECTORIES="${MAX_TRAJECTORIES:-}" \
         TRAJECTORIES="${TRAJECTORIES:-}" OVERWRITE="${OVERWRITE:-}" \
         LOG_EVERY_TRAJECTORIES="${LOG_EVERY_TRAJECTORIES:-}" \
@@ -70,6 +72,8 @@ MAX_GPU_UTILIZATION="${MAX_GPU_UTILIZATION:-20}"
 MIN_FREE_GPU_MB="${MIN_FREE_GPU_MB:-30000}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
 LOADER_THREADS="${LOADER_THREADS:-8}"
+DINO_FRAME_BATCH_SIZE="${DINO_FRAME_BATCH_SIZE:-32}"
+DINO_LAM_BATCH_SIZE="${DINO_LAM_BATCH_SIZE:-16}"
 PRECISION="${PRECISION:-bf16-mixed}"
 MAX_TRAJECTORIES="${MAX_TRAJECTORIES:-0}"
 TRAJECTORIES="${TRAJECTORIES:-}"
@@ -201,6 +205,8 @@ ARGS=(
     --precision "${PRECISION}"
     --batch-size "${BATCH_SIZE}"
     --loader-threads "${LOADER_THREADS}"
+    --dino-frame-batch-size "${DINO_FRAME_BATCH_SIZE}"
+    --dino-lam-batch-size "${DINO_LAM_BATCH_SIZE}"
     --image-height 240
     --image-width 320
     --context-size 4

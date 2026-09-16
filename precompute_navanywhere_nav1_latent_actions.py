@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract nav1 PixelActionLAM posterior means for NavAnywhere LatentPT.
+"""Extract navigation-LAM posterior means for NavAnywhere LatentPT.
 
 The output is one strict ``OfflineProxyStore``-compatible file per trajectory:
 ``{output_root}/{source_id}/{trajectory_id}.pt``.  Every existing
@@ -40,6 +40,14 @@ from navanywhere_recipe import (
 SCHEMA_VERSION = 1
 FORMAT_NAME = "navanywhere_navigation_lam_latent_proxy"
 EXPECTED_CHECKPOINT_CLASS = "lam.navigation_variants.PixelActionLAM"
+DINO_CHECKPOINT_CLASS = "lam.navigation_variants.DINOFeatureLAM"
+SUPPORTED_CHECKPOINT_CLASSES = frozenset(
+    {
+        EXPECTED_CHECKPOINT_CLASS,
+        DINO_CHECKPOINT_CLASS,
+        "lam.navigation_variants.PixelLAM",
+    }
+)
 EXPECTED_LATENT_DIM = 32
 EXPECTED_PATCH_SIZE = 16
 IMAGE_PREPROCESSING = "center_crop_4:3_then_bilinear_resize"
@@ -47,6 +55,8 @@ IMAGE_READ_ATTEMPTS = 3
 IMAGE_READ_RETRY_DELAY_SECONDS = 0.25
 GPU_FRAME_BANK_LIMIT_BYTES = 16 * 1024**3
 PAIR_BANK_CHUNK_SIZE = 8192
+DINO_FRAME_BATCH_SIZE = 32
+DINO_LAM_PAIR_BATCH_SIZE = 16
 
 
 def utc_now() -> str:
@@ -134,6 +144,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-root", required=True)
     parser.add_argument(
+        "--reuse-root",
+        action="append",
+        default=None,
+        help=(
+            "Compatible latent-action cache used as a row-level source. "
+            "Repeat to reuse several earlier recipes; only exact frame-pair "
+            "matches are copied and all missing rows are inferred normally."
+        ),
+    )
+    parser.add_argument(
         "--lam-project-root",
         default=str(repo.parent / "DreamDojo" / "external" / "lam_project"),
     )
@@ -147,6 +167,46 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--loader-threads", type=int, default=8)
+    parser.add_argument(
+        "--dino-frame-batch-size",
+        type=int,
+        default=DINO_FRAME_BATCH_SIZE,
+        help=(
+            "Unique RGB frames per frozen DINO forward. DINO checkpoints "
+            "automatically extract each referenced trajectory frame once."
+        ),
+    )
+    parser.add_argument(
+        "--dino-lam-batch-size",
+        type=int,
+        default=DINO_LAM_PAIR_BATCH_SIZE,
+        help="Cached DINO feature pairs per navigation-LAM encoder forward.",
+    )
+    parser.add_argument(
+        "--stream-frames",
+        action="store_true",
+        help=(
+            "Decode only the frames needed by each pair chunk and overlap the "
+            "next chunk's image reads with GPU inference. This is intended for "
+            "long trajectories that cannot keep a full resized frame bank."
+        ),
+    )
+    parser.add_argument(
+        "--stream-pair-chunk-size",
+        type=int,
+        default=4096,
+        help="Number of frame pairs per streamed read/inference chunk.",
+    )
+    parser.add_argument(
+        "--allow-future-training-plan",
+        action="store_true",
+        help=(
+            "Accept a cryptographically self-consistent pair plan whose "
+            "reference_validation status is not_requested. Use this only when "
+            "the plan defines a future training run rather than replaying an "
+            "already completed reference run."
+        ),
+    )
     parser.add_argument("--image-height", type=int, default=240)
     parser.add_argument("--image-width", type=int, default=320)
     parser.add_argument("--context-size", type=int, default=4)
@@ -260,10 +320,11 @@ def validate_checkpoint_metadata(
     image_width: int,
     max_abs_frame_offset: int,
 ) -> None:
-    if metadata.get("class_path") != EXPECTED_CHECKPOINT_CLASS:
+    checkpoint_class = metadata.get("class_path")
+    if checkpoint_class not in SUPPORTED_CHECKPOINT_CLASSES:
         raise ValueError(
-            f"checkpoint class={metadata.get('class_path')!r}, "
-            f"expected {EXPECTED_CHECKPOINT_CLASS!r}"
+            f"checkpoint class={checkpoint_class!r}, expected one of "
+            f"{sorted(SUPPORTED_CHECKPOINT_CLASSES)!r}"
         )
     hparams = metadata.get("hparams")
     data_hparams = metadata.get("datamodule_hparams")
@@ -357,7 +418,16 @@ def _policy(
     return {"configuration": configuration, "fingerprint": fingerprint(configuration)}
 
 
-def _extraction(args: argparse.Namespace) -> dict[str, Any]:
+def _extraction(
+    args: argparse.Namespace, checkpoint: Mapping[str, Any]
+) -> dict[str, Any]:
+    is_dino = checkpoint.get("class_path") == DINO_CHECKPOINT_CLASS
+    if is_dino:
+        frame_bank_strategy = "trajectory_unique_dino_features_with_read_ahead_v1"
+    elif args.stream_frames:
+        frame_bank_strategy = "stream_unique_frames_with_one_chunk_read_ahead_v1"
+    else:
+        frame_bank_strategy = "full_gpu_up_to_16gib_else_compact_8192_pair_chunks_v1"
     configuration = {
         "precision": str(args.precision),
         "batch_size": int(args.batch_size),
@@ -367,11 +437,229 @@ def _extraction(args: argparse.Namespace) -> dict[str, Any]:
         "image_preprocessing": IMAGE_PREPROCESSING,
         "image_value_range": [0.0, 1.0],
         "output_dtype": "float32",
-        "frame_bank_strategy": (
-            "full_gpu_up_to_16gib_else_compact_8192_pair_chunks_v1"
-        ),
+        "frame_bank_strategy": frame_bank_strategy,
     }
+    if is_dino:
+        configuration.update(
+            {
+                "dino_feature_strategy": "each_referenced_trajectory_frame_once_v1",
+                "dino_feature_storage": "per_trajectory_cpu_mixed_precision",
+                "dino_frame_batch_size": int(args.dino_frame_batch_size),
+                "dino_lam_pair_batch_size": int(args.dino_lam_batch_size),
+                "loader_threads": int(args.loader_threads),
+            }
+        )
+    elif args.stream_frames:
+        configuration["stream_pair_chunk_size"] = int(args.stream_pair_chunk_size)
+        configuration["loader_threads"] = int(args.loader_threads)
     return {"configuration": configuration, "fingerprint": fingerprint(configuration)}
+
+
+_NUMERICAL_EXTRACTION_FIELDS = (
+    "precision",
+    "fused_attention",
+    "image_height",
+    "image_width",
+    "image_preprocessing",
+    "image_value_range",
+    "output_dtype",
+    "dino_feature_strategy",
+)
+
+
+def _reuse_descriptors(
+    args: argparse.Namespace,
+    checkpoint: Mapping[str, Any],
+    extraction: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Validate cache-level numerical compatibility for optional row reuse."""
+
+    descriptors = []
+    target_configuration = extraction["configuration"]
+    roots = list(getattr(args, "reuse_root", None) or ())
+    for raw_root in roots:
+        root = Path(raw_root).expanduser().resolve()
+        if not root.is_dir():
+            raise FileNotFoundError(f"Latent-action reuse root does not exist: {root}")
+        metadata_path = root / "metadata.json"
+        state_path = root / "extraction_state.json"
+        descriptor_path = metadata_path if metadata_path.is_file() else state_path
+        if not descriptor_path.is_file():
+            raise FileNotFoundError(
+                f"Reuse root has neither metadata.json nor extraction_state.json: {root}"
+            )
+        document = json.loads(descriptor_path.read_text(encoding="utf-8"))
+        source_checkpoint = document.get("checkpoint")
+        source_extraction = document.get("extraction")
+        if not isinstance(source_checkpoint, Mapping) or not isinstance(
+            source_extraction, Mapping
+        ):
+            raise TypeError(f"Reuse descriptor is incomplete: {descriptor_path}")
+        if source_checkpoint.get("sha256") != checkpoint.get("sha256"):
+            raise ValueError(f"Reuse checkpoint differs from target: {root}")
+        source_configuration = source_extraction.get("configuration")
+        if not isinstance(source_configuration, Mapping):
+            raise TypeError(f"Reuse extraction configuration is invalid: {root}")
+        mismatches = [
+            field
+            for field in _NUMERICAL_EXTRACTION_FIELDS
+            if source_configuration.get(field) != target_configuration.get(field)
+        ]
+        if mismatches:
+            raise ValueError(
+                f"Reuse extraction is numerically incompatible for {root}: {mismatches}"
+            )
+        source_fingerprint = source_extraction.get("fingerprint")
+        if not isinstance(source_fingerprint, str) or len(source_fingerprint) != 64:
+            raise ValueError(f"Reuse extraction fingerprint is invalid: {root}")
+        descriptors.append(
+            {
+                "root": str(root),
+                "descriptor_path": str(descriptor_path),
+                "checkpoint_sha256": source_checkpoint["sha256"],
+                "extraction_fingerprint": source_fingerprint,
+                "numerical_configuration": {
+                    field: source_configuration[field]
+                    for field in _NUMERICAL_EXTRACTION_FIELDS
+                },
+            }
+        )
+    if len({item["root"] for item in descriptors}) != len(descriptors):
+        raise ValueError("--reuse-root contains duplicates")
+    return descriptors
+
+
+def _strictly_sorted_pairs(pairs: np.ndarray) -> bool:
+    if len(pairs) < 2:
+        return True
+    current_increases = pairs[1:, 0] > pairs[:-1, 0]
+    same_current_target_increases = (
+        (pairs[1:, 0] == pairs[:-1, 0])
+        & (pairs[1:, 1] > pairs[:-1, 1])
+    )
+    return bool(np.all(current_increases | same_current_target_increases))
+
+
+def _matching_pair_rows(
+    requested_pairs: np.ndarray, available_pairs: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return aligned requested/available row numbers for sorted unique pairs."""
+
+    requested = np.ascontiguousarray(requested_pairs, dtype="<i8")
+    available = np.ascontiguousarray(available_pairs, dtype="<i8")
+    if requested.ndim != 2 or requested.shape[1:] != (2,):
+        raise ValueError("Requested reuse pairs must have shape [N,2]")
+    if available.ndim != 2 or available.shape[1:] != (2,):
+        raise ValueError("Available reuse pairs must have shape [N,2]")
+    if not _strictly_sorted_pairs(requested) or not _strictly_sorted_pairs(available):
+        raise ValueError("Latent-action reuse pairs must be sorted and unique")
+    pair_dtype = np.dtype([("current", "<i8"), ("target", "<i8")])
+    requested_keys = requested.view(pair_dtype).reshape(-1)
+    available_keys = available.view(pair_dtype).reshape(-1)
+    positions = np.searchsorted(available_keys, requested_keys)
+    valid = positions < len(available_keys)
+    valid[valid] &= available_keys[positions[valid]] == requested_keys[valid]
+    requested_rows = np.flatnonzero(valid).astype(np.int64, copy=False)
+    return requested_rows, positions[valid].astype(np.int64, copy=False)
+
+
+def _reuse_task_motion(
+    state: Mapping[str, Any],
+    task: Mapping[str, Any],
+    indices: np.ndarray,
+    source_fingerprint: str,
+    frame_pairs: np.ndarray,
+) -> dict[str, Any]:
+    """Fill exact target rows from compatible prior caches, without fallback."""
+
+    latent_dim = int(state["checkpoint"]["latent_dim"])
+    motion = torch.empty((len(frame_pairs), latent_dim), dtype=torch.float32)
+    filled = np.zeros(len(frame_pairs), dtype=np.bool_)
+    provenance: list[dict[str, Any]] = []
+    for descriptor in state.get("reuse_roots", ()):
+        path = safe_path(
+            Path(descriptor["root"]),
+            str(task["source_id"]),
+            str(task["trajectory_id"]),
+            ".pt",
+        )
+        if not path.is_file() or bool(np.all(filled)):
+            continue
+        try:
+            payload = safe_torch_load(path)
+            if not (
+                payload.get("schema_version") == SCHEMA_VERSION
+                and payload.get("format") == FORMAT_NAME
+                and payload.get("proxy_type") == "latent"
+                and payload.get("source_id") == task["source_id"]
+                and payload.get("trajectory_id") == task["trajectory_id"]
+                and payload.get("complete") is True
+            ):
+                raise ValueError("cache identity or format mismatch")
+            metadata = payload.get("metadata")
+            if not isinstance(metadata, Mapping):
+                raise TypeError("cache metadata is not a mapping")
+            required_metadata = {
+                "frame_indices_sha256": task["frame_indices_sha256"],
+                "source_fingerprint": source_fingerprint,
+                "checkpoint_sha256": state["checkpoint"]["sha256"],
+                "extraction_fingerprint": descriptor["extraction_fingerprint"],
+            }
+            for key, expected in required_metadata.items():
+                if metadata.get(key) != expected:
+                    raise ValueError(f"cache metadata.{key} mismatch")
+            stored_indices = torch.as_tensor(payload["frame_indices"])
+            if stored_indices.dtype != torch.int64 or not torch.equal(
+                stored_indices, torch.from_numpy(indices.copy())
+            ):
+                raise ValueError("cache frame inventory mismatch")
+            available_pairs_tensor = torch.as_tensor(payload["frame_pairs"])
+            available_motion = torch.as_tensor(payload["motion"])
+            if available_pairs_tensor.dtype != torch.int64:
+                raise TypeError("cache frame-pair dtype is invalid")
+            if available_motion.dtype != torch.float32 or tuple(
+                available_motion.shape
+            ) != (len(available_pairs_tensor), latent_dim):
+                raise ValueError("cache motion shape or dtype is invalid")
+            requested_rows, available_rows = _matching_pair_rows(
+                frame_pairs, available_pairs_tensor.numpy()
+            )
+            if len(requested_rows):
+                keep = ~filled[requested_rows]
+                requested_rows = requested_rows[keep]
+                available_rows = available_rows[keep]
+            if not len(requested_rows):
+                continue
+            reused = available_motion.index_select(
+                0, torch.from_numpy(available_rows)
+            ).contiguous()
+            if not torch.isfinite(reused).all():
+                raise ValueError("selected cache motion contains non-finite values")
+            motion[torch.from_numpy(requested_rows)] = reused
+            filled[requested_rows] = True
+            provenance.append(
+                {
+                    "root": descriptor["root"],
+                    "path": str(path),
+                    "rows": int(len(requested_rows)),
+                }
+            )
+        except Exception as exc:
+            provenance.append(
+                {
+                    "root": descriptor["root"],
+                    "path": str(path),
+                    "rows": 0,
+                    "ignored_error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+    missing_rows = np.flatnonzero(~filled).astype(np.int64, copy=False)
+    return {
+        "motion": motion,
+        "missing_rows": missing_rows,
+        "reused_rows": int(np.count_nonzero(filled)),
+        "provenance": provenance,
+    }
 
 
 def _bitmap_bits(
@@ -398,6 +686,7 @@ def _load_training_pair_plan(
     *,
     recipe_sha256: str,
     max_abs_frame_offset: int,
+    allow_future_training_plan: bool = False,
 ) -> tuple[dict[str, Any] | None, np.ndarray | None]:
     if path is None:
         return None, None
@@ -412,8 +701,15 @@ def _load_training_pair_plan(
         and report.get("complete") is True
     ):
         raise ValueError("Training pair plan is incomplete or has the wrong format")
-    if report.get("reference_validation", {}).get("status") != "matched":
-        raise ValueError("Training pair plan was not matched to TimePT/GeoPT references")
+    reference_status = report.get("reference_validation", {}).get("status")
+    allowed_reference_statuses = {"matched"}
+    if allow_future_training_plan:
+        allowed_reference_statuses.add("not_requested")
+    if reference_status not in allowed_reference_statuses:
+        raise ValueError(
+            "Training pair plan reference validation status is not allowed: "
+            f"{reference_status!r}; allowed={sorted(allowed_reference_statuses)}"
+        )
     if report.get("sampling_recipe", {}).get("sha256") != recipe_sha256:
         raise ValueError("Training pair plan sampling recipe SHA-256 mismatch")
     contract = report.get("training_contract")
@@ -527,8 +823,11 @@ def _build_state(args: argparse.Namespace, world_size: int) -> dict[str, Any]:
         args.training_pair_plan,
         recipe_sha256=recipe_sha,
         max_abs_frame_offset=int(args.max_abs_frame_offset),
+        allow_future_training_plan=bool(args.allow_future_training_plan),
     )
     checkpoint = _checkpoint_descriptor(args)
+    extraction = _extraction(args, checkpoint)
+    reuse_roots = _reuse_descriptors(args, checkpoint, extraction)
     tasks = [dict(item) for item in recipe["trajectories"]]
     observation_base = 0
     pair_width = 2 * int(args.max_abs_frame_offset) + 1
@@ -575,7 +874,8 @@ def _build_state(args: argparse.Namespace, world_size: int) -> dict[str, Any]:
         "legacy_full_policy_fingerprint": fingerprint(
             _full_pair_policy_configuration(args)
         ),
-        "extraction": _extraction(args),
+        "extraction": extraction,
+        "reuse_roots": reuse_roots,
         "training_pair_plan": training_plan,
         "tasks": tasks,
         "world_size": world_size,
@@ -801,6 +1101,33 @@ def _load_frames(
     image_width: int,
     loader_threads: int,
 ) -> tuple[torch.Tensor, list[dict[str, Any]]]:
+    return _load_frame_positions(
+        frames,
+        range(len(frames)),
+        load_frame,
+        image_height=image_height,
+        image_width=image_width,
+        loader_threads=loader_threads,
+    )
+
+
+def _load_frame_positions(
+    frames: list[tuple[int, str]],
+    positions: Sequence[int] | np.ndarray,
+    load_frame: Callable[..., torch.Tensor],
+    *,
+    image_height: int,
+    image_width: int,
+    loader_threads: int,
+) -> tuple[torch.Tensor, list[dict[str, Any]]]:
+    """Load selected positions while retaining trajectory-wide fallbacks."""
+
+    selected_positions = [int(position) for position in positions]
+    if not selected_positions:
+        raise ValueError("At least one frame position is required")
+    if min(selected_positions) < 0 or max(selected_positions) >= len(frames):
+        raise IndexError("Selected frame position is outside the trajectory")
+
     def load(position: int) -> tuple[torch.Tensor, dict[str, Any] | None]:
         return _load_frame_with_fallback(
             frames,
@@ -812,9 +1139,9 @@ def _load_frames(
 
     if loader_threads > 0:
         with ThreadPoolExecutor(max_workers=loader_threads) as executor:
-            loaded = list(executor.map(load, range(len(frames))))
+            loaded = list(executor.map(load, selected_positions))
     else:
-        loaded = [load(position) for position in range(len(frames))]
+        loaded = [load(position) for position in selected_positions]
     substitutions = [item[1] for item in loaded if item[1] is not None]
     return torch.stack([item[0] for item in loaded]).contiguous(), substitutions
 
@@ -883,6 +1210,210 @@ def encode_pair_batches(
     return torch.cat(outputs, dim=0).contiguous()
 
 
+def encode_pair_batches_streaming(
+    adapter: Any,
+    frames: list[tuple[int, str]],
+    position_pairs_array: np.ndarray,
+    load_frame: Callable[..., torch.Tensor],
+    *,
+    batch_size: int,
+    precision: str,
+    image_height: int,
+    image_width: int,
+    loader_threads: int,
+    pair_chunk_size: int,
+    progress: Callable[[int, int], None] | None = None,
+) -> tuple[torch.Tensor, list[dict[str, Any]]]:
+    """Encode a long trajectory without materializing its full RGB frame bank.
+
+    Pair chunks retain canonical row-major order. Each chunk decodes its unique
+    source frames once, while a one-item read-ahead overlaps NAS/JPEG work for
+    the next chunk with current GPU inference.
+    """
+
+    position_pairs_array = np.asarray(position_pairs_array, dtype=np.int64)
+    if position_pairs_array.ndim != 2 or position_pairs_array.shape[1:] != (2,):
+        raise ValueError("position_pairs_array must have shape [N,2]")
+    if pair_chunk_size < 1:
+        raise ValueError("stream pair chunk size must be positive")
+    latent_dim = int(adapter.checkpoint_metadata["hparams"]["lam_latent_dim"])
+    if len(position_pairs_array) == 0:
+        return torch.empty((0, latent_dim), dtype=torch.float32), []
+
+    chunks = [
+        position_pairs_array[start : start + pair_chunk_size]
+        for start in range(0, len(position_pairs_array), pair_chunk_size)
+    ]
+
+    def prepare(
+        pair_chunk: np.ndarray,
+    ) -> tuple[torch.Tensor, np.ndarray, list[dict[str, Any]]]:
+        unique_positions, inverse = np.unique(pair_chunk, return_inverse=True)
+        selected = [frames[int(position)] for position in unique_positions]
+        frame_tensors, substitutions = _load_frames(
+            selected,
+            load_frame,
+            image_height=image_height,
+            image_width=image_width,
+            loader_threads=loader_threads,
+        )
+        return frame_tensors, inverse.reshape(-1, 2), substitutions
+
+    outputs: list[torch.Tensor] = []
+    substitutions_by_frame: dict[int, dict[str, Any]] = {}
+    completed = 0
+    with ThreadPoolExecutor(max_workers=1) as read_ahead:
+        future = read_ahead.submit(prepare, chunks[0])
+        for chunk_index, pair_chunk in enumerate(chunks):
+            frame_tensors, compact_pairs, substitutions = future.result()
+            if chunk_index + 1 < len(chunks):
+                future = read_ahead.submit(prepare, chunks[chunk_index + 1])
+            outputs.append(
+                encode_pair_batches(
+                    adapter,
+                    frame_tensors,
+                    compact_pairs,
+                    batch_size=batch_size,
+                    precision=precision,
+                    gpu_frame_bank_limit_bytes=GPU_FRAME_BANK_LIMIT_BYTES,
+                )
+            )
+            del frame_tensors
+            for substitution in substitutions:
+                substitutions_by_frame[int(substitution["frame_index"])] = substitution
+            completed += len(pair_chunk)
+            if progress is not None:
+                progress(completed, len(position_pairs_array))
+    return torch.cat(outputs, dim=0).contiguous(), list(substitutions_by_frame.values())
+
+
+def encode_dino_pair_batches(
+    adapter: Any,
+    frames: list[tuple[int, str]],
+    position_pairs_array: np.ndarray,
+    load_frame: Callable[..., torch.Tensor],
+    *,
+    precision: str,
+    image_height: int,
+    image_width: int,
+    loader_threads: int,
+    frame_batch_size: int = DINO_FRAME_BATCH_SIZE,
+    lam_batch_size: int = DINO_LAM_PAIR_BATCH_SIZE,
+    progress: Callable[[str, int, int], None] | None = None,
+) -> tuple[torch.Tensor, list[dict[str, Any]]]:
+    """Encode DINO pairs after extracting every referenced frame only once.
+
+    The feature bank exists only for the current trajectory and stays on CPU.
+    JPEG reads for the next frame chunk overlap the current DINO forward, while
+    long trajectories never materialize a full RGB tensor bank.
+    """
+
+    position_pairs_array = np.asarray(position_pairs_array, dtype=np.int64)
+    if position_pairs_array.ndim != 2 or position_pairs_array.shape[1:] != (2,):
+        raise ValueError("position_pairs_array must have shape [N,2]")
+    if frame_batch_size < 1 or lam_batch_size < 1:
+        raise ValueError("DINO frame and LAM pair batch sizes must be positive")
+    latent_dim = int(adapter.checkpoint_metadata["hparams"]["lam_latent_dim"])
+    if len(position_pairs_array) == 0:
+        return torch.empty((0, latent_dim), dtype=torch.float32), []
+    if np.min(position_pairs_array) < 0 or np.max(position_pairs_array) >= len(
+        frames
+    ):
+        raise IndexError("DINO pair position is outside the trajectory")
+
+    model = getattr(adapter, "model", None)
+    extract_features = getattr(model, "extract_dino_features", None)
+    lam = getattr(model, "lam", None)
+    if not callable(extract_features) or lam is None or not callable(
+        getattr(lam, "encode", None)
+    ):
+        raise TypeError("DINO feature-once extraction requires a DINOFeatureLAM adapter")
+
+    unique_positions, inverse = np.unique(position_pairs_array, return_inverse=True)
+    feature_bank: torch.Tensor | None = None
+    substitutions_by_frame: dict[int, dict[str, Any]] = {}
+    chunks = [
+        unique_positions[start : start + frame_batch_size]
+        for start in range(0, len(unique_positions), frame_batch_size)
+    ]
+
+    def prepare(position_chunk: np.ndarray) -> tuple[torch.Tensor, list[dict[str, Any]]]:
+        return _load_frame_positions(
+            frames,
+            position_chunk,
+            load_frame,
+            image_height=image_height,
+            image_width=image_width,
+            loader_threads=loader_threads,
+        )
+
+    completed_frames = 0
+    with ThreadPoolExecutor(max_workers=1) as read_ahead:
+        future = read_ahead.submit(prepare, chunks[0])
+        for chunk_index, position_chunk in enumerate(chunks):
+            frame_tensors, substitutions = future.result()
+            if chunk_index + 1 < len(chunks):
+                future = read_ahead.submit(prepare, chunks[chunk_index + 1])
+            videos = frame_tensors.to(device=adapter.device).unsqueeze(1)
+            with _autocast(adapter.device, precision):
+                feature_sequence = extract_features(videos)
+            expected_prefix = (len(position_chunk), 1)
+            if (
+                feature_sequence.ndim != 4
+                or tuple(feature_sequence.shape[:2]) != expected_prefix
+            ):
+                raise RuntimeError(
+                    "DINO encoder returned malformed features: "
+                    f"got {tuple(feature_sequence.shape)}, expected prefix {expected_prefix}"
+                )
+            chunk_features = feature_sequence[:, 0].detach().cpu()
+            if feature_bank is None:
+                feature_bank = torch.empty(
+                    (len(unique_positions), *chunk_features.shape[1:]),
+                    dtype=chunk_features.dtype,
+                )
+            start = completed_frames
+            completed_frames += len(position_chunk)
+            feature_bank[start:completed_frames].copy_(chunk_features)
+            for substitution in substitutions:
+                substitutions_by_frame[int(substitution["frame_index"])] = substitution
+            if progress is not None:
+                progress("dino_frames", completed_frames, len(unique_positions))
+            del frame_tensors, videos, feature_sequence, chunk_features
+
+    assert feature_bank is not None
+    compact_pairs = torch.from_numpy(inverse.reshape(-1, 2).astype(np.int64, copy=False))
+    outputs: list[torch.Tensor] = []
+    completed_pairs = 0
+    for start in range(0, len(compact_pairs), lam_batch_size):
+        selection = compact_pairs[start : start + lam_batch_size]
+        flat_selection = selection.reshape(-1)
+        pair_features = feature_bank.index_select(0, flat_selection).reshape(
+            len(selection), 2, *feature_bank.shape[1:]
+        )
+        pair_features = pair_features.to(device=adapter.device)
+        if hasattr(lam, "mu_record"):
+            lam.mu_record = None
+        try:
+            with _autocast(adapter.device, precision):
+                encoded = lam.encode(pair_features)
+            z_mu = encoded["z_mu"]
+            expected = (len(selection), latent_dim)
+            if tuple(z_mu.shape) != expected:
+                raise RuntimeError(
+                    f"DINO navigation LAM returned z_mu {tuple(z_mu.shape)}, "
+                    f"expected {expected}"
+                )
+            outputs.append(z_mu.detach().float().cpu())
+        finally:
+            if hasattr(lam, "mu_record"):
+                lam.mu_record = None
+        completed_pairs += len(selection)
+        if progress is not None:
+            progress("lam_pairs", completed_pairs, len(compact_pairs))
+    return torch.cat(outputs, dim=0).contiguous(), list(substitutions_by_frame.values())
+
+
 def _load_adapter(state: Mapping[str, Any], local_rank: int) -> Any:
     _, load_adapter, _ = _lam_api(state["lam_project_root"])
     adapter = load_adapter(
@@ -903,7 +1434,7 @@ def _load_adapter(state: Mapping[str, Any], local_rank: int) -> Any:
 
 
 def _compute_task(
-    adapter: Any,
+    adapter: Any | None,
     load_frame: Callable[..., torch.Tensor],
     state: Mapping[str, Any],
     task: Mapping[str, Any],
@@ -913,24 +1444,105 @@ def _compute_task(
     pair_bitmap: np.ndarray | None,
     args: argparse.Namespace,
     rank: int,
+    reuse_result: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     frame_pairs = _task_frame_pairs(state, task, indices, pair_bitmap)
-    position_pair_array = position_pairs(indices, frame_pairs)
-    frame_tensors, substitutions = _load_frames(
-        frames,
-        load_frame,
-        image_height=int(args.image_height),
-        image_width=int(args.image_width),
-        loader_threads=int(args.loader_threads),
+    reuse = (
+        dict(reuse_result)
+        if reuse_result is not None
+        else _reuse_task_motion(
+            state, task, indices, source_fingerprint, frame_pairs
+        )
     )
-    motion = encode_pair_batches(
-        adapter,
-        frame_tensors,
-        position_pair_array,
-        batch_size=int(args.batch_size),
-        precision=str(args.precision),
-    )
-    del frame_tensors
+    motion = torch.as_tensor(reuse["motion"])
+    missing_rows = np.asarray(reuse["missing_rows"], dtype=np.int64)
+    substitutions: list[dict[str, Any]] = []
+    if int(reuse.get("reused_rows", 0)):
+        log(
+            rank,
+            f"reused {int(reuse['reused_rows'])}/{len(frame_pairs)} exact rows "
+            f"for {task['source_id']}/{task['trajectory_id']}",
+        )
+    if len(missing_rows):
+        if adapter is None:
+            raise RuntimeError("Navigation LAM adapter is required for missing reuse rows")
+        missing_pairs = frame_pairs[missing_rows]
+        position_pair_array = position_pairs(indices, missing_pairs)
+        if state["checkpoint"]["class_path"] == DINO_CHECKPOINT_CLASS:
+            last_logged = {"dino_frames": 0, "lam_pairs": 0}
+
+            def report_dino_progress(phase: str, completed: int, total: int) -> None:
+                if phase == "dino_frames":
+                    interval = max(int(args.dino_frame_batch_size) * 20, 1)
+                else:
+                    interval = max(int(args.dino_lam_batch_size) * 20, 1)
+                if total >= interval and (
+                    completed == total or completed - last_logged[phase] >= interval
+                ):
+                    log(
+                        rank,
+                        f"DINO feature-once {task['source_id']}/{task['trajectory_id']} "
+                        f"{phase}={completed}/{total}",
+                    )
+                    last_logged[phase] = completed
+
+            inferred, substitutions = encode_dino_pair_batches(
+                adapter,
+                frames,
+                position_pair_array,
+                load_frame,
+                precision=str(args.precision),
+                image_height=int(args.image_height),
+                image_width=int(args.image_width),
+                loader_threads=int(args.loader_threads),
+                frame_batch_size=int(args.dino_frame_batch_size),
+                lam_batch_size=int(args.dino_lam_batch_size),
+                progress=report_dino_progress,
+            )
+        elif args.stream_frames:
+            last_logged = 0
+
+            def report_progress(completed: int, total: int) -> None:
+                nonlocal last_logged
+                interval = max(int(args.stream_pair_chunk_size) * 20, 1)
+                if completed == total or completed - last_logged >= interval:
+                    log(
+                        rank,
+                        f"streaming {task['source_id']}/{task['trajectory_id']} "
+                        f"missing_pairs={completed}/{total}",
+                    )
+                    last_logged = completed
+
+            inferred, substitutions = encode_pair_batches_streaming(
+                adapter,
+                frames,
+                position_pair_array,
+                load_frame,
+                batch_size=int(args.batch_size),
+                precision=str(args.precision),
+                image_height=int(args.image_height),
+                image_width=int(args.image_width),
+                loader_threads=int(args.loader_threads),
+                pair_chunk_size=int(args.stream_pair_chunk_size),
+                progress=report_progress,
+            )
+        else:
+            frame_tensors, substitutions = _load_frames(
+                frames,
+                load_frame,
+                image_height=int(args.image_height),
+                image_width=int(args.image_width),
+                loader_threads=int(args.loader_threads),
+            )
+            inferred = encode_pair_batches(
+                adapter,
+                frame_tensors,
+                position_pair_array,
+                batch_size=int(args.batch_size),
+                precision=str(args.precision),
+            )
+            del frame_tensors
+        motion[torch.from_numpy(missing_rows)] = inferred
     for item in substitutions:
         log(
             rank,
@@ -955,6 +1567,11 @@ def _compute_task(
         "frame_pairs": torch.from_numpy(frame_pairs.copy()),
         "motion": motion,
         "invalid_frame_substitutions": substitutions,
+        "reuse": {
+            "reused_rows": int(reuse.get("reused_rows", 0)),
+            "inferred_rows": int(len(missing_rows)),
+            "sources": list(reuse.get("provenance", ())),
+        },
         "metadata": _expected_metadata(state, task, source_fingerprint),
         "complete": True,
     }
@@ -1068,7 +1685,13 @@ def _write_completion(
 
 def main() -> None:
     args = parse_args()
-    if args.batch_size < 1 or args.loader_threads < 0:
+    if (
+        args.batch_size < 1
+        or args.loader_threads < 0
+        or args.stream_pair_chunk_size < 1
+        or args.dino_frame_batch_size < 1
+        or args.dino_lam_batch_size < 1
+    ):
         raise ValueError("Invalid encoder batch size or loader thread count")
     if args.context_size < 1 or args.max_abs_frame_offset < 0:
         raise ValueError("Invalid pair-domain arguments")
@@ -1129,8 +1752,12 @@ def main() -> None:
             except Exception as exc:
                 log(rank, f"recomputing invalid {output}: {type(exc).__name__}: {exc}")
         if record is None:
-            if adapter is None:
-                log(rank, "loading nav1 PixelActionLAM checkpoint")
+            target_pairs = _task_frame_pairs(state, task, indices, pair_bitmap)
+            reuse_result = _reuse_task_motion(
+                state, task, indices, source_fingerprint, target_pairs
+            )
+            if len(reuse_result["missing_rows"]) and adapter is None:
+                log(rank, "loading navigation LAM checkpoint")
                 adapter = _load_adapter(state, local_rank)
                 log(rank, "navigation LAM ready")
             record = _compute_task(
@@ -1144,6 +1771,7 @@ def main() -> None:
                 pair_bitmap,
                 args,
                 rank,
+                reuse_result=reuse_result,
             )
         records.append(record)
         pairs_done += int(record["pair_count"])

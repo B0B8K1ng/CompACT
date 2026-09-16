@@ -46,6 +46,31 @@ def test_global_epoch_indices_match_real_distributed_samplers() -> None:
     assert np.array_equal(replayed, expected_interleaved)
 
 
+def test_validation_indices_match_unshuffled_distributed_sampler() -> None:
+    dataset = _LengthOnlyDataset(41)
+    actual_ranks = []
+    for rank in range(3):
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=3,
+            rank=rank,
+            shuffle=False,
+            seed=19,
+        )
+        actual_ranks.append(list(sampler)[:4])
+    expected_interleaved = np.asarray(actual_ranks, dtype=np.int64).T.reshape(-1)
+    replayed = distributed_epoch_indices(
+        len(dataset),
+        seed=19,
+        epoch=0,
+        world_size=3,
+        batch_size=4,
+        steps=1,
+        shuffle=False,
+    )
+    assert np.array_equal(replayed, expected_interleaved)
+
+
 def test_geopt_reference_validation_allows_only_float32_reduction_error() -> None:
     local_draws = 8_934_207
     absolute_offset_sum = 35_536_926

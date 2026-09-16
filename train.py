@@ -54,6 +54,7 @@ from data_utils import (
 )
 import hydra_utils  # noqa: F401 — registers OmegaConf resolvers
 from misc import seed_everything, get_unnormalize
+from two_stage_checkpoint import capture_rng_state, restore_rng_state
 
 #################################################################################
 #                                  Training Loop                                #
@@ -99,6 +100,39 @@ def setup_memory_monitoring(dataloader, rank):
     return monitor
 
 
+def initialize_wandb(config, experiment_dir):
+    """Keep legacy logging optional; Go2 requires a persistent online run."""
+    options = {}
+    required = config.training.get("wandb_required", False)
+    state_path = os.path.join(experiment_dir, "wandb_state.json")
+    if required:
+        if config.training.get("from_checkpoint"):
+            with open(state_path) as stream:
+                saved = json.load(stream)
+            options.update(id=saved["id"], resume="must")
+        options["mode"] = "online"
+    run = wandb.init(
+        project=config.training.get("wandb_project", "nwm-training"),
+        entity=config.training.get("wandb_entity", None),
+        name=config.training.get("run_name", None),
+        notes=config.training.get("wandb_notes", None),
+        tags=config.training.get("wandb_tags", []),
+        config=OmegaConf.to_container(config, resolve=False),
+        dir=experiment_dir,
+        group=config.training.get("wandb_group", None),
+        **options,
+    )
+    if required:
+        if run is None or run.settings.mode != "online":
+            raise RuntimeError("Go2 requires an online WandB run")
+        temporary = state_path + ".tmp"
+        with open(temporary, "w") as stream:
+            json.dump({"id": run.id, "url": run.url, "path": run.path,
+                       "status": "running"}, stream, indent=2)
+        os.replace(temporary, state_path)
+    return run
+
+
 @hydra.main(version_base=None, config_path="conf", config_name="config")
 def main(config: DictConfig):
     """
@@ -134,20 +168,16 @@ def main(config: DictConfig):
         wandb_run_name = None
         if config.training.get("wandb_enabled", False):
             try:
-                wandb.init(
-                    project=config.training.get("wandb_project", "nwm-training"),
-                    entity=config.training.get("wandb_entity", None),
-                    name=config.training.get("run_name", None),
-                    notes=config.training.get("wandb_notes", None),
-                    tags=config.training.get("wandb_tags", []),
-                    config=OmegaConf.to_container(config, resolve=False),
-                    dir=experiment_dir,
-                )
-                wandb_run_name = wandb.run.name
+                wandb_state_path = os.path.join(experiment_dir, "wandb_state.json")
+                wandb_run_name = initialize_wandb(config, experiment_dir).name
                 logger.info(
                     f"WandB logging initialized with run name: {wandb_run_name}"
                 )
             except Exception as e:
+                if config.training.get("wandb_required", False):
+                    # Go2 uses one GPU. Other ranks are terminated by torchrun
+                    # if a caller explicitly launches a distributed variant.
+                    raise RuntimeError("Required online WandB initialization failed") from e
                 logger.warning(
                     f"Failed to initialize WandB: {e}. Continuing without WandB logging."
                 )
@@ -187,7 +217,15 @@ def main(config: DictConfig):
         if rank == 0 and config.training.get("wandb_enabled", False):
             try:
                 wandb.finish()
+                if config.training.get("wandb_required", False):
+                    with open(wandb_state_path) as stream:
+                        saved_wandb = json.load(stream)
+                    saved_wandb["status"] = "sdk_finished"
+                    with open(wandb_state_path, "w") as stream:
+                        json.dump(saved_wandb, stream, indent=2)
             except Exception as exc:
+                if config.training.get("wandb_required", False):
+                    raise
                 logger.warning(f"Failed to finish WandB run: {exc}")
         cleanup()
         return
@@ -400,20 +438,27 @@ def main(config: DictConfig):
             ) or (train_steps == 1 and config.get("eval_at_first_step", True)):
                 eval_start_time = time()
                 save_dir = os.path.join(experiment_dir, "viz", str(train_steps))
-                sim_score = evaluate(
-                    ema,
-                    tokenizer,
-                    diffusion,
-                    eval_loader,
-                    rank,
-                    latent_size,
-                    torch_device,
-                    save_dir,
-                    config.seed,
-                    bfloat_enable,
-                    config.dataset.context_size,
-                    get_unnormalize(config.dataset.mean, config.dataset.std),
-                )
+                # Evaluation uses a fixed sample/noise stream for comparable
+                # curves. Restore every RNG afterward so it cannot alter the
+                # subsequent training trajectory.
+                training_rng_state = capture_rng_state()
+                try:
+                    sim_score = evaluate(
+                        ema,
+                        tokenizer,
+                        diffusion,
+                        eval_loader,
+                        rank,
+                        latent_size,
+                        torch_device,
+                        save_dir,
+                        config.seed,
+                        bfloat_enable,
+                        config.dataset.context_size,
+                        get_unnormalize(config.dataset.mean, config.dataset.std),
+                    )
+                finally:
+                    restore_rng_state(training_rng_state)
                 dist.barrier()
                 eval_end_time = time()
                 eval_time = eval_end_time - eval_start_time

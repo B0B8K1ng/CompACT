@@ -15,6 +15,7 @@ from typing import Any
 DEFAULT_REGISTRY = Path(
     "/file_system/nas/algorithm/dujun.nie/nwm/results/nwm_benchmark/benchmark_results.json"
 )
+EVAL_SEED = int(os.environ.get("NWM_EVAL_SEED", "0"))
 
 MODELS = {
     "nwm-base": {
@@ -96,6 +97,51 @@ MODELS = {
             "training_complete_at": "2026-09-07T03:32:21Z",
         },
     },
+    "nwm-latentpt-ft": {
+        "architecture": "CDiT-B/2 + SD-VAE + LatentPT adapter reset fine-tune",
+        "exp_dir": "/file_system/nas/algorithm/dujun.nie/nwm/compact/runs/navanywherev1_latentpt_ft_pixel_action_l20/nwm-nav1-latentpt-finetune-pixel-action-l20",
+        "checkpoint_id": "joint_0100000",
+        "checkpoint": "/file_system/nas/algorithm/dujun.nie/nwm/compact/runs/navanywherev1_latentpt_ft_pixel_action_l20/nwm-nav1-latentpt-finetune-pixel-action-l20/checkpoints/joint_0100000.pth.tar",
+        "checkpoint_step": 110000,
+        "sha256": "f5d5b3b70cd8a483ce4783b06ceb4405a8af1ff1a843e521cdd65e51f076df35",
+        "training_datasets": ["recon", "sacson", "scand", "tartan_drive"],
+        "provenance": {
+            "stage1": "NavAnywhere-v1 LatentPT",
+            "stage1_checkpoint": "/file_system/nas/algorithm/dujun.nie/nwm/compact/runs/navanywhere_stage1/nwm-latentpt/checkpoints/latest.pth.tar",
+            "fine_tune_scheme": "adapter reset; 10k warmup + 100k joint steps",
+            "training_complete_at": "2026-09-10T18:23:44Z",
+        },
+    },
+    "nwm-latentpt-ft-align": {
+        "architecture": "CDiT-B/2 + SD-VAE + LatentPT-aligned real-motion adapter fine-tune",
+        "exp_dir": "/file_system/nas/algorithm/dujun.nie/nwm/compact/runs/navanywherev1_latentpt_ft_align_pixel_action_l20/nwm-nav1-latentpt-finetune-align-pixel-action-l20",
+        "checkpoint_id": "joint_0100000",
+        "checkpoint": "/file_system/nas/algorithm/dujun.nie/nwm/compact/runs/navanywherev1_latentpt_ft_align_pixel_action_l20/nwm-nav1-latentpt-finetune-align-pixel-action-l20/checkpoints/joint_0100000.pth.tar",
+        "checkpoint_step": 110000,
+        "sha256": "c8639c99e3f8dca8059f31a3c34b3cef93b11f16141cf002d84577e738550b1c",
+        "training_datasets": ["recon", "sacson", "scand", "tartan_drive"],
+        "provenance": {
+            "stage1": "NavAnywhere-v1 LatentPT",
+            "stage1_checkpoint": "/file_system/nas/algorithm/dujun.nie/nwm/compact/runs/navanywhere_stage1/nwm-latentpt/checkpoints/latest.pth.tar",
+            "fine_tune_scheme": "adapter reset; 10k warmup + 100k joint steps with LatentPT alignment loss",
+            "training_complete_at": "2026-09-11T20:34:16Z",
+        },
+    },
+    "nwm-latentpt-ft-action2latent": {
+        "architecture": "CDiT-B/2 + SD-VAE + LatentPT Action2Latent adapter fine-tune",
+        "exp_dir": "/file_system/nas/algorithm/dujun.nie/nwm/compact/runs/navanywherev1_latentpt_ft_action2latent_pixel_action_l20/nwm-nav1-latentpt-finetune-action2latent-pixel-action-l20",
+        "checkpoint_id": "joint_0100000",
+        "checkpoint": "/file_system/nas/algorithm/dujun.nie/nwm/compact/runs/navanywherev1_latentpt_ft_action2latent_pixel_action_l20/nwm-nav1-latentpt-finetune-action2latent-pixel-action-l20/checkpoints/joint_0100000.pth.tar",
+        "checkpoint_step": 110000,
+        "sha256": "c4973fb135bba5b261b94f3bf822cc158654a21a22993ac9f54b0835c70c6b6c",
+        "training_datasets": ["recon", "sacson", "scand", "tartan_drive"],
+        "provenance": {
+            "stage1": "NavAnywhere-v1 LatentPT",
+            "stage1_checkpoint": "/file_system/nas/algorithm/dujun.nie/nwm/compact/runs/navanywhere_stage1/nwm-latentpt/checkpoints/latest.pth.tar",
+            "fine_tune_scheme": "real-to-latent action mapping; 10k warmup + 100k joint steps",
+            "training_complete_at": "2026-09-12T13:27:27Z",
+        },
+    },
     "nwm-no-pretrain": {
         "architecture": "CDiT-B/2 + SD-VAE + real-motion adapter, trained from scratch",
         "exp_dir": "/file_system/nas/algorithm/dujun.nie/nwm/compact/runs/no_pretrain_ft/nwm-no-pretrain-finetune",
@@ -119,7 +165,7 @@ PROTOCOLS = {
         "sample_counts": {"time": 500, "rollout_1fps": 150, "rollout_4fps": 150},
         "horizons_seconds": [1, 2, 4, 8, 16],
         "diffusion_steps": 250,
-        "seed": 0,
+        "seed": EVAL_SEED,
         "metrics": {
             "lpips_alex": "lower",
             "dreamsim": "lower",
@@ -134,7 +180,7 @@ PROTOCOLS = {
         "horizons_seconds": [1, 2, 4, 8, 16],
         "paper_comparison_horizon_seconds": 4,
         "diffusion_steps": 250,
-        "seed": 0,
+        "seed": EVAL_SEED,
         "paper_comparison_caveat": "NWM paper reports five-sample mean for CDiT-XL; local models are CDiT-B single-seed checkpoints",
         "metrics": {
             "lpips_alex": "lower",
@@ -153,7 +199,7 @@ PROTOCOLS = {
         "rollout_fps": [1, 4],
         "horizons_seconds": [1, 2, 4, 8, 16],
         "diffusion_steps": 250,
-        "seed": 0,
+        "seed": EVAL_SEED,
         "autoregressive": True,
         "execution": {
             "distributed_world_size": 2,
@@ -185,7 +231,7 @@ PROTOCOLS = {
         "rollout_fps": [1, 4],
         "horizons_seconds": [1, 2, 4, 8, 16],
         "diffusion_steps": 250,
-        "seed": 0,
+        "seed": EVAL_SEED,
         "autoregressive": True,
         "execution": {
             "distributed_world_size": 2,
@@ -211,7 +257,7 @@ PROTOCOLS = {
         "horizon_steps": 8,
         "seconds_per_step": 0.25,
         "cost": "lpips_alex_on_vae_reconstruction",
-        "seed": 42,
+        "seed": 42 + EVAL_SEED,
         "metrics": {"ate": "lower", "rpe_trans": "lower"},
         "comparability": {
             "compact_paper": "exact CEM population/protocol",
@@ -231,7 +277,7 @@ PROTOCOLS = {
         "seconds_per_step": 0.25,
         "diffusion_steps": 10,
         "cost": "lpips_alex_on_vae_reconstruction",
-        "seed": 42,
+        "seed": 42 + EVAL_SEED,
         "metrics": {"ate": "lower", "rpe_trans": "lower"},
         "comparability": {
             "paper": "accelerated local protocol; diffusion step count differs from the 250-step local exact run"

@@ -8,7 +8,7 @@ show_help() {
     cat <<'EOF'
 Usage:
   ./two_stage_nwm.sh stage1 {timept|geopt|idmpt|latentpt} [options] [-- HYDRA_OVERRIDES...]
-  ./two_stage_nwm.sh stage2 {no_pretrain|latent_reset|latent_align|latent_real_to_latent|time_reset|geo_reset|idm_reset} [options] [-- HYDRA_OVERRIDES...]
+  ./two_stage_nwm.sh stage2 {no_pretrain|latent_reset|latent_align|latent_real_to_latent|latent_state_controller|time_reset|geo_reset|idm_reset} [options] [-- HYDRA_OVERRIDES...]
 
 Options:
   --nproc=N                    Processes per node (stage 2 default: 8; otherwise GPU list size or 1)
@@ -45,6 +45,7 @@ Additional cache environment:
   idmpt:        NWM_IDM_PROXY_ROOT
   latentpt:     NWM_LATENT_PROXY_ROOT
   latent_align: NWM_FINETUNE_LATENT_ROOT
+  latent_state_controller: NWM_FINETUNE_LATENT_ROOT (has a shared NAS default)
 EOF
 }
 
@@ -79,6 +80,7 @@ NWM_HF_HOME="${NWM_HF_HOME:-/file_system/nas/algorithm/dujun.nie/huggingface}"
 NWM_MODEL_CACHE="${NWM_MODEL_CACHE:-/file_system/nas/algorithm/dujun.nie/nwm/compact/cache/models}"
 VAE_MODEL_PATH="${VAE_MODEL_PATH:-}"
 DEFAULT_FINETUNE_VAE_LATENT_ROOT="/file_system/nas/algorithm/dujun.nie/nwm/compact/cache/vae_latents_sd_vae_ft_ema_224_four_datasets"
+DEFAULT_STATE_CONTROLLER_LATENT_ROOT="/file_system/nas/algorithm/dujun.nie/nwm/compact/cache/finetune_nav1_pixel_action_step100000_four_datasets"
 NWM_FINETUNE_VAE_LATENT_ROOT="${NWM_FINETUNE_VAE_LATENT_ROOT:-${DEFAULT_FINETUNE_VAE_LATENT_ROOT}}"
 export NWM_FINETUNE_VAE_LATENT_ROOT
 
@@ -116,7 +118,7 @@ case "${STAGE}" in
         ;;
     stage2)
         case "${VARIANT}" in
-            no_pretrain|latent_reset|latent_align|latent_real_to_latent|time_reset|geo_reset|idm_reset) ;;
+            no_pretrain|latent_reset|latent_align|latent_real_to_latent|latent_state_controller|time_reset|geo_reset|idm_reset) ;;
             *) echo "ERROR: unsupported stage-2 variant ${VARIANT}." >&2; exit 2 ;;
         esac
         ;;
@@ -125,6 +127,11 @@ case "${STAGE}" in
         exit 2
         ;;
 esac
+
+if [[ "${STAGE}" == "stage2" && "${VARIANT}" == "latent_state_controller" ]]; then
+    NWM_FINETUNE_LATENT_ROOT="${NWM_FINETUNE_LATENT_ROOT:-${DEFAULT_STATE_CONTROLLER_LATENT_ROOT}}"
+    export NWM_FINETUNE_LATENT_ROOT
+fi
 
 if [[ ! -r "${NWM_CONDA_ACTIVATE}" ]]; then
     echo "ERROR: conda activation script is not readable: ${NWM_CONDA_ACTIVATE}" >&2
@@ -300,7 +307,7 @@ if (( DRY_RUN == 0 )); then
                 exit 2
             fi
         done
-        if [[ "${VARIANT}" == "latent_align" ]]; then
+        if [[ "${VARIANT}" == "latent_align" || "${VARIANT}" == "latent_state_controller" ]]; then
             require_env NWM_FINETUNE_LATENT_ROOT
             canonicalize_existing_dir_env NWM_FINETUNE_LATENT_ROOT
         fi
@@ -366,6 +373,9 @@ if [[ -n "${GPU_LIST}" ]]; then
 fi
 if [[ "${STAGE}" == "stage2" ]]; then
     echo "Stage-2 VAE latent cache=${NWM_FINETUNE_VAE_LATENT_ROOT}"
+    if [[ "${VARIANT}" == "latent_align" || "${VARIANT}" == "latent_state_controller" ]]; then
+        echo "Stage-2 latent teacher cache=${NWM_FINETUNE_LATENT_ROOT}"
+    fi
 fi
 if (( DRY_RUN == 1 )); then
     printf 'Dry-run command:'

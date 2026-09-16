@@ -145,7 +145,9 @@ def plot_batch_final(
 def get_dataset_eval(config, dataset_name, predefined_index=True):
     data_config = config.dataset.datasets[dataset_name]
     if predefined_index:
-        predefined_index = f"data_splits/{dataset_name}/test/navigation_eval.pkl"
+        predefined_index = data_config.get(
+            "navigation_index", f"data_splits/{dataset_name}/test/navigation_eval.pkl"
+        )
     else:
         predefined_index = None
 
@@ -166,14 +168,25 @@ def get_dataset_eval(config, dataset_name, predefined_index=True):
         action_stats=config.dataset.action_stats,
         waypoint_spacing=data_config.metric_waypoint_spacing,
         predefined_index=predefined_index,
-        traj_names="rollout_traj_names.txt",
+        traj_names=data_config.get("navigation_traj_names", "rollout_traj_names.txt"),
     )
-
+    expected_count = data_config.get("navigation_sample_count", None)
+    if expected_count is not None and len(dataset) != int(expected_count):
+        raise ValueError(f"{dataset_name}: expected {expected_count} navigation windows, loaded {len(dataset)}")
     return dataset
 
 
 def repeat_along_first_dim(tensor, num_repeat):
     return repeat(tensor, "b ... -> (repeat b) ...", repeat=num_repeat)
+
+
+def seed_planning_sample(config, idxs):
+    """Make a resumed window independent of previously evaluated windows."""
+    base_seed = config.get("planning_sample_seed", None)
+    if base_seed is not None:
+        if len(idxs) != 1:
+            raise ValueError("Per-sample planning seeds require batch_size=1")
+        seed_everything(int(base_seed) + int(idxs.flatten()[0].item()))
 
 
 class WM_Planning_Evaluator:
@@ -801,6 +814,7 @@ class WM_Planning_Evaluator:
                     continue
 
                 obs_image = obs_image[:, -self.num_cond :]
+                seed_planning_sample(self.config, idxs)
                 with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
                     pred_actions, pred_yaw = self.generate_actions(
                         eval_save_output_dir,
@@ -910,7 +924,7 @@ def main(config: DictConfig):
     # Restore the original working directory
     os.chdir(get_original_cwd())
 
-    seed_everything(42)
+    seed_everything(int(config.seed))
 
     # Create evaluator instance with Hydra config
     evaluator = WM_Planning_Evaluator(config)

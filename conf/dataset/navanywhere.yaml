@@ -13,6 +13,16 @@ sampling_recipe:
   path: ${oc.env:NWM_NAVANYWHERE_RECIPE,null}
   sha256: null
 
+# Opt-in trajectory-disjoint Stage-1 validation. Defaults are inert so existing
+# configs do not start loading a validation split unless a launcher enables it.
+validation:
+  enabled: ${oc.decode:${oc.env:NWM_NAVANYWHERE_VAL_ENABLED,false}}
+  batches: 1
+  sampling_recipe:
+    path: ${oc.env:NWM_NAVANYWHERE_VAL_RECIPE,null}
+    sha256: null
+  proxy_root: ${oc.env:NWM_NAVANYWHERE_VAL_PROXY_ROOT,null}
+
 precomputed_latents:
   # Stage-1 launchers default to cached SD-VAE posterior statistics.  Tiny
   # tests and legacy pixel-debug runs may explicitly override this to false.
@@ -22,6 +32,9 @@ precomputed_latents:
   vae_identifier: stabilityai/sd-vae-ft-ema
   scaling_factor: 0.18215
   vae_encode_batch_size: 128
+  # Opt in only when a train/validation recipe is a frame-identical subset of
+  # an already validated cache. Exact recipe matching remains the default.
+  allow_recipe_subset: false
 
 # The proxy cache covers only local pairs, but goal sampling must retain the
 # original complete signed frame-offset range.

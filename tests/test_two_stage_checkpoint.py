@@ -39,6 +39,7 @@ from two_stage_training import (
     _periodic_checkpoint_due,
     _phase_progress_after_iteration,
     _prepare_loader,
+    _retained_stage1_checkpoint_path,
     _retained_stage2_checkpoint_path,
     _restore_completed_phase_rng,
     _save_training_checkpoint,
@@ -155,6 +156,41 @@ class Stage2CheckpointPublicationTests(unittest.TestCase):
         self.assertTrue(create.call_args_list[0].kwargs["is_train"])
         self.assertFalse(create.call_args_list[1].kwargs["is_train"])
 
+    def test_stage1_loader_builds_navanywhere_validation(self):
+        config = SimpleNamespace(training_stage="proxy_pretrain")
+        with mock.patch(
+            "data_utils.prepare_proxy_pretrain_dataset",
+            return_value="nav-train-dataset",
+        ), mock.patch(
+            "data_utils.prepare_proxy_pretrain_validation_dataset",
+            return_value="nav-eval-dataset",
+        ), mock.patch(
+            "two_stage_training.create_dataloader",
+            side_effect=[
+                ("train-loader", "train-sampler"),
+                ("nav-eval-loader", "nav-eval-sampler"),
+            ],
+        ) as create:
+            result = _prepare_loader(
+                config,
+                rank=2,
+                substage="pretrain",
+                include_eval=True,
+            )
+
+        self.assertEqual(
+            result,
+            (
+                "train-loader",
+                "train-sampler",
+                "nav-train-dataset",
+                "nav-eval-loader",
+                "nav-eval-dataset",
+            ),
+        )
+        self.assertEqual(create.call_count, 2)
+        self.assertFalse(create.call_args_list[1].kwargs["is_train"])
+
     def test_stage2_checkpoint_names_include_substage_steps(self):
         with tempfile.TemporaryDirectory() as directory:
             self.assertEqual(
@@ -173,10 +209,18 @@ class Stage2CheckpointPublicationTests(unittest.TestCase):
                 ).name,
                 "joint_0100000.pth.tar",
             )
+            self.assertEqual(
+                Path(
+                    _retained_stage1_checkpoint_path(directory, 10_000)
+                ).name,
+                "pretrain_0010000.pth.tar",
+            )
         with self.assertRaisesRegex(ValueError, "Unsupported"):
             _retained_stage2_checkpoint_path(".", "transition", 10_000)
         with self.assertRaisesRegex(ValueError, "non-negative"):
             _retained_stage2_checkpoint_path(".", "joint", -1)
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            _retained_stage1_checkpoint_path(".", -1)
 
     def test_stage2_periodicity_uses_substage_steps_and_leaves_final_save_once(
         self,
@@ -186,6 +230,15 @@ class Stage2CheckpointPublicationTests(unittest.TestCase):
                 training_stage="real_finetune",
                 current_steps=10,
                 global_steps=13,
+                target_steps=100,
+                interval=10,
+            )
+        )
+        self.assertFalse(
+            _periodic_checkpoint_due(
+                training_stage="proxy_pretrain",
+                current_steps=100,
+                global_steps=100,
                 target_steps=100,
                 interval=10,
             )
@@ -250,7 +303,7 @@ class Stage2CheckpointPublicationTests(unittest.TestCase):
                 [],
             )
 
-    def test_stage2_retains_numbered_file_and_stage1_keeps_latest_only(self):
+    def test_both_stages_retain_numbered_files_and_update_latest(self):
         stage2_config = OmegaConf.create(
             _config(
                 stage="real_finetune",
@@ -310,10 +363,14 @@ class Stage2CheckpointPublicationTests(unittest.TestCase):
                     include_optimizer=False,
                 )
             )
-            self.assertEqual(saved.name, "latest.pth.tar")
+            latest = Path(directory) / "latest.pth.tar"
+            self.assertEqual(saved.name, "pretrain_0010000.pth.tar")
             self.assertTrue(saved.is_file())
-            self.assertFalse(saved.is_symlink())
-            self.assertEqual(list(Path(directory).glob("pretrain_*.pth.tar")), [])
+            self.assertTrue(latest.is_symlink())
+            self.assertEqual(latest.resolve(), saved.resolve())
+            self.assertEqual(
+                list(Path(directory).glob("pretrain_*.pth.tar")), [saved]
+            )
 
 
 class InferenceContextValidationTests(unittest.TestCase):

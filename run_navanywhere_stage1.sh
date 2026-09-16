@@ -52,13 +52,18 @@ MAX_GPU_UTILIZATION="${MAX_GPU_UTILIZATION:-20}"
 MIN_FREE_GPU_MB="${MIN_FREE_GPU_MB:-30000}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
+MODEL_GENERATOR="${MODEL_GENERATOR:-cdit_b}"
 MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-200000}"
 LEARNING_RATE="${LEARNING_RATE:-1e-4}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
 LOG_EVERY="${LOG_EVERY:-50}"
-CKPT_EVERY="${CKPT_EVERY:-5000}"
+CKPT_EVERY="${CKPT_EVERY:-10000}"
+EVAL_EVERY="${EVAL_EVERY:-5000}"
+EVAL_AT_FIRST_STEP="${EVAL_AT_FIRST_STEP:-false}"
+EVAL_OFFLOAD_MODELS="${EVAL_OFFLOAD_MODELS:-false}"
 LATENT_LRU_SIZE="${LATENT_LRU_SIZE:-8}"
 USE_PRECOMPUTED_LATENTS="${USE_PRECOMPUTED_LATENTS:-true}"
+ALLOW_VAE_RECIPE_SUBSET="${ALLOW_VAE_RECIPE_SUBSET:-false}"
 RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-}"
 
 # W&B online logging is the default. WANDB_API_KEY or an existing login is
@@ -161,6 +166,23 @@ if [[ "${DRY_RUN}" != "1" ]]; then
             done
             ;;
     esac
+    if [[ "${NWM_NAVANYWHERE_VAL_ENABLED:-false}" == "true" ]]; then
+        if [[ ! -r "${NWM_NAVANYWHERE_VAL_RECIPE:-}" ]]; then
+            echo "ERROR: Stage-1 validation recipe is missing: ${NWM_NAVANYWHERE_VAL_RECIPE:-<unset>}" >&2
+            exit 2
+        fi
+        if [[ "${STAGE1_MODE}" == "latentpt" ]]; then
+            for marker in \
+                "${NWM_NAVANYWHERE_VAL_PROXY_ROOT:-}/metadata.json" \
+                "${NWM_NAVANYWHERE_VAL_PROXY_ROOT:-}/_SUCCESS.json"; do
+                if [[ ! -r "${marker}" ]]; then
+                    echo "ERROR: validation latent-action cache is incomplete: ${marker}" >&2
+                    echo "Run ./prepare_navanywhere_v1_stage1_xl.sh cache first." >&2
+                    exit 2
+                fi
+            done
+        fi
+    fi
     if ! command -v nvidia-smi >/dev/null 2>&1; then
         echo "ERROR: nvidia-smi is required for the capacity check." >&2
         exit 2
@@ -202,6 +224,7 @@ if [[ -f "${SAMPLING_RECIPE}" ]]; then
 else
     RECIPE_SHA256="dry-run-recipe-sha256"
 fi
+VAE_INPUT_TAG="$([[ "${USE_PRECOMPUTED_LATENTS}" == "true" ]] && echo precomputed-VAE || echo online-VAE)"
 LAUNCH_LOG="${LOG_DIR}/train_${STAGE1_MODE}_${RUN_TIMESTAMP}.log"
 if [[ "${DRY_RUN}" != "1" ]]; then
     exec > >(tee -a "${LAUNCH_LOG}") 2>&1
@@ -239,18 +262,29 @@ echo "  recipe:            ${SAMPLING_RECIPE}"
 echo "  recipe sha256:     ${RECIPE_SHA256}"
 echo "  VAE input:         $([[ "${USE_PRECOMPUTED_LATENTS}" == "true" ]] && echo precomputed-posterior || echo online-pixels)"
 echo "  VAE cache:         ${VAE_LATENT_ROOT}"
+if [[ "${STAGE1_MODE}" == "latentpt" ]]; then
+    echo "  latent cache:      ${LATENT_PROXY_ROOT}"
+fi
+if [[ "${NWM_NAVANYWHERE_VAL_ENABLED:-false}" == "true" ]]; then
+    echo "  validation recipe:${NWM_NAVANYWHERE_VAL_RECIPE:-<unset>}"
+    echo "  validation cache: ${NWM_NAVANYWHERE_VAL_PROXY_ROOT:-<unset>}"
+    echo "  evaluation:       step1=${EVAL_AT_FIRST_STEP}, every=${EVAL_EVERY} steps"
+fi
 echo "  GPUs/processes:    ${GPU_IDS} / ${NPROC}"
+echo "  generator:         ${MODEL_GENERATOR}"
 echo "  batch/GPU:         ${BATCH_SIZE}"
 echo "  max steps:         ${MAX_TRAIN_STEPS}"
 echo "  W&B:               ${WANDB_ENABLED} ${WANDB_MODE} ${WANDB_PROJECT}/${WANDB_RUN_NAME}"
 
 HYDRA_ARGS=(
+    "model/generator=${MODEL_GENERATOR}"
     "seed=${SAMPLING_SEED}"
     "dataset.sampling_recipe.path=${SAMPLING_RECIPE}"
     "dataset.sampling_recipe.sha256=${RECIPE_SHA256}"
     "dataset.precomputed_latents.enabled=${USE_PRECOMPUTED_LATENTS}"
     "dataset.precomputed_latents.root=${VAE_LATENT_ROOT}"
     "dataset.precomputed_latents.cache_size=${LATENT_LRU_SIZE}"
+    "dataset.precomputed_latents.allow_recipe_subset=${ALLOW_VAE_RECIPE_SUBSET}"
     "training.batch_size=${BATCH_SIZE}"
     "training.num_workers=${NUM_WORKERS}"
     "training.optimizer.lr=${LEARNING_RATE}"
@@ -260,12 +294,14 @@ HYDRA_ARGS=(
     "training.notes=\"${WANDB_NOTES}\""
     "training.wandb_enabled=${WANDB_ENABLED}"
     "training.wandb_project=${WANDB_PROJECT}"
-    "training.wandb_tags=[NavAnywhere,Stage1,${STAGE1_MODE},shared-recipe,precomputed-VAE]"
+    "training.wandb_tags=[NavAnywhere,Stage1,${STAGE1_MODE},shared-recipe,${VAE_INPUT_TAG}]"
     "model.tokenizer.model_path=${VAE_MODEL_PATH:-stabilityai/sd-vae-ft-ema}"
     "max_train_steps=${MAX_TRAIN_STEPS}"
     "log_every=${LOG_EVERY}"
     "ckpt_every=${CKPT_EVERY}"
-    "eval_at_first_step=false"
+    "eval_every=${EVAL_EVERY}"
+    "eval_at_first_step=${EVAL_AT_FIRST_STEP}"
+    "eval_offload_models=${EVAL_OFFLOAD_MODELS}"
     "log_cuda_memory=true"
     "bfloat16=1"
 )

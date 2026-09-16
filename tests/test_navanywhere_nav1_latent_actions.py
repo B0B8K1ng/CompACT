@@ -9,11 +9,14 @@ import torch
 
 from precompute_navanywhere_nav1_latent_actions import (
     EXPECTED_CHECKPOINT_CLASS,
+    SUPPORTED_CHECKPOINT_CLASSES,
     atomic_json_dump,
     atomic_torch_save,
     build_navanywhere_frame_pairs,
     build_planned_navanywhere_frame_pairs,
+    encode_dino_pair_batches,
     encode_pair_batches,
+    encode_pair_batches_streaming,
     position_pairs,
     safe_path,
     validate_checkpoint_metadata,
@@ -136,6 +139,96 @@ def test_encode_pair_batches_compact_frame_bank_matches_full_bank() -> None:
     assert torch.equal(compact, full)
 
 
+def test_streaming_pair_batches_match_full_bank_and_preserve_order() -> None:
+    frames = torch.arange(9, dtype=torch.float32).reshape(9, 1, 1, 1)
+    records = [(index, f"{index}.jpg") for index in range(len(frames))]
+    pairs = np.asarray(
+        [[8, 1], [3, 8], [1, 2], [4, 3], [8, 0], [2, 5], [0, 7]],
+        dtype=np.int64,
+    )
+
+    def load_frame(path, *, image_height, image_width):
+        assert (image_height, image_width) == (1, 1)
+        return frames[int(Path(path).stem)]
+
+    expected = encode_pair_batches(
+        _FakeAdapter(), frames, pairs, batch_size=2, precision="32"
+    )
+    actual, substitutions = encode_pair_batches_streaming(
+        _FakeAdapter(),
+        records,
+        pairs,
+        load_frame,
+        batch_size=2,
+        precision="32",
+        image_height=1,
+        image_width=1,
+        loader_threads=2,
+        pair_chunk_size=4,
+    )
+    assert substitutions == []
+    assert torch.equal(actual, expected)
+
+
+def test_dino_feature_once_encodes_each_referenced_frame_once() -> None:
+    frame_values = torch.arange(6, dtype=torch.float32).reshape(6, 1, 1, 1)
+    records = [(index, f"{index}.jpg") for index in range(len(frame_values))]
+    pairs = np.asarray(
+        [[2, 0], [2, 1], [3, 2], [2, 3], [3, 0], [2, 0]], dtype=np.int64
+    )
+
+    class FakeFeatureLAM:
+        mu_record = None
+
+        def encode(self, features: torch.Tensor) -> dict[str, torch.Tensor]:
+            values = features[:, 0, 0, 0] + 10 * features[:, 1, 0, 0]
+            z_mu = values[:, None].expand(-1, 32).contiguous()
+            self.mu_record = z_mu
+            return {"z_mu": z_mu}
+
+    class FakeDINOModel:
+        def __init__(self) -> None:
+            self.lam = FakeFeatureLAM()
+            self.seen: list[int] = []
+
+        def extract_dino_features(self, videos: torch.Tensor) -> torch.Tensor:
+            values = videos[:, :, 0, 0, 0]
+            self.seen.extend(int(value) for value in values.reshape(-1).tolist())
+            return values[:, :, None, None]
+
+    class FakeDINOAdapter:
+        device = torch.device("cpu")
+        checkpoint_metadata = {"hparams": {"lam_latent_dim": 32}}
+
+        def __init__(self) -> None:
+            self.model = FakeDINOModel()
+
+    def load_frame(path, *, image_height, image_width):
+        assert (image_height, image_width) == (1, 1)
+        return frame_values[int(Path(path).stem)]
+
+    adapter = FakeDINOAdapter()
+    actual, substitutions = encode_dino_pair_batches(
+        adapter,
+        records,
+        pairs,
+        load_frame,
+        precision="32",
+        image_height=1,
+        image_width=1,
+        loader_threads=2,
+        frame_batch_size=2,
+        lam_batch_size=3,
+    )
+    expected = encode_pair_batches(
+        _FakeAdapter(), frame_values, pairs, batch_size=3, precision="32"
+    )
+    assert substitutions == []
+    assert torch.equal(actual, expected)
+    assert adapter.model.seen == [0, 1, 2, 3]
+    assert adapter.model.lam.mu_record is None
+
+
 def test_resumable_chunks_preserve_batch_membership_and_pair_order() -> None:
     class BatchSensitiveAdapter(_FakeAdapter):
         def encode(self, videos):
@@ -207,7 +300,7 @@ def test_complete_saved_chunk_assembles_training_compatible_shard(tmp_path, monk
     assert torch.equal(result.proxy_action, motion[-1])
 
 
-def test_checkpoint_contract_rejects_non_pixel_action_model() -> None:
+def test_checkpoint_contract_accepts_pixel_models_and_rejects_other_models() -> None:
     metadata = {
         "class_path": EXPECTED_CHECKPOINT_CLASS,
         "global_step": 100000,
@@ -222,6 +315,15 @@ def test_checkpoint_contract_rejects_non_pixel_action_model() -> None:
     validate_checkpoint_metadata(
         metadata, image_height=240, image_width=320, max_abs_frame_offset=8
     )
+    for checkpoint_class in (
+        "lam.navigation_variants.PixelLAM",
+        "lam.navigation_variants.DINOFeatureLAM",
+    ):
+        metadata["class_path"] = checkpoint_class
+        assert metadata["class_path"] in SUPPORTED_CHECKPOINT_CLASSES
+        validate_checkpoint_metadata(
+            metadata, image_height=240, image_width=320, max_abs_frame_offset=8
+        )
     metadata["class_path"] = "lam.model.LAM"
     with pytest.raises(ValueError, match="checkpoint class"):
         validate_checkpoint_metadata(
