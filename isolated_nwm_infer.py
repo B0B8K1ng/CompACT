@@ -29,6 +29,10 @@ from train_utils import (
     validate_model_context_sizes,
 )
 from motion_condition import make_motion_group
+from scripts.benchmark_reproducibility import (
+    expand_sample_keys,
+    samplewise_noise_schedule,
+)
 
 
 def _uses_motion_condition(model):
@@ -58,21 +62,26 @@ def save_image(output_file, img):
 
 
 def get_dataset_eval(config, dataset_name, eval_type, predefined_index=True):
-    if dataset_name in config.dataset.datasets:
-        data_config = config.dataset.datasets[dataset_name]
-    elif dataset_name in config.evaluation_datasets:
+    # Explicit evaluation entries override experiment/training dataset entries.
+    # This keeps held-out split controls (for example a fixed 500-window index)
+    # from being shadowed by an older training config stored in a checkpoint run.
+    if dataset_name in config.evaluation_datasets:
         data_config = config.evaluation_datasets[dataset_name]
+    elif dataset_name in config.dataset.datasets:
+        data_config = config.dataset.datasets[dataset_name]
     else:
         raise KeyError(f"Unknown evaluation dataset: {dataset_name}")
-    if predefined_index:
-        predefined_index = f"data_splits/{dataset_name}/test/{eval_type}.pkl"
+    split_name = str(data_config.get("split_name", dataset_name))
+    loader_name = str(data_config.get("loader_name", dataset_name))
+    if predefined_index and bool(data_config.get("use_predefined_index", True)):
+        predefined_index = f"data_splits/{split_name}/test/{eval_type}.pkl"
     else:
         predefined_index = None
 
     dataset = EvalDataset(
         data_folder=data_config.data_folder,
         data_split_folder=data_config.test,
-        dataset_name=dataset_name,
+        dataset_name=loader_name,
         image_size=config.dataset.image_size,
         min_dist_cat=config.eval_distance.eval_min_dist_cat,
         max_dist_cat=config.eval_distance.eval_max_dist_cat,
@@ -87,13 +96,43 @@ def get_dataset_eval(config, dataset_name, eval_type, predefined_index=True):
         ),
         goals_per_obs=4,
         predefined_index=predefined_index,
-        traj_names="traj_names.txt",
+        traj_names=str(
+            data_config.get(
+                "rollout_traj_names" if eval_type == "rollout" else "traj_names",
+                "rollout_traj_names.txt" if eval_type == "rollout" else "traj_names.txt",
+            )
+        ),
         motion_condition_enabled=bool(
             config.get("motion_condition", {}).get("enabled", False)
         ),
+        wrap_delta_yaw=bool(data_config.get("wrap_delta_yaw", False)),
     )
 
     return dataset
+
+
+def resolve_time_horizons(config):
+    """Resolve and validate direct-prediction horizons without changing legacy defaults."""
+
+    configured = config.get("time_horizons_seconds")
+    if configured is None:
+        horizons = [2**index for index in range(int(config.num_sec_eval))]
+    else:
+        horizons = [int(value) for value in configured]
+        if any(float(value) != int(value) for value in configured):
+            raise ValueError("time_horizons_seconds must contain integer seconds")
+    if not horizons or any(value <= 0 for value in horizons):
+        raise ValueError("time_horizons_seconds must contain positive values")
+    if len(horizons) != len(set(horizons)) or horizons != sorted(horizons):
+        raise ValueError("time_horizons_seconds must be unique and increasing")
+    required_frames = horizons[-1] * int(config.input_fps)
+    if required_frames > int(config.eval_len_traj_pred):
+        raise ValueError(
+            "Direct-prediction horizon exceeds eval_len_traj_pred: "
+            f"{horizons[-1]}s * {config.input_fps}fps = {required_frames} frames, "
+            f"but eval_len_traj_pred={config.eval_len_traj_pred}"
+        )
+    return np.asarray(horizons, dtype=np.int64)
 
 
 @torch.no_grad()
@@ -111,6 +150,9 @@ def model_forward_wrapper(
     skip_tokenizer=False,
     motion=None,
     motion_type="real",
+    sample_keys=None,
+    noise_seed=0,
+    noise_stream="nwm",
 ):
     model, diffusion, tokenizer = all_models
     x = curr_obs.to(device)
@@ -141,7 +183,30 @@ def model_forward_wrapper(
             x = tokenizer.encode(x).unflatten(0, (B, T))
 
         x_cond = repeat(x[:, :num_cond], "b t ... -> (b g) t ...", g=num_goals)
-        z = torch.randn(B * num_goals, *x.shape[2:], device=device)
+        latent_shape = (model_batch, *x.shape[2:])
+        initial_noise = None
+        step_noises = None
+        if sample_keys is None:
+            # Keep the historical global RNG position for training/planning
+            # callers that have not opted into the benchmark noise contract.
+            torch.randn(*latent_shape, device=device)
+        else:
+            expanded_keys = expand_sample_keys(sample_keys, num_goals)
+            if len(expanded_keys) != model_batch:
+                raise ValueError(
+                    f"sample_keys expand to {len(expanded_keys)} rows, expected "
+                    f"B*num_goals={model_batch}"
+                )
+            noise_schedule = samplewise_noise_schedule(
+                expanded_keys,
+                x.shape[2:],
+                draws=diffusion.num_timesteps + 1,
+                base_seed=int(noise_seed),
+                stream=str(noise_stream),
+                device=device,
+            )
+            initial_noise = noise_schedule[0]
+            step_noises = noise_schedule[1:]
         if y is not None:
             if y.ndim == 3:
                 y = y.flatten(0, 1)
@@ -182,10 +247,12 @@ def model_forward_wrapper(
             model_kwargs = {"y": y, "x_cond": x_cond, "rel_t": rel_t}
         samples = diffusion.p_sample_loop(
             model.forward,
-            z.shape,
+            latent_shape,
+            noise=initial_noise,
             model_kwargs=model_kwargs,
             progress=progress,
             device=device,
+            step_noises=step_noises,
         )
 
         if not skip_tokenizer:
@@ -208,6 +275,7 @@ def generate_rollout_efficient(
     delta,
     num_cond,
     device,
+    dataset_name,
 ):
     """
     Efficient autoregressive rollout that operates in latent space.
@@ -251,6 +319,9 @@ def generate_rollout_efficient(
                 device=device,
                 motion_type="real",
                 skip_tokenizer=True,  # Work directly with latents
+                sample_keys=idxs,
+                noise_seed=config.seed,
+                noise_stream=f"{dataset_name}/rollout_{rollout_fps}fps/step={i}",
             )
 
             # Decode for visualization
@@ -276,6 +347,7 @@ def generate_rollout(
     delta,
     num_cond,
     device,
+    dataset_name,
 ):
     """
     Produce an autoregressive rollout video at a downsampled frame rate.
@@ -312,6 +384,9 @@ def generate_rollout(
                 num_goals=1,
                 device=device,
                 motion_type="real",
+                sample_keys=idxs,
+                noise_seed=config.seed,
+                noise_stream=f"{dataset_name}/rollout_{rollout_fps}fps/step={i}",
             )
 
         # model_forward_wrapper returns display-space pixels in [0, 1], while
@@ -346,6 +421,7 @@ def generate_time(
     secs,
     num_cond,
     device,
+    dataset_name,
 ):
     """
     Predict future *snapshots* at a list of absolute times given in seconds.
@@ -377,6 +453,9 @@ def generate_time(
                 num_goals=1,
                 device=device,
                 motion_type="real",
+                sample_keys=idxs,
+                noise_seed=config.seed,
+                noise_stream=f"{dataset_name}/time/{int(sec)}s",
             )
         visualize_preds(
             output_dir,
@@ -387,7 +466,7 @@ def generate_time(
 
 
 def visualize_preds(output_dir, idxs, sec, x_pred_pixels):
-    for batch_idx, sample_idx in enumerate(idxs.squeeze()):
+    for batch_idx, sample_idx in enumerate(idxs.reshape(-1)):
         sample_idx = int(sample_idx.item())
         sample_folder = os.path.join(output_dir, f"id_{sample_idx}")
         os.makedirs(sample_folder, exist_ok=True)
@@ -453,6 +532,17 @@ def main(config: DictConfig):
             logger.info("Experiment configuration merged with inference config")
     else:
         raise ValueError(f"Experiment directory {config.exp_dir} does not exist")
+
+    requested_diffusion_steps = config.get("eval_diffusion_steps")
+    if requested_diffusion_steps is not None:
+        requested_diffusion_steps = int(requested_diffusion_steps)
+        if requested_diffusion_steps <= 0:
+            raise ValueError("eval_diffusion_steps must be positive")
+        with open_dict(config):
+            config.model.diffusion.eval_timestep_respacing = requested_diffusion_steps
+        logger.info(
+            "Pinned evaluation diffusion steps to %d", requested_diffusion_steps
+        )
 
     validate_model_context_sizes(config, "eval_context_size")
 
@@ -535,15 +625,9 @@ def main(config: DictConfig):
                 sample_indices,
             )
 
-        if len(dataset_val) % num_tasks != 0:
-            logger.warning(
-                "Enabling distributed evaluation with an eval dataset not divisible by process number. "
-                "This will slightly alter validation results as extra duplicate entries are added to achieve "
-                "equal num of samples per-process."
-            )
-        sampler_val = torch.utils.data.DistributedSampler(
-            dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=False
-        )
+        # Exact strided sharding avoids DistributedSampler padding and works for
+        # every GPU count. Sample-keyed noise makes rank ownership irrelevant.
+        sampler_val = list(range(global_rank, len(dataset_val), num_tasks))
 
         curr_data_loader = torch.utils.data.DataLoader(
             dataset_val,
@@ -604,13 +688,11 @@ def main(config: DictConfig):
                             delta,
                             num_cond,
                             device,
+                            dataset_name,
                         )
 
                 elif config.eval_type == "time":
-                    # secs = [1, 2, 4, 8, 16] when num_sec_eval = 5
-                    # not sure why, but time is evaluated at exponent of 2 within +-16 seconds
-                    # (it is not randomly sampled within this range since it is using EvalDataset)
-                    secs = np.array([2**i for i in range(0, config.num_sec_eval)])
+                    secs = resolve_time_horizons(config)
                     curr_time_output_dir = os.path.join(dataset_save_output_dir, "time")
                     os.makedirs(curr_time_output_dir, exist_ok=True)
                     generate_time(
@@ -624,6 +706,7 @@ def main(config: DictConfig):
                         secs,
                         num_cond,
                         device,
+                        dataset_name,
                     )
                 else:
                     raise ValueError(

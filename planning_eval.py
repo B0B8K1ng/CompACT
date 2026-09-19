@@ -42,6 +42,7 @@ from evo.core.metrics import PoseRelation
 
 from datasets import TrajectoryEvalDataset
 from isolated_nwm_infer import model_forward_wrapper
+from scripts.benchmark_reproducibility import samplewise_randn
 from misc import (
     calculate_delta_yaw,
     get_action_torch,
@@ -142,11 +143,22 @@ def plot_batch_final(
     plt.close()
 
 
+def get_planning_data_config(config, dataset_name):
+    evaluation_datasets = config.get("evaluation_datasets", {})
+    if dataset_name in evaluation_datasets:
+        return evaluation_datasets[dataset_name]
+    if dataset_name in config.dataset.datasets:
+        return config.dataset.datasets[dataset_name]
+    raise KeyError(f"Unknown planning evaluation dataset: {dataset_name}")
+
+
 def get_dataset_eval(config, dataset_name, predefined_index=True):
-    data_config = config.dataset.datasets[dataset_name]
+    data_config = get_planning_data_config(config, dataset_name)
+    split_name = str(data_config.get("split_name", dataset_name))
+    loader_name = str(data_config.get("loader_name", dataset_name))
     if predefined_index:
         predefined_index = data_config.get(
-            "navigation_index", f"data_splits/{dataset_name}/test/navigation_eval.pkl"
+            "navigation_index", f"data_splits/{split_name}/test/navigation_eval.pkl"
         )
     else:
         predefined_index = None
@@ -154,7 +166,7 @@ def get_dataset_eval(config, dataset_name, predefined_index=True):
     dataset = TrajectoryEvalDataset(
         data_folder=data_config.data_folder,
         data_split_folder=data_config.test,
-        dataset_name=dataset_name,
+        dataset_name=loader_name,
         image_size=config.dataset.image_size,
         min_dist_cat=config.trajectory_eval_distance.min_dist_cat,
         max_dist_cat=config.trajectory_eval_distance.max_dist_cat,
@@ -416,8 +428,20 @@ class WM_Planning_Evaluator:
             for traj in range(n_evals):
                 traj_id = int(idxs.flatten()[traj].item())
                 logger.info(f"Trajectory {traj_id}")
+                candidate_keys = [
+                    f"{dataset_name}/navigation/sample={traj_id}/opt={i}/candidate={candidate}"
+                    for candidate in range(self.num_samples)
+                ]
                 sample = (
-                    torch.randn(self.num_samples, self.action_dim).to(self.device)
+                    samplewise_randn(
+                        candidate_keys,
+                        (self.action_dim,),
+                        base_seed=int(
+                            self.config.get("planning_sample_seed", self.config.seed)
+                        ),
+                        stream=f"{dataset_name}/navigation/candidates",
+                        device=self.device,
+                    )
                     * sigma[traj]
                     + mu[traj]
                 )
@@ -456,6 +480,11 @@ class WM_Planning_Evaluator:
                                     self.config.rollout_stride,
                                     only_final=True,
                                     return_codes=True,
+                                    sample_keys=candidate_keys[start:stop],
+                                    noise_stream=(
+                                        f"{dataset_name}/navigation/sample={traj_id}/"
+                                        f"opt={i}/repeat={r}"
+                                    ),
                                 )
                             )
                             preds = preds[:, -1]  # take the last predicted image
@@ -494,6 +523,14 @@ class WM_Planning_Evaluator:
                             self.config.rollout_stride,
                             only_final=True,
                             return_codes=True,
+                            sample_keys=[
+                                f"{key}/repeat={repeat_index}"
+                                for repeat_index in range(self.num_repeat_eval)
+                                for key in candidate_keys
+                            ],
+                            noise_stream=(
+                                f"{dataset_name}/navigation/sample={traj_id}/opt={i}"
+                            ),
                         )
                     )
                     preds = preds[:, -1]
@@ -551,6 +588,11 @@ class WM_Planning_Evaluator:
                 self.config.rollout_stride,
                 only_final=True,
                 return_codes=True,
+                sample_keys=[
+                    f"{dataset_name}/navigation/sample={int(value.item())}/final"
+                    for value in idxs.flatten()
+                ],
+                noise_stream=f"{dataset_name}/navigation/final",
             )
             preds = preds[:, -1]  # take the last predicted image
 
@@ -615,7 +657,9 @@ class WM_Planning_Evaluator:
         plot_name = os.path.join(image_plot_dir, f"idx{traj_id}_iter{i}_trajs.png")
         num_plot = self.config.num_samples
         log_viz_single(
-            self.config.dataset.datasets[dataset_name]["metric_waypoint_spacing"],
+            get_planning_data_config(self.config, dataset_name)[
+                "metric_waypoint_spacing"
+            ],
             cur_obs_image[0],
             cur_goal_image[0],
             preds[:num_plot],
@@ -665,8 +709,12 @@ class WM_Planning_Evaluator:
         rollout_stride,
         only_final=False,
         return_codes=False,
+        sample_keys=None,
+        noise_stream="navigation",
     ):
-        batch_size = 80  # batch size hardcoded, need to be configurable
+        batch_size = int(
+            self.config.get("planning_microbatch_size", None) or self.num_samples
+        )
         num_batches = obs_image.shape[0] // batch_size
 
         if num_batches * batch_size < obs_image.shape[0]:
@@ -678,6 +726,11 @@ class WM_Planning_Evaluator:
         for i in range(num_batches):
             batch_deltas = deltas[i * batch_size : (i + 1) * batch_size]
             batch_obs_image = obs_image[i * batch_size : (i + 1) * batch_size]
+            batch_sample_keys = (
+                None
+                if sample_keys is None
+                else sample_keys[i * batch_size : (i + 1) * batch_size]
+            )
 
             batch_deltas = batch_deltas.unflatten(1, (-1, rollout_stride)).sum(2)
             preds_latents = []
@@ -702,6 +755,11 @@ class WM_Planning_Evaluator:
                     device=self.device,
                     motion_type="real",
                     skip_tokenizer=True,
+                    sample_keys=batch_sample_keys,
+                    noise_seed=int(
+                        self.config.get("planning_sample_seed", self.config.seed)
+                    ),
+                    noise_stream=f"{noise_stream}/rollout_step={i}",
                 )
                 x_pred_latents = x_pred_latents.unsqueeze(1)
 

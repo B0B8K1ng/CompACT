@@ -23,16 +23,67 @@ ckp: "0100000"                  # Checkpoint ID to use
 # Evaluation settings
 seed: 0                            # Reproducible diffusion noise across checkpoints
 num_sec_eval: 5                 # Number of seconds for evaluation intervals
+time_horizons_seconds: [1,2,4,8,16]  # Explicit one-shot horizons; OOD protocol overrides to [4]
 input_fps: 4                    # Input frames per second
 datasets_to_eval: [recon,scand,sacson]           # Comma-separated list of dataset names
 evaluation_datasets:
+  recon:
+    data_folder: ${oc.env:NWM_DATA_ROOT}/recon
+    test: data_splits/recon/test/
+    metric_waypoint_spacing: 0.25
+  scand:
+    data_folder: ${oc.env:NWM_DATA_ROOT}/scand
+    test: data_splits/scand/test/
+    metric_waypoint_spacing: 0.38
+  huron:
+    # HuRoN is stored under the repository's historical SACSoN key.
+    data_folder: ${oc.env:NWM_DATA_ROOT}/sacson
+    test: data_splits/sacson/test/
+    split_name: sacson
+    loader_name: sacson
+    metric_waypoint_spacing: 0.255
+  tartan_drive:
+    data_folder: ${oc.env:NWM_DATA_ROOT}/tartan
+    test: data_splits/tartan_drive/test/
+    metric_waypoint_spacing: 0.72
   go_stanford:
     data_folder: ${oc.env:NWM_DATA_ROOT}/go_stanford
     test: data_splits/go_stanford/test/
     metric_waypoint_spacing: 0.12
+    rollout_traj_names: traj_names.txt
+  planetary_rover:
+    evaluation_only: true
+    data_folder: ${oc.env:NWM_DATA_ROOT}/planetary_rover
+    test: data_splits/planetary_rover/test/
+    metric_waypoint_spacing: 0.9741752833246042
+    wrap_delta_yaw: true
+    use_predefined_index: true
+    temporal_semantics: spatial_index
+  unitree_go2:
+    evaluation_only: true
+    data_folder: ${oc.env:NWM_DATA_ROOT}/unitree_go2
+    test: data_splits/unitree_go2/test/
+    metric_waypoint_spacing: 0.07610250112606785
+    wrap_delta_yaw: true
+    use_predefined_index: true
+  tum_rgbd:
+    evaluation_only: true
+    data_folder: ${oc.env:NWM_DATA_ROOT}/tum_rgbd
+    test: data_splits/tum_rgbd/test/
+    metric_waypoint_spacing: 0.05016063266653285
+    wrap_delta_yaw: true
+    use_predefined_index: true
+  uzh_fpv:
+    evaluation_only: true
+    data_folder: ${oc.env:NWM_DATA_ROOT}/uzh_fpv
+    test: data_splits/uzh_fpv/test/
+    metric_waypoint_spacing: 1.1438262345654386
+    wrap_delta_yaw: true
+    use_predefined_index: true
 num_workers: 8                  # Number of workers for data loading
 batch_size: 64                  # Batch size for inference
 pin_memory: true               # Disable when several large evaluation jobs share host memory
+eval_diffusion_steps: null      # Optional explicit DDPM step count for pinned protocols
 eval_type: null                 # Type of evaluation: 'time' or 'rollout'
 eval_sample_indices: null       # Optional fixed subset of positions in the predefined split
 eval_expected_full_count: null  # Optional guard on the predefined split before subsetting

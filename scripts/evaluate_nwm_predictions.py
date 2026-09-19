@@ -66,7 +66,24 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dreamsim-cache", type=Path, required=True)
     parser.add_argument("--fid", action="store_true")
+    parser.add_argument("--inference-backend")
+    parser.add_argument("--sampler")
+    parser.add_argument("--sampling-steps", type=int)
+    parser.add_argument("--seed", type=int)
     args = parser.parse_args()
+    inference_fields = (
+        args.inference_backend,
+        args.sampler,
+        args.sampling_steps,
+        args.seed,
+    )
+    if any(value is not None for value in inference_fields) and not all(
+        value is not None for value in inference_fields
+    ):
+        raise ValueError(
+            "inference provenance requires --inference-backend, --sampler, "
+            "--sampling-steps, and --seed together"
+        )
 
     gt_samples = sample_directories(args.gt_dir)
     pred_samples = sample_directories(args.pred_dir)
@@ -167,6 +184,13 @@ def main() -> None:
         },
         "metrics": metrics,
     }
+    if all(value is not None for value in inference_fields):
+        result["inference"] = {
+            "backend": args.inference_backend,
+            "sampler": args.sampler,
+            "sampling_steps": args.sampling_steps,
+            "seed": args.seed,
+        }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(result, indent=2))

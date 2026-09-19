@@ -17,7 +17,7 @@ from PIL import Image, ImageDraw, ImageFont
 DEFAULT_BENCHMARK_ROOT = Path(
     "/file_system/nas/algorithm/dujun.nie/nwm/results/nwm_benchmark"
 )
-DEFAULT_PROTOCOL = "go_stanford_unseen_rollout_10_v1"
+DEFAULT_PROTOCOL = "go_stanford_unseen_rollout_v1"
 HORIZONS = (1, 2, 4, 8, 16)
 BACKGROUND = (20, 23, 29)
 LABEL = (242, 244, 248)

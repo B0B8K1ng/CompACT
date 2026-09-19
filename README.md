@@ -163,8 +163,8 @@ scripts/run_nwm_benchmark.sh \
   --tasks unseen,navigation \
   --gpus 0,1,2,3
 
-# Run the standardized Go Stanford autoregressive rollout benchmark and
-# render GT/models side by side. This protocol intentionally requires 2 GPUs.
+# Run the standardized full Go Stanford autoregressive rollout benchmark and
+# render GT/models side by side. Any positive GPU count is supported.
 scripts/run_nwm_benchmark.sh \
   --models nwm-real,nwm-timept-ft \
   --tasks unseen_rollout \
@@ -184,17 +184,16 @@ The canonical outputs are:
 
 - `/file_system/nas/algorithm/dujun.nie/nwm/results/nwm_benchmark/benchmark_results.json`
 - `/file_system/nas/algorithm/dujun.nie/nwm/results/nwm_benchmark/benchmark_results.md`
-- `/file_system/nas/algorithm/dujun.nie/nwm/results/nwm_benchmark/visualizations/go_stanford_unseen_rollout_10_v1/`
+- `/file_system/nas/algorithm/dujun.nie/nwm/results/nwm_benchmark/visualizations/go_stanford_unseen_rollout_v1/`
 
-`unseen_rollout` uses `go_stanford_unseen_rollout_10_v1`: the first ten entries
-of the 150-sample Go Stanford `rollout.pkl`. Both the parent split SHA-256 and
-the selected-entry SHA-256 are recorded in the registry. The ten entries are
-ten distinct trajectories. The protocol keeps 1 fps and 4 fps autoregressive
-rollouts, 16 seconds, 250 diffusion steps, seed 0, two GPUs, and batch size 64
-per GPU. It scores and visualizes all ten trajectory IDs at
-1/2/4/8/16-second horizons for every model. Prediction artifacts live under
-`protocol_runs/go_stanford_unseen_rollout_10_v1`, isolated from the archived
-150-sample `go_stanford_unseen_rollout_v1` results. To compare a newly
+`unseen_rollout` uses all 150 fixed entries in the Go Stanford `rollout.pkl`.
+The split SHA-256 is recorded in the registry. The protocol keeps 1 fps and
+4 fps autoregressive rollouts, 16 seconds, 250 DDPM steps for NWM (50 Euler
+steps for RAE-NWM), and seed 0. Exact strided sharding plus sample-ID keyed
+randomness makes results independent of GPU count and batch partitioning up to
+floating-point error. It scores all 150 samples at 1/2/4/8/16-second horizons
+and visualizes eight fixed IDs. Prediction artifacts live under
+`protocol_runs/go_stanford_unseen_rollout_v1`. To compare a newly
 registered model, include it together with the desired baselines in `--models`;
 completed baseline audits are reused and one new side-by-side visualization set
 is made.

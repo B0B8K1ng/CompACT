@@ -64,3 +64,15 @@ datasets:
     test: data_splits/go_stanford/test/
     goals_per_obs: 4
     metric_waypoint_spacing: 0.12
+  planetary_rover:
+    # Real NASA/CLEP Mars + Moon imagery. This source is test-only and must
+    # remain disabled for every training/precompute selection.
+    enabled: false
+    evaluation_only: true
+    data_folder: ${oc.env:NWM_DATA_ROOT}/planetary_rover
+    test: data_splits/planetary_rover/test/
+    goals_per_obs: 4
+    metric_waypoint_spacing: 0.9741752833246042
+    wrap_delta_yaw: true
+    use_predefined_index: false
+    temporal_semantics: spatial_index

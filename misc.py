@@ -238,10 +238,16 @@ def angle_difference(theta1, theta2):
     return delta_theta
 
 
-def get_delta_np(actions):
+def get_delta_np(actions, wrap_yaw=False):
     # append zeros to first action (unbatched)
     ex_actions = np.concatenate((np.zeros((1, actions.shape[1])), actions), axis=0)
     delta = ex_actions[1:] - ex_actions[:-1]
+    if wrap_yaw:
+        if delta.ndim != 2 or delta.shape[1] < 3:
+            raise ValueError(
+                "Wrapped yaw deltas require unbatched [..., x, y, yaw] actions"
+            )
+        delta[:, 2] = angle_difference(0.0, delta[:, 2])
 
     return delta
 

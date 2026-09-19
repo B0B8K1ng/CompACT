@@ -1065,6 +1065,7 @@ class EvalDataset(BaseDataset):
         predefined_index: list = None,
         goals_per_obs: int = 1,
         motion_condition_enabled: bool = False,
+        wrap_delta_yaw: bool = False,
     ):
         super().__init__(
             data_folder,
@@ -1085,6 +1086,7 @@ class EvalDataset(BaseDataset):
             goals_per_obs,
         )
         self.motion_condition_enabled = bool(motion_condition_enabled)
+        self.wrap_delta_yaw = bool(wrap_delta_yaw)
 
     def __getitem__(self, i: int) -> Tuple[torch.Tensor]:
         try:
@@ -1123,7 +1125,7 @@ class EvalDataset(BaseDataset):
             # historical pre-normalized action contract.
             if not self.motion_condition_enabled:
                 actions[:, :2] = normalize_data(actions[:, :2], self.ACTION_STATS)
-            delta = get_delta_np(actions)
+            delta = get_delta_np(actions, wrap_yaw=self.wrap_delta_yaw)
 
             return (
                 torch.tensor([i], dtype=torch.float32),  # for logging purposes

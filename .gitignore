@@ -4,6 +4,7 @@ diffusion/__pycache__
 logs
 .vscode
 .venv-vggt-omega/
+third_party/raenwm/
 .ipynb_checkpoints
 models
 nwm/data

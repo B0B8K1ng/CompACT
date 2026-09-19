@@ -24,6 +24,76 @@ save_preds: false              # Whether to save prediction tensors
 num_workers: 12                 # Number of workers for data loading
 batch_size: 1                 # Batch size for planning evaluation
 
+# Evaluation-only datasets override any training dataset entry stored in the
+# checkpoint config. Every OOD navigation split is fixed to 100 real-pose windows.
+evaluation_datasets:
+  recon:
+    data_folder: ${oc.env:NWM_DATA_ROOT}/recon
+    test: data_splits/recon/test/
+    metric_waypoint_spacing: 0.25
+    navigation_index: data_splits/recon/test/navigation_eval.pkl
+    navigation_traj_names: rollout_traj_names.txt
+    navigation_sample_count: 100
+  scand:
+    data_folder: ${oc.env:NWM_DATA_ROOT}/scand
+    test: data_splits/scand/test/
+    metric_waypoint_spacing: 0.38
+    navigation_index: data_splits/scand/test/navigation_eval.pkl
+    navigation_traj_names: rollout_traj_names.txt
+    navigation_sample_count: 100
+  huron:
+    data_folder: ${oc.env:NWM_DATA_ROOT}/sacson
+    test: data_splits/sacson/test/
+    split_name: sacson
+    loader_name: sacson
+    metric_waypoint_spacing: 0.255
+    navigation_index: data_splits/sacson/test/navigation_eval.pkl
+    navigation_traj_names: rollout_traj_names.txt
+    navigation_sample_count: 100
+  tartan_drive:
+    data_folder: ${oc.env:NWM_DATA_ROOT}/tartan
+    test: data_splits/tartan_drive/test/
+    metric_waypoint_spacing: 0.72
+    navigation_index: data_splits/tartan_drive/test/navigation_eval.pkl
+    navigation_traj_names: rollout_traj_names.txt
+    navigation_sample_count: 100
+  go_stanford:
+    data_folder: ${oc.env:NWM_DATA_ROOT}/go_stanford
+    test: data_splits/go_stanford/test/
+    metric_waypoint_spacing: 0.12
+    navigation_index: data_splits/go_stanford/test/navigation_eval.pkl
+    navigation_traj_names: traj_names.txt
+    navigation_sample_count: 100
+  planetary_rover:
+    data_folder: ${oc.env:NWM_DATA_ROOT}/planetary_rover
+    test: data_splits/planetary_rover/test/
+    metric_waypoint_spacing: 0.9741752833246042
+    navigation_index: data_splits/planetary_rover/test/navigation_eval.pkl
+    navigation_traj_names: rollout_traj_names.txt
+    navigation_sample_count: 100
+    temporal_semantics: spatial_index
+  unitree_go2:
+    data_folder: ${oc.env:NWM_DATA_ROOT}/unitree_go2
+    test: data_splits/unitree_go2/test/
+    metric_waypoint_spacing: 0.07610250112606785
+    navigation_index: data_splits/unitree_go2/test/navigation_eval.pkl
+    navigation_traj_names: rollout_traj_names.txt
+    navigation_sample_count: 100
+  tum_rgbd:
+    data_folder: ${oc.env:NWM_DATA_ROOT}/tum_rgbd
+    test: data_splits/tum_rgbd/test/
+    metric_waypoint_spacing: 0.05016063266653285
+    navigation_index: data_splits/tum_rgbd/test/navigation_eval.pkl
+    navigation_traj_names: rollout_traj_names.txt
+    navigation_sample_count: 100
+  uzh_fpv:
+    data_folder: ${oc.env:NWM_DATA_ROOT}/uzh_fpv
+    test: data_splits/uzh_fpv/test/
+    metric_waypoint_spacing: 1.1438262345654386
+    navigation_index: data_splits/uzh_fpv/test/navigation_eval.pkl
+    navigation_traj_names: rollout_traj_names.txt
+    navigation_sample_count: 100
+
 # Planning specific settings
 num_samples: 80                # Number of sampled trajectories
 planning_microbatch_size: null # Optional candidate chunk size; null evaluates all candidates together
@@ -64,6 +134,12 @@ plan_datasets_hyperparams:
     var_scale: [0.07, 0.1, 0.1]
   go_stanford:
     metric_waypoint_spacing: 0.12
-  sacson:
+  huron:
     mu: [-0.33, 0, 0]
     var_scale: [0.03, 0.1, 0.1]
+  planetary_rover: &ood_plan_distribution
+    mu: [-0.1, 0, 0]
+    var_scale: [0.1, 0.15, 0.1]
+  unitree_go2: *ood_plan_distribution
+  tum_rgbd: *ood_plan_distribution
+  uzh_fpv: *ood_plan_distribution

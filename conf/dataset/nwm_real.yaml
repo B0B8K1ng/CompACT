@@ -63,3 +63,14 @@ datasets:
     test: data_splits/go_stanford/test/
     goals_per_obs: 4
     metric_waypoint_spacing: 0.12
+  planetary_rover:
+    # Held-out real planetary data; never include it in NWM-real training.
+    enabled: false
+    evaluation_only: true
+    data_folder: ${oc.env:NWM_DATA_ROOT}/planetary_rover
+    test: data_splits/planetary_rover/test/
+    goals_per_obs: 4
+    metric_waypoint_spacing: 0.9741752833246042
+    wrap_delta_yaw: true
+    use_predefined_index: false
+    temporal_semantics: spatial_index

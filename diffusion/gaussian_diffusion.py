@@ -406,6 +406,7 @@ class GaussianDiffusion:
         denoised_fn=None,
         cond_fn=None,
         model_kwargs=None,
+        noise=None,
     ):
         """
         Sample x_{t-1} from the model at the given timestep.
@@ -431,7 +432,13 @@ class GaussianDiffusion:
             denoised_fn=denoised_fn,
             model_kwargs=model_kwargs,
         )
-        noise = th.randn_like(x)
+        if noise is None:
+            noise = th.randn_like(x)
+        elif noise.shape != x.shape:
+            raise ValueError(
+                f"DDPM step noise must have shape {tuple(x.shape)}, got "
+                f"{tuple(noise.shape)}"
+            )
         nonzero_mask = (
             (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
         )  # no noise when t == 0
@@ -453,6 +460,7 @@ class GaussianDiffusion:
         model_kwargs=None,
         device=None,
         progress=False,
+        step_noises=None,
     ):
         """
         Generate samples from the model.
@@ -483,6 +491,7 @@ class GaussianDiffusion:
             model_kwargs=model_kwargs,
             device=device,
             progress=progress,
+            step_noises=step_noises,
         ):
             final = sample
         return final["sample"]
@@ -498,6 +507,7 @@ class GaussianDiffusion:
         model_kwargs=None,
         device=None,
         progress=False,
+        step_noises=None,
     ):
         """
         Generate samples from the model and yield intermediate samples from
@@ -515,13 +525,26 @@ class GaussianDiffusion:
             img = th.randn(*shape, device=device)
         indices = list(range(self.num_timesteps))[::-1]
 
+        if step_noises is not None:
+            if len(step_noises) != self.num_timesteps:
+                raise ValueError(
+                    "DDPM noise schedule length must equal num_timesteps: "
+                    f"{len(step_noises)} != {self.num_timesteps}"
+                )
+            expected_shape = tuple(shape)
+            if any(tuple(value.shape) != expected_shape for value in step_noises):
+                raise ValueError(
+                    "Every DDPM step noise tensor must have shape "
+                    f"{expected_shape}"
+                )
+
         if progress:
             # Lazy import so that we don't depend on tqdm.
             from tqdm.auto import tqdm
 
             indices = tqdm(indices)
 
-        for i in indices:
+        for step_index, i in enumerate(indices):
             t = th.tensor([i] * shape[0], device=device)
             with th.no_grad():
                 out = self.p_sample(
@@ -532,6 +555,9 @@ class GaussianDiffusion:
                     denoised_fn=denoised_fn,
                     cond_fn=cond_fn,
                     model_kwargs=model_kwargs,
+                    noise=(
+                        None if step_noises is None else step_noises[step_index]
+                    ),
                 )
                 yield out
                 img = out["sample"]
