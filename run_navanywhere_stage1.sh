@@ -2,12 +2,13 @@
 set -euo pipefail
 
 # One configurable entry point for TimePT (default), GeoPT, IDMPT, and
-# LatentPT.  All modes consume the same immutable sampling recipe.
+# LatentPT, and LatentOnlyPT. All modes consume the same immutable sampling
+# recipe.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_PATH="${SCRIPT_DIR}/$(basename -- "${BASH_SOURCE[0]}")"
 cd "${SCRIPT_DIR}"
 
-STAGE1_MODE="${STAGE1_MODE:-timept}" # timept | geopt | idmpt | latentpt
+STAGE1_MODE="${STAGE1_MODE:-timept}" # timept | geopt | idmpt | latentpt | latentonlypt
 DRY_RUN="${DRY_RUN:-0}"
 DETACH="${DETACH:-0}"
 RUN_TIMESTAMP="${RUN_TIMESTAMP:-$(date -u +%Y%m%d_%H%M%S)}"
@@ -31,8 +32,8 @@ if [[ "${DETACH}" == "1" && "${RUN_UNDER_CODEX_EXP:-0}" != "1" ]]; then
 fi
 
 case "${STAGE1_MODE}" in
-    timept|geopt|idmpt|latentpt) ;;
-    *) echo "ERROR: STAGE1_MODE must be timept, geopt, idmpt, or latentpt." >&2; exit 2 ;;
+    timept|geopt|idmpt|latentpt|latentonlypt) ;;
+    *) echo "ERROR: STAGE1_MODE must be timept, geopt, idmpt, latentpt, or latentonlypt." >&2; exit 2 ;;
 esac
 
 # ---- Frequently edited experiment settings ---------------------------------
@@ -156,7 +157,7 @@ if [[ "${DRY_RUN}" != "1" ]]; then
             done
             ;;
         idmpt) [[ -d "${IDM_PROXY_ROOT}" ]] || { echo "ERROR: ${IDM_PROXY_ROOT} missing" >&2; exit 2; } ;;
-        latentpt)
+        latentpt|latentonlypt)
             for marker in "${LATENT_PROXY_ROOT}/metadata.json" "${LATENT_PROXY_ROOT}/_SUCCESS.json"; do
                 if [[ ! -r "${marker}" ]]; then
                     echo "ERROR: precomputed nav1 latent-action cache is incomplete: ${marker}" >&2
@@ -171,7 +172,7 @@ if [[ "${DRY_RUN}" != "1" ]]; then
             echo "ERROR: Stage-1 validation recipe is missing: ${NWM_NAVANYWHERE_VAL_RECIPE:-<unset>}" >&2
             exit 2
         fi
-        if [[ "${STAGE1_MODE}" == "latentpt" ]]; then
+        if [[ "${STAGE1_MODE}" == "latentpt" || "${STAGE1_MODE}" == "latentonlypt" ]]; then
             for marker in \
                 "${NWM_NAVANYWHERE_VAL_PROXY_ROOT:-}/metadata.json" \
                 "${NWM_NAVANYWHERE_VAL_PROXY_ROOT:-}/_SUCCESS.json"; do
@@ -262,7 +263,7 @@ echo "  recipe:            ${SAMPLING_RECIPE}"
 echo "  recipe sha256:     ${RECIPE_SHA256}"
 echo "  VAE input:         $([[ "${USE_PRECOMPUTED_LATENTS}" == "true" ]] && echo precomputed-posterior || echo online-pixels)"
 echo "  VAE cache:         ${VAE_LATENT_ROOT}"
-if [[ "${STAGE1_MODE}" == "latentpt" ]]; then
+if [[ "${STAGE1_MODE}" == "latentpt" || "${STAGE1_MODE}" == "latentonlypt" ]]; then
     echo "  latent cache:      ${LATENT_PROXY_ROOT}"
 fi
 if [[ "${NWM_NAVANYWHERE_VAL_ENABLED:-false}" == "true" ]]; then

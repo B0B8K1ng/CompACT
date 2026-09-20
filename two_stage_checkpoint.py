@@ -595,6 +595,9 @@ def build_checkpoint_metadata(
         "proxy_type": proxy_type,
         "proxy_dim": _proxy_dim(config, action_mode, model),
         "proxy_max_abs_frame_offset": int(max_abs_frame_offset),
+        "proxy_relative_time_mode": str(
+            _get(proxy, "relative_time_mode", "always")
+        ).strip().lower(),
         "latent_dim": _latent_dim(config, model),
         "latent_normalization": _latent_normalization(config),
         "finetune_scheme": scheme,
@@ -895,6 +898,15 @@ def validate_resume_checkpoint(
             "proxy_max_abs_frame_offset",
             source.get("proxy_max_abs_frame_offset"),
             int(expected_window),
+            required=True,
+        )
+        expected_relative_time_mode = str(
+            _get(proxy, "relative_time_mode", "always")
+        ).strip().lower()
+        _assert_same(
+            "proxy_relative_time_mode",
+            source.get("proxy_relative_time_mode", "always"),
+            expected_relative_time_mode,
             required=True,
         )
         expected_proxy_dim = _proxy_dim(config, expected_proxy_type, model)

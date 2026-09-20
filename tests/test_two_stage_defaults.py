@@ -11,6 +11,8 @@ from unittest import mock
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 
+from two_stage_nwm import validate_two_stage_config
+
 
 ROOT = Path(__file__).resolve().parents[1]
 STAGE2_VARIANTS = (
@@ -38,6 +40,18 @@ DEFAULT_DREAMSIM_CACHE = Path(
 
 
 class Stage2DefaultTests(unittest.TestCase):
+    def test_latentonlypt_overlay_uses_relative_time_only_as_fallback(self):
+        with initialize_config_dir(config_dir=str(ROOT / "conf"), version_base=None):
+            config = compose(config_name="nwm", overrides=["two_stage=latentonlypt"])
+        self.assertEqual(config.training_stage, "proxy_pretrain")
+        self.assertEqual(config.action_mode, "latent")
+        self.assertEqual(config.proxy.relative_time_mode, "fallback")
+        self.assertEqual(config.proxy.max_abs_frame_offset, 8)
+        self.assertEqual(
+            validate_two_stage_config(config),
+            ("proxy_pretrain", "latent", None),
+        )
+
     def test_navanywhere_stage1_validation_is_opt_in(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             with initialize_config_dir(config_dir=str(ROOT / "conf"), version_base=None):

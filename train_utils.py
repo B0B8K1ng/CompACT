@@ -148,6 +148,9 @@ def setup_model(config: DictConfig, device: torch.device):
             model_kwargs.update(
                 training_stage=training_stage,
                 action_mode=str(config.get("action_mode", "none")),
+                proxy_relative_time_mode=str(
+                    config.get("proxy", {}).get("relative_time_mode", "always")
+                ),
                 finetune=config.get("finetune", None),
             )
     model = instantiate(

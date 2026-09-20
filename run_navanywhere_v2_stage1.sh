@@ -34,7 +34,7 @@ export VAE_LATENT_ROOT="${VAE_LATENT_ROOT:-${COMPACT_ROOT}/cache/navanywhere_v2_
 for required in "${SAMPLING_RECIPE}" "${NWM_NAVANYWHERE_VAL_RECIPE}"; do
     [[ -r "${required}" ]] || { echo "ERROR: recipe is missing: ${required}" >&2; exit 2; }
 done
-if [[ "${DRY_RUN:-0}" != "1" && "${STAGE1_MODE}" == "latentpt" ]]; then
+if [[ "${DRY_RUN:-0}" != "1" && ( "${STAGE1_MODE}" == "latentpt" || "${STAGE1_MODE}" == "latentonlypt" ) ]]; then
     for cache_root in "${LATENT_PROXY_ROOT}" "${NWM_NAVANYWHERE_VAL_PROXY_ROOT}"; do
         for marker in metadata.json _SUCCESS.json; do
             [[ -r "${cache_root}/${marker}" ]] || {

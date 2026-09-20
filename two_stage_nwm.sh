@@ -7,7 +7,7 @@ cd "${SCRIPT_DIR}"
 show_help() {
     cat <<'EOF'
 Usage:
-  ./two_stage_nwm.sh stage1 {timept|geopt|idmpt|latentpt} [options] [-- HYDRA_OVERRIDES...]
+  ./two_stage_nwm.sh stage1 {timept|geopt|idmpt|latentpt|latentonlypt} [options] [-- HYDRA_OVERRIDES...]
   ./two_stage_nwm.sh stage2 {no_pretrain|latent_reset|latent_align|latent_real_to_latent|latent_state_controller|time_reset|geo_reset|idm_reset} [options] [-- HYDRA_OVERRIDES...]
 
 Options:
@@ -43,7 +43,7 @@ Optional stage-1 split selection:
 Additional cache environment:
   geopt:        NWM_GEOMETRY_PROXY_ROOT
   idmpt:        NWM_IDM_PROXY_ROOT
-  latentpt:     NWM_LATENT_PROXY_ROOT
+  latentpt/latentonlypt: NWM_LATENT_PROXY_ROOT
   latent_align: NWM_FINETUNE_LATENT_ROOT
   latent_state_controller: NWM_FINETUNE_LATENT_ROOT (has a shared NAS default)
 EOF
@@ -112,7 +112,7 @@ done
 case "${STAGE}" in
     stage1)
         case "${VARIANT}" in
-            timept|geopt|idmpt|latentpt) ;;
+            timept|geopt|idmpt|latentpt|latentonlypt) ;;
             *) echo "ERROR: unsupported stage-1 variant ${VARIANT}." >&2; exit 2 ;;
         esac
         ;;
@@ -291,7 +291,7 @@ if (( DRY_RUN == 0 )); then
                 require_env NWM_IDM_PROXY_ROOT
                 canonicalize_existing_dir_env NWM_IDM_PROXY_ROOT
                 ;;
-            latentpt)
+            latentpt|latentonlypt)
                 require_env NWM_LATENT_PROXY_ROOT
                 canonicalize_existing_dir_env NWM_LATENT_PROXY_ROOT
                 ;;

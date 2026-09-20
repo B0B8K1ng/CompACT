@@ -122,12 +122,14 @@ def _config(
     training_stage: str,
     action_mode: str,
     scheme: str = "reset",
+    relative_time_mode: str = "always",
 ):
     proxy_type = action_mode if training_stage == "proxy_pretrain" else "latent"
     proxy = {
         "type": proxy_type,
         "max_abs_frame_offset": 8,
         "use_precomputed_only": True,
+        "relative_time_mode": relative_time_mode,
     }
     if proxy_type != "none":
         proxy["dim"] = 4
@@ -185,6 +187,7 @@ def _model(config, *, open_zero_gates: bool = True) -> CDiT:
         motion_condition=MOTION_CONFIG,
         training_stage=str(config.training_stage),
         action_mode=str(config.action_mode),
+        proxy_relative_time_mode=str(config.proxy.relative_time_mode),
         finetune=OmegaConf.to_container(config.finetune, resolve=True),
     ).to(SMOKE_DEVICE)
     if open_zero_gates:
@@ -473,6 +476,37 @@ class TwoStageProductionSmokeTests(unittest.TestCase):
             self.assertEqual(int(proxy["frame_offset"].abs().max()), 64)
             self.assertTrue(bool(torch.isfinite(logs["loss"])))
         self.assertTrue(_any_changed(before, model))
+
+    def test_latentonlypt_two_steps_mix_local_latent_and_long_range_time(self):
+        config = _config(
+            training_stage="proxy_pretrain",
+            action_mode="latent",
+            relative_time_mode="fallback",
+        )
+        model = _model(config)
+        self.assertEqual(model.proxy_relative_time_mode, "fallback")
+        ema = _ema(model)
+        optimizer = _optimizer(
+            model,
+            training_stage="proxy_pretrain",
+            action_mode="latent",
+            scheme=None,
+            substage=None,
+        )
+        logs, proxy = _step(
+            model=model,
+            ema=ema,
+            diffusion=_diffusion(),
+            optimizer=optimizer,
+            batch=_batch(),
+            config=config,
+            scheme=None,
+            substage=None,
+            check_gradients=False,
+        )
+        expected = torch.tensor([True, False, True, False])
+        self.assertTrue(torch.equal(proxy["used"].cpu(), expected))
+        self.assertTrue(bool(torch.isfinite(logs["loss"])))
 
     def _run_finetune_pair(self, scheme: str):
         config = _config(

@@ -40,6 +40,7 @@ sampling range.
 | `geopt` | `geometry` | time condition plus an eligible cached geometry proxy |
 | `idmpt` | `idm` | time condition plus an eligible cached IDM proxy |
 | `latentpt` | `latent` | time condition plus an eligible cached DreamDojo latent |
+| `latentonlypt` | `latent` | eligible cached DreamDojo latent only; time fallback otherwise |
 
 HybridPT and ShuffledPT are not part of this workflow.
 
@@ -66,6 +67,21 @@ if proxy_valid:
     c += proxy_encoder(proxy_action)
 prediction = NWM(noisy_target, context, c)
 ```
+
+`latentonlypt` changes only the relative-time/action composition. The diffusion
+timestep embedding is always retained because it identifies the diffusion noise
+level. For each flattened target row it computes:
+
+```text
+if abs(frame_offset) <= 8 and latent_valid:
+    c = diffusion_timestep_embedding(diffusion_t) + latent_encoder(latent_action)
+else:
+    c = diffusion_timestep_embedding(diffusion_t) + relative_time_embedding(rel_t)
+```
+
+Thus local valid rows do not receive relative time, while long-range rows and
+local cache misses remain time-conditioned. `proxy.relative_time_mode=fallback`
+records this identity in checkpoint metadata; regular `latentpt` uses `always`.
 
 The eligibility test always uses the original signed integer `frame_offset`,
 never normalized `rel_t`.
@@ -217,6 +233,7 @@ Stage 1:
 - `conf/two_stage/geopt.yaml`
 - `conf/two_stage/idmpt.yaml`
 - `conf/two_stage/latentpt.yaml`
+- `conf/two_stage/latentonlypt.yaml`
 
 Stage 2:
 
@@ -285,6 +302,7 @@ export NWM_LATENT_PROXY_ROOT=/path/to/proxy-cache/dreamdojo-latent
 conda run -n "${NWM_CONDA_ENV}" ./two_stage_nwm.sh stage1 geopt --gpus=0,1,2,3 --nproc=4
 conda run -n "${NWM_CONDA_ENV}" ./two_stage_nwm.sh stage1 idmpt --gpus=0,1,2,3 --nproc=4
 conda run -n "${NWM_CONDA_ENV}" ./two_stage_nwm.sh stage1 latentpt --gpus=0,1,2,3 --nproc=4
+conda run -n "${NWM_CONDA_ENV}" ./two_stage_nwm.sh stage1 latentonlypt --gpus=0,1,2,3 --nproc=4
 ```
 
 Start stage 2 from a LatentPT checkpoint (the same syntax works for every reset

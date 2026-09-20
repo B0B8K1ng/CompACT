@@ -41,10 +41,12 @@ SCHEMA_VERSION = 1
 FORMAT_NAME = "navanywhere_navigation_lam_latent_proxy"
 EXPECTED_CHECKPOINT_CLASS = "lam.navigation_variants.PixelActionLAM"
 DINO_CHECKPOINT_CLASS = "lam.navigation_variants.DINOFeatureLAM"
+ACTION_ONLY_CHECKPOINT_CLASS = "lam.navigation_variants.ActionOnlyLAM"
 SUPPORTED_CHECKPOINT_CLASSES = frozenset(
     {
         EXPECTED_CHECKPOINT_CLASS,
         DINO_CHECKPOINT_CLASS,
+        ACTION_ONLY_CHECKPOINT_CLASS,
         "lam.navigation_variants.PixelLAM",
     }
 )
@@ -985,7 +987,9 @@ def _cache_record(
         raise TypeError("cache metadata is not a mapping")
     expected_metadata = _expected_metadata(state, task, source_fingerprint)
     for key, expected in expected_metadata.items():
-        if key == "policy_fingerprint":
+        # Encoder batch size is an execution-only tuning knob.  Allow completed
+        # trajectory shards to survive a batch-size change during resume.
+        if key in {"policy_fingerprint", "extraction_fingerprint"}:
             continue
         if metadata.get(key) != expected:
             raise ValueError(f"cache metadata.{key} mismatch")

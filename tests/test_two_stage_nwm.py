@@ -27,6 +27,7 @@ from two_stage_nwm import (
     configure_trainable_parameters,
     dense_motion_from_collated,
     flatten_goal_tensor,
+    validate_two_stage_config,
 )
 
 
@@ -100,6 +101,7 @@ def _model(
     training_stage: str = "proxy_pretrain",
     action_mode: str = "latent",
     scheme: str = "reset",
+    proxy_relative_time_mode: str = "always",
 ) -> CDiT:
     torch.manual_seed(101)
     model = CDiT(
@@ -115,6 +117,7 @@ def _model(
         motion_condition=MOTION_CONFIG,
         training_stage=training_stage,
         action_mode=action_mode,
+        proxy_relative_time_mode=proxy_relative_time_mode,
         finetune={"scheme": scheme, "real_to_latent_hidden_dim": 8},
     ).cpu()
     _open_condition_gates(model)
@@ -182,6 +185,26 @@ def _assert_all_grad_none(test: unittest.TestCase, named_parameters) -> None:
 
 
 class ProxyConditionTests(unittest.TestCase):
+    def test_fallback_relative_time_mode_is_latent_only(self):
+        config = {
+            "training_stage": "proxy_pretrain",
+            "action_mode": "geometry",
+            "proxy": {
+                "type": "geometry",
+                "dim": 3,
+                "max_abs_frame_offset": 8,
+                "relative_time_mode": "fallback",
+                "use_precomputed_only": True,
+            },
+            "dataset": {"distance": {"min_dist_cat": -64, "max_dist_cat": 64}},
+            "motion_condition": {
+                "enabled": True,
+                "geometry": {"geometry_dim": 3},
+            },
+        }
+        with self.assertRaisesRegex(ValueError, "action_mode=latent"):
+            validate_two_stage_config(config)
+
     def test_context_length_mismatch_fails_before_positional_addition(self):
         model = _model().eval()
         batch = _inputs()
@@ -237,6 +260,65 @@ class ProxyConditionTests(unittest.TestCase):
             )
         torch.testing.assert_close(output_a, output_b, rtol=0.0, atol=0.0)
         torch.testing.assert_close(output_a, output_none, rtol=0.0, atol=0.0)
+
+    def test_latentonly_uses_latent_locally_and_time_as_fallback(self):
+        model = _model(proxy_relative_time_mode="fallback").eval()
+        generator = torch.Generator(device="cpu").manual_seed(404)
+        diffusion = torch.randn(4, model.hidden_size, generator=generator)
+        relative_time = torch.randn(4, model.hidden_size, generator=generator)
+        latent = torch.randn(4, 4, generator=generator)
+        valid = torch.tensor([True, False, True, False])
+
+        condition, _ = model._compute_condition(
+            diffusion,
+            relative_time,
+            action=latent,
+            action_valid=valid,
+            conditioning_mode="latent",
+        )
+        latent_embedding = model.motion_condition_encoder.encode("latent", latent)
+        expected = diffusion + relative_time * (~valid).float().unsqueeze(-1)
+        expected = expected + latent_embedding * valid.float().unsqueeze(-1)
+        torch.testing.assert_close(condition, expected)
+
+        changed_time = relative_time + 1000.0
+        changed_condition, _ = model._compute_condition(
+            diffusion,
+            changed_time,
+            action=latent,
+            action_valid=valid,
+            conditioning_mode="latent",
+        )
+        torch.testing.assert_close(condition[valid], changed_condition[valid])
+        self.assertFalse(torch.equal(condition[~valid], changed_condition[~valid]))
+
+    def test_latentonly_grouped_motion_matches_dense_conditioning(self):
+        model = _model(proxy_relative_time_mode="fallback").eval()
+        generator = torch.Generator(device="cpu").manual_seed(405)
+        diffusion = torch.randn(4, model.hidden_size, generator=generator)
+        relative_time = torch.randn(4, model.hidden_size, generator=generator)
+        latent = torch.randn(4, 4, generator=generator)
+        valid = torch.tensor([True, False, True, False])
+        grouped = {
+            "latent": {
+                "indices": torch.tensor([0, 2], dtype=torch.int64),
+                "values": latent[valid],
+            }
+        }
+        dense_condition, _ = model._compute_condition(
+            diffusion,
+            relative_time,
+            action=latent,
+            action_valid=valid,
+            conditioning_mode="latent",
+        )
+        grouped_condition, _ = model._compute_condition(
+            diffusion,
+            relative_time,
+            motion=grouped,
+            conditioning_mode="latent",
+        )
+        torch.testing.assert_close(dense_condition, grouped_condition)
 
     def test_timept_ignores_any_accidentally_supplied_action_tensor(self):
         model = _model(action_mode="none").eval()

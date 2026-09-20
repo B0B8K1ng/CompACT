@@ -77,6 +77,14 @@ def validate_two_stage_config(config: Any) -> tuple[str, str, str | None]:
     if stage == "legacy":
         return stage, action_mode, None
     proxy = config_get(config, "proxy", {})
+    relative_time_mode = str(
+        config_get(proxy, "relative_time_mode", "always")
+    ).strip().lower()
+    if relative_time_mode not in {"always", "fallback"}:
+        raise ValueError(
+            "proxy.relative_time_mode must be 'always' or 'fallback', got "
+            f"{relative_time_mode!r}"
+        )
     proxy_limit = int(
         config_get(
             proxy,
@@ -101,6 +109,14 @@ def validate_two_stage_config(config: Any) -> tuple[str, str, str | None]:
     motion = config_get(config, "motion_condition", {})
     if not bool(config_get(motion, "enabled", False)):
         raise ValueError("Two-stage training requires motion_condition.enabled=true")
+    if relative_time_mode == "fallback" and not (
+        stage == "proxy_pretrain" and action_mode == "latent"
+    ):
+        raise ValueError(
+            "proxy.relative_time_mode=fallback is reserved for latent-only "
+            "pretraining and requires training_stage=proxy_pretrain with "
+            "action_mode=latent"
+        )
     if stage == "proxy_pretrain":
         if action_mode not in {"none", "geometry", "idm", "latent"}:
             raise ValueError(

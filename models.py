@@ -217,6 +217,7 @@ class CDiT(nn.Module):
         motion_condition=None,
         training_stage="legacy",
         action_mode=None,
+        proxy_relative_time_mode="always",
         finetune=None,
     ):
         super().__init__()
@@ -229,6 +230,14 @@ class CDiT(nn.Module):
         self.num_heads = num_heads
         self.training_stage = str(training_stage or "legacy")
         self.action_mode = str(action_mode or "real")
+        self.proxy_relative_time_mode = str(
+            proxy_relative_time_mode or "always"
+        ).strip().lower()
+        if self.proxy_relative_time_mode not in {"always", "fallback"}:
+            raise ValueError(
+                "proxy_relative_time_mode must be 'always' or 'fallback', got "
+                f"{self.proxy_relative_time_mode!r}"
+            )
         raw_finetune_scheme = (
             str((finetune or {}).get("scheme", "reset"))
             .strip()
@@ -503,6 +512,75 @@ class CDiT(nn.Module):
             "alignment_valid": teacher_valid,
         }
 
+    def _proxy_relative_time_embedding(
+        self,
+        relative_time_embedding,
+        *,
+        mode,
+        action,
+        action_valid,
+        motion,
+    ):
+        """Keep relative time only on rows without a usable Stage-1 proxy."""
+        if not (
+            self.training_stage == "proxy_pretrain"
+            and self.proxy_relative_time_mode == "fallback"
+            and mode == "latent"
+        ):
+            return relative_time_embedding
+
+        use_proxy = torch.zeros(
+            relative_time_embedding.shape[0],
+            dtype=torch.bool,
+            device=relative_time_embedding.device,
+        )
+        if action is not None:
+            if action_valid is None:
+                use_proxy.fill_(True)
+            else:
+                use_proxy = torch.as_tensor(
+                    action_valid,
+                    dtype=torch.bool,
+                    device=relative_time_embedding.device,
+                )
+                if use_proxy.shape != (relative_time_embedding.shape[0],):
+                    raise ValueError(
+                        "action_valid must be "
+                        f"[{relative_time_embedding.shape[0]}], got "
+                        f"{tuple(use_proxy.shape)}"
+                    )
+        elif motion:
+            payload = motion.get(mode)
+            if payload is not None:
+                if not isinstance(payload, Mapping):
+                    raise TypeError(f"motion[{mode!r}] must be a mapping")
+                indices = payload.get("indices")
+                if not isinstance(indices, torch.Tensor):
+                    raise TypeError(
+                        f"motion[{mode!r}] requires tensor indices and values"
+                    )
+                indices = indices.to(
+                    device=relative_time_embedding.device, dtype=torch.int64
+                )
+                if indices.ndim != 1:
+                    raise ValueError(f"motion[{mode!r}].indices must be int64 [N]")
+                if bool(
+                    (
+                        (indices < 0)
+                        | (indices >= relative_time_embedding.shape[0])
+                    ).any()
+                ):
+                    raise ValueError(
+                        f"motion[{mode!r}].indices are outside the model batch"
+                    )
+                use_proxy[indices] = True
+
+        # Mask the embedding, not rel_t itself: TimestepEmbedder(0) is learned
+        # and generally nonzero because its MLP has biases.
+        return relative_time_embedding * (~use_proxy).to(
+            relative_time_embedding.dtype
+        ).unsqueeze(-1)
+
     def _compute_condition(
         self,
         diffusion_embedding,
@@ -562,6 +640,15 @@ class CDiT(nn.Module):
                     f"{sorted(supplied_types)}. Run real-action inference from a "
                     "stage-2 checkpoint instead."
                 )
+
+        relative_time_embedding = self._proxy_relative_time_embedding(
+            relative_time_embedding,
+            mode=mode,
+            action=action,
+            action_valid=action_valid,
+            motion=motion,
+        )
+        base_condition = diffusion_embedding + relative_time_embedding
 
         if mode == "real_to_latent":
             if action is None:

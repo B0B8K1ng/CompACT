@@ -410,6 +410,7 @@ def _config(
     proxy_window: int = 8,
     warmup_steps: int | None = None,
     joint_steps: int | None = None,
+    relative_time_mode: str = "always",
 ) -> dict:
     proxy_type = action_mode if proxy_type is None else proxy_type
     finetune = {"scheme": scheme}
@@ -426,6 +427,7 @@ def _config(
             "type": proxy_type,
             "dim": latent_dim if proxy_type == "latent" else (0 if proxy_type == "none" else 3),
             "max_abs_frame_offset": proxy_window,
+            "relative_time_mode": relative_time_mode,
             "normalization_path": "stats/navanywhere-1000h.json",
         },
         "finetune": finetune,
@@ -479,6 +481,7 @@ class Stage1LoadingTests(unittest.TestCase):
         self.assertEqual(metadata["proxy_type"], "latent")
         self.assertEqual(metadata["proxy_dim"], 4)
         self.assertEqual(metadata["proxy_max_abs_frame_offset"], 8)
+        self.assertEqual(metadata["proxy_relative_time_mode"], "always")
         self.assertEqual(metadata["latent_dim"], 4)
         self.assertEqual(metadata["hidden_dim"], model.hidden_size)
         self.assertEqual(metadata["context_size"], model.context_size)
@@ -1183,6 +1186,20 @@ class ResumeTests(unittest.TestCase):
             expected_substage="pretrain",
         )
         self.assertEqual(validation["finetune_substage"], "pretrain")
+
+        latentonly_config = _config(
+            stage="proxy_pretrain",
+            action_mode="latent",
+            proxy_type="latent",
+            relative_time_mode="fallback",
+        )
+        with self.assertRaisesRegex(ValueError, "proxy_relative_time_mode"):
+            validate_resume_checkpoint(
+                checkpoint[TWO_STAGE_METADATA_KEY],
+                config=latentonly_config,
+                model=model,
+                expected_substage="pretrain",
+            )
 
         corrupted = copy.deepcopy(checkpoint[TWO_STAGE_METADATA_KEY])
         corrupted["completed_warmup_steps"] = 1

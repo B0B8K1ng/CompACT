@@ -90,6 +90,66 @@ def test_planned_frame_pairs_decode_packed_global_pair_keys() -> None:
     assert pairs.tolist() == [[11, 10], [11, 11], [13, 14], [14, 12]]
 
 
+def test_cache_resume_accepts_changed_extraction_batch_fingerprint(
+    tmp_path: Path,
+) -> None:
+    import precompute_navanywhere_nav1_latent_actions as pre
+
+    indices = np.arange(5, dtype=np.int64)
+    pairs = pre.build_navanywhere_frame_pairs(
+        indices, context_size=2, max_abs_frame_offset=1
+    )
+    task = {
+        "source_id": "source",
+        "trajectory_id": "trajectory",
+        "frame_indices_sha256": "indices",
+    }
+    state = {
+        "sampling_recipe_sha256": "recipe",
+        "checkpoint": {"sha256": "checkpoint", "latent_dim": 32},
+        "extraction": {"fingerprint": "batch-128"},
+        "policy": {
+            "fingerprint": "policy",
+            "configuration": {"context_size": 2, "max_abs_frame_offset": 1},
+        },
+        "training_pair_plan": None,
+        "legacy_full_policy_fingerprint": "legacy",
+    }
+    payload = {
+        "schema_version": pre.SCHEMA_VERSION,
+        "format": pre.FORMAT_NAME,
+        "proxy_type": "latent",
+        "source_id": "source",
+        "trajectory_id": "trajectory",
+        "frame_indices": torch.from_numpy(indices.copy()),
+        "frame_pairs": torch.from_numpy(pairs.copy()),
+        "motion": torch.zeros(len(pairs), 32),
+        "metadata": {
+            "sampling_recipe_sha256": "recipe",
+            "frame_indices_sha256": "indices",
+            "source_fingerprint": "source",
+            "checkpoint_sha256": "checkpoint",
+            "extraction_fingerprint": "batch-64",
+            "policy_fingerprint": "policy",
+        },
+        "complete": True,
+    }
+    path = tmp_path / "trajectory.pt"
+    pre.atomic_torch_save(payload, path)
+
+    record = pre._cache_record(
+        path,
+        state,
+        task,
+        indices,
+        "source",
+        None,
+        payload=payload,
+    )
+
+    assert record["pair_count"] == len(pairs)
+
+
 def test_safe_path_rejects_identity_traversal(tmp_path: Path) -> None:
     assert safe_path(tmp_path, "source", "trajectory", ".pt") == (
         tmp_path / "source" / "trajectory.pt"
