@@ -38,7 +38,7 @@ EXPECTED_SAMPLE_COUNT = 100
 EXPECTED_SPLIT_SHA256 = {
     "recon": "c62cd08be9f124cbeec48d914460da8630e089bf0bdb84c5018013a82d12ec54",
     "scand": "8acb4062561cbf1549e27f39a6e80241b97294a8c0e55c345787ae6a47be55ce",
-    "huron": "89e07bb2b934d7fe4e8ab0bddf51e28a4beb36d2415ad83c166350241ef4e9fd",
+    "huron": "82745a1ca8e7d14bebf87bd5ff96deebb07ef3c53ad8d6ca6b87eb7641c6dc3c",
     "tartan_drive": "77bc38808b8df24b330fc4f9a4a17ed0de35a1c1bef0ff2283fc461b3ab16435",
     "go_stanford": "5013d8e2defbbee4d9652f7ae4569816113a8d44dd2af8b5e135d9f5cea3e27c",
 }

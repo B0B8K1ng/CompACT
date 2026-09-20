@@ -124,9 +124,9 @@ DATASET_CONTRACTS = {
         "metric_waypoint_spacing": 0.255,
         "temporal_semantics": "physical_4_seconds",
         "splits": {
-            "time": "9d1c5239dfbf0f73d4aaee29c5abda31f28e97bbaf02f5bfc76cfd4f7f63953e",
-            "rollout": "3058126a3c8fea9776c364f41c394d00bff1bb8f9a4d092fa8d1433554ec6991",
-            "navigation_eval": "89e07bb2b934d7fe4e8ab0bddf51e28a4beb36d2415ad83c166350241ef4e9fd",
+            "time": "d285d1b93967b992380f90b6e92edc2742577b251a863e88638e1f22d3ecfe6d",
+            "rollout": "c75551b92bd75cb35a87606b276a0d720e3b0d08888298e0cff7368ae9f8604b",
+            "navigation_eval": "82745a1ca8e7d14bebf87bd5ff96deebb07ef3c53ad8d6ca6b87eb7641c6dc3c",
         },
     },
     "tartan_drive": {
@@ -566,7 +566,7 @@ PROTOCOLS = {
             },
             "huron": {
                 "path": "data_splits/sacson/test/navigation_eval.pkl",
-                "sha256": "89e07bb2b934d7fe4e8ab0bddf51e28a4beb36d2415ad83c166350241ef4e9fd",
+                "sha256": "82745a1ca8e7d14bebf87bd5ff96deebb07ef3c53ad8d6ca6b87eb7641c6dc3c",
                 "metric_waypoint_spacing": 0.255,
             },
             "tartan_drive": {

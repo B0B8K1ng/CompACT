@@ -27,6 +27,13 @@ noise are derived from the protocol seed and semantic sample ID. Consequently,
 changing GPU count or batch/microbatch size preserves the evaluated samples and
 random streams; normal floating-point kernel differences are allowed.
 
+The fixed HuRoN splits are built from the locally available public SACSoN
+trajectories. Historical entries that refer to unavailable processed chunks are
+replaced deterministically using trajectory coverage and evenly spaced movement
+distance quantiles: 500 windows at 4 seconds, 150 rollout windows, and 100
+navigation windows. Rebuild or verify them with
+`scripts/prepare_nwm_benchmark_splits.py --repair-huron [--check]`.
+
 ## Commands
 
 Run any model/dataset/metric selection on any positive number of GPUs:
