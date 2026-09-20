@@ -111,6 +111,23 @@ def test_geopt_finetune_model_is_pinned_to_completed_checkpoint() -> None:
     )
 
 
+def test_latentpt_pixel_finetune_model_is_pinned_to_modelscope_checkpoint() -> None:
+    model = MODELS["nwm-latentpt-ft-pixel"]
+
+    assert model["display_name"] == "NWM-LatentPT-FT-Pixel"
+    assert model["checkpoint_id"] == "joint_0100000"
+    assert model["checkpoint_step"] == 110000
+    assert model["sha256"] == (
+        "03507c990230bbe329d8aca9e6e739aadefe4905ff4e5442ee307d9f7c2c12d2"
+    )
+    assert model["provenance"]["repository"] == (
+        "LittleBoss/nwm-nav1-latentpt-pixel-ft-reset"
+    )
+    assert model["provenance"]["revision"] == (
+        "c3dfa2533da976be47f75cc94dcf0eba07c90644"
+    )
+
+
 def test_raenwm_model_and_sampling_protocol_are_pinned() -> None:
     model = MODELS["rae-nwm"]
 

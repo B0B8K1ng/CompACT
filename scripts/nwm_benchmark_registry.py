@@ -307,6 +307,22 @@ MODELS = {
             "training_complete_at": "2026-09-10T18:23:44Z",
         },
     },
+    "nwm-latentpt-ft-pixel": {
+        "display_name": "NWM-LatentPT-FT-Pixel",
+        "architecture": "CDiT-B/2 + SD-VAE + LatentPT pixel adapter reset fine-tune",
+        "exp_dir": "/file_system/nas/algorithm/dujun.nie/nwm/benchmark_models/nwm-latentpt-ft-pixel",
+        "checkpoint_id": "joint_0100000",
+        "checkpoint": "/file_system/nas/algorithm/dujun.nie/nwm/weights/modelscope/LittleBoss/nwm-nav1-latentpt-pixel-ft-reset/joint_0100000.pth.tar",
+        "checkpoint_step": 110000,
+        "sha256": "03507c990230bbe329d8aca9e6e739aadefe4905ff4e5442ee307d9f7c2c12d2",
+        "training_datasets": ["recon", "sacson", "scand", "tartan_drive"],
+        "provenance": {
+            "repository": "LittleBoss/nwm-nav1-latentpt-pixel-ft-reset",
+            "revision": "c3dfa2533da976be47f75cc94dcf0eba07c90644",
+            "checkpoint_filename": "joint_0100000.pth.tar",
+            "joint_fine_tuning_steps": 100000,
+        },
+    },
     "nwm-latentpt-ft-align": {
         "architecture": "CDiT-B/2 + SD-VAE + LatentPT-aligned real-motion adapter fine-tune",
         "exp_dir": "/file_system/nas/algorithm/dujun.nie/nwm/compact/runs/navanywherev1_latentpt_ft_align_pixel_action_l20/nwm-nav1-latentpt-finetune-align-pixel-action-l20",
