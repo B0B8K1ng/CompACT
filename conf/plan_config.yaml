@@ -16,6 +16,7 @@ hydra:
 
 # Base configuration
 seed: 42                         # Top-level stochastic planning evaluation seed
+planning_sample_seed: 42         # Stable per-sample seed for exact resume/GPU-count parity
 exp_dir: null                      # Experiment config file path
 ckp: "0100000"                 # Checkpoint ID to use
 datasets_to_eval: [recon,scand]                 # Comma-separated list of dataset names
