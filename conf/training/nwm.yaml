@@ -4,6 +4,8 @@ notes: "compact_nwm_cdit_b_sdvae"
 run_name: ${now:%Y%m%d_%H%M%S}_${training.notes}_bs${training.batch_size}
 results_dir: /file_system/nas/algorithm/dujun.nie/nwm/compact/runs
 batch_size: 16
+# Per-GPU evaluation batch; null preserves the training batch size.
+eval_batch_size: null
 num_workers: 4
 grad_clip_val: 2.0
 

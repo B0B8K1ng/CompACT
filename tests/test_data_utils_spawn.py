@@ -44,11 +44,19 @@ class _WorkerRandomDataset(Dataset):
         )
 
 
-def _config(*, num_workers: int) -> OmegaConf:
+def _config(
+    *,
+    num_workers: int,
+    batch_size: int = 2,
+    reference_batch_size: int | None = None,
+) -> OmegaConf:
+    training = {"batch_size": batch_size, "num_workers": num_workers}
+    if reference_batch_size is not None:
+        training["reference_batch_size"] = reference_batch_size
     return OmegaConf.create(
         {
             "seed": 1701,
-            "training": {"batch_size": 2, "num_workers": num_workers},
+            "training": training,
             "motion_condition": {"enabled": False},
             "training_stage": "real_finetune",
             "action_mode": "real",
@@ -60,9 +68,19 @@ def _config(*, num_workers: int) -> OmegaConf:
     )
 
 
-def _loader(*, num_workers: int = 2):
-    dataset = _WorkerRandomDataset()
-    config = _config(num_workers=num_workers)
+def _loader(
+    *,
+    num_workers: int = 2,
+    length: int = 18,
+    batch_size: int = 2,
+    reference_batch_size: int | None = None,
+):
+    dataset = _WorkerRandomDataset(length=length)
+    config = _config(
+        num_workers=num_workers,
+        batch_size=batch_size,
+        reference_batch_size=reference_batch_size,
+    )
     with mock.patch.object(data_utils.dist, "get_world_size", return_value=1):
         loader, sampler = data_utils.create_dataloader(
             dataset, config, rank=0, is_train=True
@@ -141,6 +159,54 @@ class SpawnDataLoaderTests(unittest.TestCase):
         self.assertEqual(
             loader.multiprocessing_context.get_start_method(), "spawn"
         )
+
+    def test_reference_rebatch_preserves_reference_drop_last_sequence(self) -> None:
+        config, dataset, loader, sampler = _loader(
+            num_workers=0,
+            length=20,
+            batch_size=6,
+            reference_batch_size=2,
+        )
+        epoch = 3
+        sampler.set_epoch(epoch)
+        expected_indices = list(sampler)[:20]
+        _prepare_epoch(config, dataset, loader, sampler, epoch)
+        batches = list(loader)
+
+        self.assertEqual([int(batch.shape[0]) for batch in batches], [6, 6, 6, 2])
+        actual_indices = torch.cat([batch[:, 0] for batch in batches]).tolist()
+        self.assertEqual(actual_indices, expected_indices)
+        self.assertEqual(len(loader), 4)
+
+        fingerprint = build_data_resume_fingerprint(
+            config,
+            "pretrain",
+            dataset_length=len(dataset),
+            loader_length=len(loader),
+        )
+        self.assertEqual(fingerprint["payload"]["reference_batch_size"], 2)
+
+    def test_reference_rebatch_is_train_only(self) -> None:
+        dataset = _WorkerRandomDataset(length=20)
+        config = _config(
+            num_workers=0,
+            batch_size=6,
+            reference_batch_size=2,
+        )
+        with mock.patch.object(data_utils.dist, "get_world_size", return_value=1):
+            loader, _ = data_utils.create_dataloader(
+                dataset, config, rank=0, is_train=False
+            )
+        self.assertEqual([int(batch.shape[0]) for batch in loader], [6, 6, 6])
+
+    def test_reference_rebatch_rejects_non_multiple_target(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must be a multiple"):
+            _loader(
+                num_workers=0,
+                length=20,
+                batch_size=5,
+                reference_batch_size=2,
+            )
 
 
 if __name__ == "__main__":

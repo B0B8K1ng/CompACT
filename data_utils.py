@@ -12,7 +12,7 @@ import torch
 import torch.distributed as dist
 import torchvision
 from PIL import __version__ as pillow_version
-from torch.utils.data import DataLoader, ConcatDataset, DistributedSampler
+from torch.utils.data import DataLoader, ConcatDataset, DistributedSampler, Sampler
 from datasets import TrainingDataset
 from misc import CenterCropAR, IMAGE_ASPECT_RATIO, get_transform
 from hydra.utils import get_original_cwd
@@ -35,6 +35,66 @@ LATENT_FORMAT = "sd_vae_posterior_stats"
 # cache, so keep the hardware-family checks strict while allowing only a small
 # capacity-reporting drift at runtime.
 RUNTIME_GPU_MEMORY_TOLERANCE_BYTES = 64 * 1024 * 1024
+
+
+class ReferenceBatchSampler(Sampler):
+    """Rebatch a sampler without changing a smaller reference-batch prefix.
+
+    NavAnywhere's strict offline action cache was planned with per-rank batch
+    16 and ``drop_last=True``. A larger ordinary DataLoader batch changes the
+    epoch prefix and can therefore request pairs outside that frozen plan. This
+    opt-in sampler first keeps exactly the samples that the reference batch
+    contract would have consumed, then merges consecutive reference batches
+    into larger optimizer batches. A final reference-aligned partial batch is
+    emitted instead of discarded.
+    """
+
+    def __init__(
+        self,
+        sampler,
+        *,
+        batch_size: int,
+        reference_batch_size: int,
+    ) -> None:
+        self.sampler = sampler
+        self.batch_size = int(batch_size)
+        self.reference_batch_size = int(reference_batch_size)
+        if self.batch_size < 1 or self.reference_batch_size < 1:
+            raise ValueError("Batch sizes must be positive")
+        if self.batch_size < self.reference_batch_size:
+            raise ValueError(
+                "training.batch_size must be at least reference_batch_size"
+            )
+        if self.batch_size % self.reference_batch_size:
+            raise ValueError(
+                "training.batch_size must be a multiple of "
+                "training.reference_batch_size"
+            )
+        self.usable_samples = (
+            len(self.sampler) // self.reference_batch_size
+        ) * self.reference_batch_size
+        if self.usable_samples < self.reference_batch_size:
+            raise ValueError(
+                "Distributed sampler has no full reference batch; lower "
+                "training.reference_batch_size or provide more samples"
+            )
+
+    def __iter__(self):
+        batch = []
+        for sample_index, index in enumerate(self.sampler):
+            if sample_index >= self.usable_samples:
+                break
+            batch.append(index)
+            if len(batch) == self.batch_size:
+                yield batch
+                batch = []
+        if batch:
+            # usable_samples and batch_size are both reference aligned.
+            assert len(batch) % self.reference_batch_size == 0
+            yield batch
+
+    def __len__(self) -> int:
+        return (self.usable_samples + self.batch_size - 1) // self.batch_size
 
 
 def _original_cwd() -> str:
@@ -316,11 +376,25 @@ def _validate_precomputed_latent_cache_local(config: DictConfig) -> dict:
         compatibility_target,
         "encoding.compatibility_target",
     )
-    _require_equal(
-        int(config.training.batch_size),
-        compatibility_target["training_batch_per_gpu"],
-        "training.batch_size",
-    )
+    training_batch_size = int(config.training.batch_size)
+    if training_batch_size < 1:
+        raise ValueError("training.batch_size must be positive")
+    if (
+        training_batch_size != compatibility_target["training_batch_per_gpu"]
+        and not bool(latent_config.get("allow_training_batch_resize", False))
+    ):
+        _require_equal(
+            training_batch_size,
+            compatibility_target["training_batch_per_gpu"],
+            "training.batch_size",
+        )
+    if training_batch_size != compatibility_target["training_batch_per_gpu"]:
+        logger.info(
+            "Using per-frame cached VAE posteriors with opt-in training batch "
+            "resize: cache_reference_batch=%d, training_batch=%d",
+            compatibility_target["training_batch_per_gpu"],
+            training_batch_size,
+        )
     if not isinstance(encoding.get("fingerprint"), str) or not encoding["fingerprint"]:
         raise ValueError("metadata.json.encoding.fingerprint must be a non-empty string")
     _validate_descriptor_fingerprint(encoding, "encoding")
@@ -582,11 +656,38 @@ def _validate_precomputed_latent_cache_local(config: DictConfig) -> dict:
     }
 
 
-def _validate_runtime_latent_hardware(metadata: dict) -> None:
+def _validate_runtime_latent_hardware(
+    metadata: dict,
+    *,
+    allow_hardware_mismatch: bool = False,
+) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for precomputed latent training")
     properties = torch.cuda.get_device_properties(torch.cuda.current_device())
     expected = metadata["hardware"]
+    if allow_hardware_mismatch:
+        # The completed cache stores posterior tensors, not executable GPU
+        # kernels. Once all hashes and tensor metadata have been validated,
+        # consuming those immutable values on another BF16-capable GPU cannot
+        # change them. Keep this exception explicit so every existing launcher
+        # retains the original same-hardware contract.
+        if int(properties.major) < 8:
+            raise ValueError(
+                "Cross-hardware cached-posterior training requires a "
+                "BF16-capable CUDA GPU (compute capability >= 8.0)"
+            )
+        logger.warning(
+            "Opt-in cross-hardware cached-posterior training: runtime=%s "
+            "sm%d%d %.2f GiB, extraction=%s sm%s %.2f GiB",
+            properties.name,
+            properties.major,
+            properties.minor,
+            float(properties.total_memory) / 1024**3,
+            expected.get("gpu_name"),
+            "".join(map(str, expected.get("compute_capability", []))),
+            float(expected.get("total_memory_bytes", 0)) / 1024**3,
+        )
+        return
     _require_equal(
         properties.name,
         expected.get("gpu_name"),
@@ -627,9 +728,17 @@ def _validate_runtime_latent_hardware(metadata: dict) -> None:
 
 def validate_precomputed_latent_cache(config: DictConfig) -> dict:
     """Validate on rank zero once, then propagate either result or error."""
+    allow_hardware_mismatch = bool(
+        config.dataset.precomputed_latents.get(
+            "allow_training_hardware_mismatch", False
+        )
+    )
     if not dist.is_available() or not dist.is_initialized():
         result = _validate_precomputed_latent_cache_local(config)
-        _validate_runtime_latent_hardware(result["metadata"])
+        _validate_runtime_latent_hardware(
+            result["metadata"],
+            allow_hardware_mismatch=allow_hardware_mismatch,
+        )
         return result
 
     message = [None]
@@ -651,7 +760,10 @@ def validate_precomputed_latent_cache(config: DictConfig) -> dict:
     # cannot detect a heterogeneous multi-GPU training node.
     local_error = None
     try:
-        _validate_runtime_latent_hardware(result["metadata"])
+        _validate_runtime_latent_hardware(
+            result["metadata"],
+            allow_hardware_mismatch=allow_hardware_mismatch,
+        )
     except Exception as exc:
         local_error = f"rank {dist.get_rank()}: {type(exc).__name__}: {exc}"
     hardware_errors = [None for _ in range(dist.get_world_size())]
@@ -1288,16 +1400,11 @@ def create_dataloader(dataset, config: DictConfig, rank, is_train=True):
     if num_workers > 0:
         worker_options["multiprocessing_context"] = "spawn"
 
-    loader = DataLoader(
-        dataset,
-        batch_size=config.training.batch_size,
-        shuffle=False,
-        sampler=sampler,
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=True,
-        persistent_workers=False,
-        collate_fn=(
+    loader_options = {
+        "num_workers": num_workers,
+        "pin_memory": True,
+        "persistent_workers": False,
+        "collate_fn": (
             motion_condition_collate
             if bool(
                 config.get("motion_condition", {}).get("enabled", False)
@@ -1305,7 +1412,33 @@ def create_dataloader(dataset, config: DictConfig, rank, is_train=True):
             else None
         ),
         **worker_options,
-    )
+    }
+    reference_batch_size = config.training.get("reference_batch_size", None)
+    if is_train and reference_batch_size not in (None, "", "null"):
+        batch_sampler = ReferenceBatchSampler(
+            sampler,
+            batch_size=int(config.training.batch_size),
+            reference_batch_size=int(reference_batch_size),
+        )
+        loader = DataLoader(
+            dataset,
+            batch_sampler=batch_sampler,
+            **loader_options,
+        )
+    else:
+        batch_size = config.training.batch_size
+        if not is_train:
+            eval_batch_size = config.training.get("eval_batch_size", None)
+            if eval_batch_size is not None:
+                batch_size = eval_batch_size
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            sampler=sampler,
+            drop_last=True,
+            **loader_options,
+        )
 
     return loader, sampler
 

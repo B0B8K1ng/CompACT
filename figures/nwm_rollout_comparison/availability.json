@@ -1,0 +1,94 @@
+{
+  "registry": "/file_system/nas/algorithm/dujun.nie/nwm/results/nwm_benchmark/benchmark_results.json",
+  "registry_updated_at": "2026-09-18T03:29:56.433745+00:00",
+  "dataset": "recon",
+  "horizons_seconds": [
+    1,
+    2,
+    4,
+    8,
+    16
+  ],
+  "models": {
+    "rae-nwm": {
+      "label": "RAE-NWM",
+      "checkpoint": "/file_system/nas/algorithm/dujun.nie/nwm/benchmark_models/rae-nwm/checkpoints/raenwm_b.pth.tar",
+      "checkpoint_step": null,
+      "sha256": "97244579618eb0e376355157a5c1df7a83e534cb1ca35d8ff4e43c4fb4f6a9d0",
+      "rollout": {
+        "1fps": {
+          "available": false,
+          "sample_count": null,
+          "source_audit": null,
+          "horizons": []
+        },
+        "4fps": {
+          "available": false,
+          "sample_count": null,
+          "source_audit": null,
+          "horizons": []
+        }
+      }
+    },
+    "nwm-real": {
+      "label": "NWM",
+      "checkpoint": "/file_system/nas/algorithm/dujun.nie/nwm/compact/runs/20260823_160459_nwm_real_recon_scand_tartan_huron_bs16/checkpoints/0200000.pth.tar",
+      "checkpoint_step": 200000,
+      "sha256": "757a511cb5efc44bca53cbd0d5d19add019c95fd229cf723538de228cbe1b846",
+      "rollout": {
+        "1fps": {
+          "available": true,
+          "sample_count": 150,
+          "source_audit": "/file_system/nas/algorithm/dujun.nie/nwm/results/nwm_comparison_20260825/nwm_real_200k/recon_rollout_1fps_audit.json",
+          "horizons": [
+            "1s",
+            "2s",
+            "4s",
+            "8s",
+            "16s"
+          ]
+        },
+        "4fps": {
+          "available": true,
+          "sample_count": 150,
+          "source_audit": "/file_system/nas/algorithm/dujun.nie/nwm/results/nwm_comparison_20260825/nwm_real_200k/recon_rollout_4fps_audit.json",
+          "horizons": [
+            "1s",
+            "2s",
+            "4s",
+            "8s",
+            "16s"
+          ]
+        }
+      }
+    },
+    "nwm-latentpt-reset-nwm-real-recipe-180k": {
+      "label": "OpenNWM (180k)",
+      "checkpoint": "/file_system/nas/algorithm/dujun.nie/nwm/compact/runs/latentpt_reset_nwm_real_recipe/nwm-latentpt-reset-nwm-real-recipe/checkpoints/joint_0180000.pth.tar",
+      "checkpoint_step": 180000,
+      "sha256": "0e3e9e49a059fc05706fc6d7b457d66df2392b18b2303631c5e04195c72a6170",
+      "rollout": {
+        "1fps": {
+          "available": false,
+          "sample_count": null,
+          "source_audit": null,
+          "horizons": []
+        },
+        "4fps": {
+          "available": false,
+          "sample_count": null,
+          "source_audit": null,
+          "horizons": []
+        }
+      }
+    }
+  },
+  "metrics_plotted": [
+    "lpips_alex",
+    "dreamsim",
+    "psnr"
+  ],
+  "metrics_not_available": [
+    "fid"
+  ]
+}

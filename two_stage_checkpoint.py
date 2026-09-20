@@ -247,6 +247,24 @@ def build_data_resume_fingerprint(
         }
     )
     assert isinstance(payload, Mapping)
+    reference_batch_size = _get(training, "reference_batch_size", None)
+    if reference_batch_size not in (None, "", "null"):
+        # Keep fingerprints for all existing/default loaders byte-for-byte
+        # compatible; the extra cursor contract exists only for opt-in runs.
+        payload = dict(payload)
+        payload["reference_batch_size"] = int(reference_batch_size)
+    if normalized_substage == "pretrain":
+        sample_target = _get(training, "target_samples_per_rank", None)
+    elif normalized_substage == "warmup":
+        sample_target = _get(finetune, "warmup_samples_per_rank", None)
+    else:
+        sample_target = _get(finetune, "joint_samples_per_rank", None)
+    if sample_target not in (None, "", "null"):
+        # A final cropped optimizer batch consumes a complete DataLoader cursor.
+        # Pinning the budget prevents an extended resume from silently skipping
+        # the unused suffix of that final fetched batch.
+        payload = dict(payload)
+        payload["target_samples_per_rank"] = int(sample_target)
     fingerprint: dict[str, Any] = {
         "schema_version": DATA_RESUME_FINGERPRINT_SCHEMA_VERSION,
         "sha256": _fingerprint_digest(payload),

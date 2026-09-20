@@ -454,17 +454,162 @@ def _restore_proxy_metrics(state: Any) -> ProxyMetrics:
 def _gather_runtime_states(
     proxy_metrics: ProxyMetrics,
     valid_alignment_batches: int,
+    completed_samples_per_rank: int | None = None,
 ) -> list[dict[str, Any]]:
     local_state = {
         "rng_state": capture_rng_state(),
         "proxy_metrics": _proxy_metrics_state(proxy_metrics),
         "valid_alignment_batches": int(valid_alignment_batches),
     }
+    if completed_samples_per_rank is not None:
+        completed_samples_per_rank = int(completed_samples_per_rank)
+        if completed_samples_per_rank < 0:
+            raise ValueError("completed_samples_per_rank must be non-negative")
+        local_state["completed_samples_per_rank"] = completed_samples_per_rank
     if not dist.is_available() or not dist.is_initialized():
         return [local_state]
     states: list[Any] = [None] * dist.get_world_size()
     dist.all_gather_object(states, local_state)
     return [dict(state) for state in states]
+
+
+def _phase_target_samples_per_rank(
+    config: Any,
+    training_stage: str,
+    substage: str,
+) -> int | None:
+    """Return the opt-in exact local sample budget for one training phase."""
+    if training_stage == "proxy_pretrain":
+        value = config.training.get("target_samples_per_rank", None)
+    elif substage == "warmup":
+        value = config.finetune.get("warmup_samples_per_rank", None)
+    elif substage == "joint":
+        value = config.finetune.get("joint_samples_per_rank", None)
+    else:
+        value = None
+    if value in (None, "", "null"):
+        return None
+    value = int(value)
+    if value < 0:
+        raise ValueError("Phase target_samples_per_rank must be non-negative")
+    return value
+
+
+def _phase_complete(
+    current_steps: int,
+    target_steps: int,
+    completed_samples_per_rank: int,
+    target_samples_per_rank: int | None,
+) -> bool:
+    if target_samples_per_rank is None:
+        return int(current_steps) >= int(target_steps)
+    return int(completed_samples_per_rank) >= int(target_samples_per_rank)
+
+
+def _training_batch_size(batch: Mapping[str, Any]) -> int:
+    if "k" not in batch:
+        raise KeyError("Training batches must contain k for sample accounting")
+    shape = torch.as_tensor(batch["k"]).shape
+    if not shape or int(shape[0]) < 1:
+        raise ValueError("Training batch k must have a positive batch dimension")
+    return int(shape[0])
+
+
+def _truncate_batch_value(value: Any, batch_size: int, limit: int) -> Any:
+    if isinstance(value, torch.Tensor):
+        if value.ndim > 0 and int(value.shape[0]) == batch_size:
+            return value[:limit]
+        return value
+    if isinstance(value, Mapping):
+        return {
+            key: _truncate_batch_value(item, batch_size, limit)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        if len(value) == batch_size:
+            return value[:limit]
+        return [_truncate_batch_value(item, batch_size, limit) for item in value]
+    if isinstance(value, tuple):
+        if len(value) == batch_size:
+            return value[:limit]
+        return tuple(
+            _truncate_batch_value(item, batch_size, limit) for item in value
+        )
+    return value
+
+
+def _truncate_motion_groups(
+    groups: Mapping[str, Mapping[str, Any]],
+    limit: int,
+) -> dict[str, dict[str, Any]]:
+    truncated: dict[str, dict[str, Any]] = {}
+    for motion_type, payload in groups.items():
+        if not isinstance(payload, Mapping) or "sample_indices" not in payload:
+            raise ValueError("Collated motion groups require sample_indices")
+        indices = torch.as_tensor(payload["sample_indices"], dtype=torch.int64)
+        if indices.ndim != 1:
+            raise ValueError("Collated motion sample_indices must be one-dimensional")
+        keep = indices < int(limit)
+        if not bool(keep.any()):
+            continue
+        selected: dict[str, Any] = {}
+        for name, value in payload.items():
+            if isinstance(value, torch.Tensor) and value.ndim > 0 and int(
+                value.shape[0]
+            ) == int(indices.numel()):
+                selected[name] = value[keep]
+            elif isinstance(value, list) and len(value) == int(indices.numel()):
+                selected[name] = [
+                    item for item, retain in zip(value, keep.tolist()) if retain
+                ]
+            else:
+                selected[name] = value
+        truncated[str(motion_type)] = selected
+    return truncated
+
+
+def _truncate_training_batch(
+    batch: Mapping[str, Any],
+    limit: int,
+) -> dict[str, Any]:
+    """Take a local batch prefix while preserving collated motion groups."""
+    batch_size = _training_batch_size(batch)
+    limit = int(limit)
+    if limit < 1 or limit > batch_size:
+        raise ValueError(
+            f"Training batch limit must be within [1,{batch_size}], got {limit}"
+        )
+    if limit == batch_size:
+        return dict(batch)
+    truncated = {
+        key: (
+            _truncate_motion_groups(value, limit)
+            if key == "motion" and isinstance(value, Mapping)
+            else _truncate_batch_value(value, batch_size, limit)
+        )
+        for key, value in batch.items()
+    }
+    if _training_batch_size(truncated) != limit:
+        raise RuntimeError("Training batch truncation produced the wrong size")
+    return truncated
+
+
+def _budget_training_batch(
+    batch: Mapping[str, Any],
+    completed_samples_per_rank: int,
+    target_samples_per_rank: int | None,
+) -> tuple[dict[str, Any] | Mapping[str, Any], int]:
+    """Crop only the final optimizer batch to hit an exact sample budget."""
+    batch_size = _training_batch_size(batch)
+    if target_samples_per_rank is None:
+        return batch, batch_size
+    remaining = int(target_samples_per_rank) - int(completed_samples_per_rank)
+    if remaining < 1:
+        raise RuntimeError("Sample-budgeted phase received a batch after completion")
+    if batch_size > remaining:
+        batch = _truncate_training_batch(batch, remaining)
+        batch_size = remaining
+    return batch, batch_size
 
 
 def _set_loader_epoch_seed(loader, config_seed: int, rank: int, epoch: int) -> None:
@@ -1362,7 +1507,18 @@ def run_two_stage_training(config, device, rank, local_gpu, experiment_dir, log=
             (resume_metadata or {}).get("completed_warmup_steps", 0)
         ) + int((resume_metadata or {}).get("completed_joint_steps", 0))
     for substage, target_steps in substages:
-        if target_steps <= 0:
+        target_samples_per_rank = _phase_target_samples_per_rank(
+            config, training_stage, substage
+        )
+        if (
+            target_samples_per_rank is not None
+            and target_samples_per_rank > 0
+            and target_steps <= 0
+        ):
+            raise ValueError(
+                "A positive sample target requires a positive optimizer-step cap"
+            )
+        if target_steps <= 0 or target_samples_per_rank == 0:
             if training_stage == "real_finetune" and substage == "warmup":
                 # A zero-length/already-disabled warm-up still has to carry the
                 # saved per-rank RNG into joint setup. Joint restores it only
@@ -1509,6 +1665,26 @@ def run_two_stage_training(config, device, rank, local_gpu, experiment_dir, log=
         proxy_metrics = _restore_proxy_metrics(runtime_state.get("proxy_metrics"))
         epoch = int((phase_resume or {}).get("epoch", 0))
         resume_rng_state = runtime_state.get("rng_state")
+        saved_samples = runtime_state.get("completed_samples_per_rank", None)
+        if (
+            target_samples_per_rank is not None
+            and current > 0
+            and saved_samples is None
+        ):
+            raise ValueError(
+                "A sample-budgeted resume checkpoint must record "
+                "completed_samples_per_rank"
+            )
+        completed_samples_per_rank = int(saved_samples or 0)
+        if completed_samples_per_rank < 0:
+            raise ValueError("Saved completed_samples_per_rank must be non-negative")
+        if (
+            target_samples_per_rank is not None
+            and completed_samples_per_rank > target_samples_per_rank
+        ):
+            raise ValueError(
+                "Checkpoint completed_samples_per_rank exceeds configured target"
+            )
         resumed_valid_alignment_batches = int(
             runtime_state.get("valid_alignment_batches", 0)
         )
@@ -1520,8 +1696,29 @@ def run_two_stage_training(config, device, rank, local_gpu, experiment_dir, log=
         # A completed phase does not enter the iterator loop, so restore its
         # model-side RNG here. The transition runtime state then carries this
         # exact point into joint and restores it after joint iterator setup.
-        resume_rng_state = _restore_completed_phase_rng(
-            current, target_steps, resume_rng_state
+        if target_samples_per_rank is None:
+            resume_rng_state = _restore_completed_phase_rng(
+                current, target_steps, resume_rng_state
+            )
+        elif _phase_complete(
+            current,
+            target_steps,
+            completed_samples_per_rank,
+            target_samples_per_rank,
+        ) and resume_rng_state is not None:
+            restore_rng_state(resume_rng_state)
+            resume_rng_state = None
+        log.info(
+            "Phase budget: substage=%s steps=%d/%d samples_per_rank=%d/%s",
+            substage,
+            current,
+            target_steps,
+            completed_samples_per_rank,
+            (
+                "step-controlled"
+                if target_samples_per_rank is None
+                else str(target_samples_per_rank)
+            ),
         )
         checked_gradients = False
         # Match the legacy nwm-real logging contract: each published train
@@ -1529,7 +1726,17 @@ def run_two_stage_training(config, device, rank, local_gpu, experiment_dir, log=
         # log point, rather than the loss of one sampled minibatch.
         running_log_sums: dict[str, torch.Tensor] = {}
         running_log_counts: dict[str, int] = {}
-        while current < target_steps:
+        while not _phase_complete(
+            current,
+            target_steps,
+            completed_samples_per_rank,
+            target_samples_per_rank,
+        ):
+            if current >= target_steps:
+                raise RuntimeError(
+                    "Optimizer-step cap was reached before the exact sample "
+                    "budget; increase the configured phase step target"
+                )
             sampler.set_epoch(epoch)
             _set_dataset_epoch(dataset, epoch)
             _set_loader_epoch_seed(loader, int(config.seed), rank, epoch)
@@ -1555,6 +1762,11 @@ def run_two_stage_training(config, device, rank, local_gpu, experiment_dir, log=
                 resume_rng_state = None
             for batch in batch_iterator:
                 batch_in_epoch += 1
+                batch, local_batch_size = _budget_training_batch(
+                    batch,
+                    completed_samples_per_rank,
+                    target_samples_per_rank,
+                )
                 if (
                     training_stage == "real_finetune"
                     and scheme
@@ -1614,6 +1826,7 @@ def run_two_stage_training(config, device, rank, local_gpu, experiment_dir, log=
                 )
                 current += 1
                 global_steps += 1
+                completed_samples_per_rank += local_batch_size
                 if substage == "warmup":
                     completed_warmup = current
                 elif substage == "joint":
@@ -1660,6 +1873,9 @@ def run_two_stage_training(config, device, rank, local_gpu, experiment_dir, log=
                             f"train/{key}": value
                             for key, value in scalar_logs.items()
                         }
+                        wandb_values["train/samples_per_rank"] = (
+                            completed_samples_per_rank
+                        )
                         wandb_values.update(
                             {
                                 f"train/lr_group_{group_index}": float(
@@ -1725,7 +1941,9 @@ def run_two_stage_training(config, device, rank, local_gpu, experiment_dir, log=
                     interval=int(config.get("ckpt_every", 10000)),
                 ):
                     runtime_states = _gather_runtime_states(
-                        proxy_metrics, valid_alignment_batches
+                        proxy_metrics,
+                        valid_alignment_batches,
+                        completed_samples_per_rank,
                     )
                     if rank == 0:
                         _save_training_checkpoint(
@@ -1910,7 +2128,12 @@ def run_two_stage_training(config, device, rank, local_gpu, experiment_dir, log=
                             global_steps,
                         )
                     _reset_cuda_peak_memory(device)
-                if current >= target_steps:
+                if _phase_complete(
+                    current,
+                    target_steps,
+                    completed_samples_per_rank,
+                    target_samples_per_rank,
+                ):
                     break
             finished_epoch = epoch
             epoch, batch_in_epoch, epoch_exhausted = _phase_progress_after_iteration(
@@ -1939,14 +2162,29 @@ def run_two_stage_training(config, device, rank, local_gpu, experiment_dir, log=
                         _wandb_log(config, rank, metrics, global_steps)
                     proxy_metrics = ProxyMetrics()
                 valid_alignment_batches = 0
-            elif current < target_steps:
+            elif not _phase_complete(
+                current,
+                target_steps,
+                completed_samples_per_rank,
+                target_samples_per_rank,
+            ):
                 raise RuntimeError(
                     "Training DataLoader stopped before its reported length; "
                     "exact cursor accounting is impossible"
                 )
 
+        if (
+            target_samples_per_rank is not None
+            and completed_samples_per_rank != target_samples_per_rank
+        ):
+            raise RuntimeError(
+                "Phase ended without reaching its exact sample budget: "
+                f"{completed_samples_per_rank} != {target_samples_per_rank}"
+            )
         runtime_states = _gather_runtime_states(
-            proxy_metrics, valid_alignment_batches
+            proxy_metrics,
+            valid_alignment_batches,
+            completed_samples_per_rank,
         )
         if rank == 0:
             _save_training_checkpoint(
@@ -1986,7 +2224,7 @@ def run_two_stage_training(config, device, rank, local_gpu, experiment_dir, log=
             torch.cuda.empty_cache()
 
         if training_stage == "real_finetune" and substage == "warmup":
-            runtime_states = _gather_runtime_states(ProxyMetrics(), 0)
+            runtime_states = _gather_runtime_states(ProxyMetrics(), 0, 0)
             transition_data_fingerprint = build_data_resume_fingerprint(
                 config, "joint"
             )
