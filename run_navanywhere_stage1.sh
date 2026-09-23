@@ -37,8 +37,8 @@ case "${STAGE1_MODE}" in
 esac
 
 # ---- Frequently edited experiment settings ---------------------------------
-CONDA_ENV="${CONDA_ENV:-nwm}"
 CONDA_ACTIVATE="${CONDA_ACTIVATE:-/file_system/vepfs/algorithm/dujun.nie/miniconda3/bin/activate}"
+CONDA_ENV="${CONDA_ENV:-/file_system/vepfs/algorithm/dujun.nie/miniconda3/envs/nwm}"
 NAVANYWHERE_ROOT="${NAVANYWHERE_ROOT:-/file_system/nas/algorithm/dujun.nie/nwm/data/NavAnywhere}"
 COMPACT_NAS_ROOT="${COMPACT_NAS_ROOT:-/file_system/nas/algorithm/dujun.nie/nwm/compact}"
 SAMPLING_SEED="${SAMPLING_SEED:-20260901}"

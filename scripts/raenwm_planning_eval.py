@@ -34,13 +34,14 @@ from scripts.raenwm_infer import (
 from scripts.benchmark_reproducibility import samplewise_randn
 
 
-EXPECTED_SAMPLE_COUNT = 100
+DEFAULT_EXPECTED_SAMPLE_COUNT = 100
 EXPECTED_SPLIT_SHA256 = {
     "recon": "c62cd08be9f124cbeec48d914460da8630e089bf0bdb84c5018013a82d12ec54",
     "scand": "8acb4062561cbf1549e27f39a6e80241b97294a8c0e55c345787ae6a47be55ce",
     "huron": "89e07bb2b934d7fe4e8ab0bddf51e28a4beb36d2415ad83c166350241ef4e9fd",
     "tartan_drive": "77bc38808b8df24b330fc4f9a4a17ed0de35a1c1bef0ff2283fc461b3ab16435",
     "go_stanford": "5013d8e2defbbee4d9652f7ae4569816113a8d44dd2af8b5e135d9f5cea3e27c",
+    "planetary_rover": "17a83bbc5994d30700a9d4c181b0205e5771066a3f5d547190d41bf1ee2ba54b",
 }
 HORIZON_STEPS = 8
 CONTEXT_SIZE = 4
@@ -58,6 +59,7 @@ EVAL_WAYPOINT_SPACING = {
     "huron": 0.255,
     "tartan_drive": 0.72,
     "go_stanford": 0.12,
+    "planetary_rover": 1.0,
 }
 RAENWM_WAYPOINT_SPACING = {
     "recon": 0.25,
@@ -65,6 +67,7 @@ RAENWM_WAYPOINT_SPACING = {
     "huron": 0.255,
     "tartan_drive": 0.72,
     "go_stanford": 0.12,
+    "planetary_rover": 1.0,
 }
 PLAN_DISTRIBUTIONS = {
     "recon": {"mu": [-0.1, 0.0, 0.0], "sigma": [0.02, 0.1, 0.1]},
@@ -72,6 +75,7 @@ PLAN_DISTRIBUTIONS = {
     "huron": {"mu": [-0.33, 0.0, 0.0], "sigma": [0.03, 0.1, 0.1]},
     "tartan_drive": {"mu": [0.5, 0.0, 0.0], "sigma": [0.07, 0.1, 0.1]},
     "go_stanford": {"mu": [-0.1, 0.0, 0.0], "sigma": [0.1, 0.15, 0.1]},
+    "planetary_rover": {"mu": [-0.1, 0.0, 0.0], "sigma": [0.1, 0.15, 0.1]},
 }
 OOD_PLAN_DISTRIBUTION = {
     "mu": [-0.1, 0.0, 0.0],
@@ -158,9 +162,13 @@ def configure_dataset_contract(args: argparse.Namespace, dataset_name: str) -> N
     report = json.loads(report_path.read_text(encoding="utf-8"))
     if report.get("dataset") != dataset_name:
         raise ValueError(f"Dataset report identity mismatch: {report_path}")
-    if report.get("navigation_samples") != EXPECTED_SAMPLE_COUNT:
+    reported_count = report.get(
+        "navigation_sample_count", report.get("navigation_samples")
+    )
+    if reported_count != args.expected_sample_count:
         raise ValueError(
-            f"{dataset_name} report does not pin {EXPECTED_SAMPLE_COUNT} navigation samples"
+            f"{dataset_name} report does not pin "
+            f"{args.expected_sample_count} navigation samples"
         )
     split_metadata = report.get("splits", {}).get("navigation_eval.pkl")
     if not split_metadata or not split_metadata.get("sha256"):
@@ -214,9 +222,10 @@ def build_dataset(args: argparse.Namespace, dataset_name: str, dataset_cls: Any,
     dataset.data_config = {
         "metric_waypoint_spacing": EVAL_WAYPOINT_SPACING[dataset_name]
     }
-    if len(dataset) != EXPECTED_SAMPLE_COUNT:
+    if len(dataset) != args.expected_sample_count:
         raise RuntimeError(
-            f"Expected {EXPECTED_SAMPLE_COUNT} {dataset_name} navigation samples, got {len(dataset)}"
+            f"Expected {args.expected_sample_count} {dataset_name} navigation "
+            f"samples, got {len(dataset)}"
         )
     return dataset
 
@@ -400,7 +409,8 @@ def run_dataset(
     output = args.output_root / dataset_name / RESULT_STEM
     samples = output / "sample_metrics"
     samples.mkdir(parents=True, exist_ok=True)
-    assigned = list(range(rank, len(dataset), world_size))
+    requested = args.sample_indices if args.sample_indices is not None else list(range(len(dataset)))
+    assigned = requested[rank::world_size]
 
     started = time.monotonic()
     for offset, sample_index in enumerate(assigned):
@@ -433,7 +443,7 @@ def run_dataset(
     if world_size > 1:
         torch_dist.all_reduce(elapsed, op=torch_dist.ReduceOp.MAX)
         torch_dist.barrier()
-    if rank == 0:
+    if rank == 0 and args.write_aggregate:
         records = []
         for sample_index in range(len(dataset)):
             path = samples / f"{sample_index:06d}.json"
@@ -474,7 +484,7 @@ def write_manifest(args: argparse.Namespace, world_size: int) -> None:
         },
         "datasets": {
             name: {
-                "sample_count": EXPECTED_SAMPLE_COUNT,
+                "sample_count": args.expected_sample_count,
                 "split": str(
                     args.project_root
                     / "data_splits"
@@ -512,7 +522,30 @@ def write_manifest(args: argparse.Namespace, world_size: int) -> None:
             "topology_independent": True,
         },
     }
-    atomic_json(args.output_root / "planning_manifest.json", manifest)
+    manifest_path = args.output_root / "planning_manifest.json"
+    if manifest_path.is_file():
+        existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for field in (
+            "schema_version",
+            "model",
+            "source_revision",
+            "checkpoint",
+            "protocol",
+        ):
+            if existing.get(field) != manifest[field]:
+                raise RuntimeError(
+                    f"Cannot merge incompatible planning manifest field {field}: "
+                    f"{manifest_path}"
+                )
+        existing_datasets = existing.get("datasets")
+        if not isinstance(existing_datasets, dict):
+            raise RuntimeError(
+                f"Existing planning manifest has invalid datasets: {manifest_path}"
+            )
+        manifest["created_at"] = existing.get("created_at", manifest["created_at"])
+        manifest["updated_at"] = datetime.now(timezone.utc).isoformat()
+        manifest["datasets"] = {**existing_datasets, **manifest["datasets"]}
+    atomic_json(manifest_path, manifest)
 
 
 def parse_args() -> argparse.Namespace:
@@ -531,9 +564,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--opt-steps", type=int, default=1)
     parser.add_argument("--num-repeat-eval", type=int, default=3)
     parser.add_argument("--microbatch-size", type=int, default=80)
+    parser.add_argument("--sample-indices", nargs="+", type=int)
+    parser.add_argument("--write-aggregate", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--sampling-method", default="euler")
     parser.add_argument("--num-steps", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--expected-sample-count",
+        type=int,
+        default=DEFAULT_EXPECTED_SAMPLE_COUNT,
+        help="Exact registered navigation split size for every dataset in this invocation.",
+    )
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
@@ -541,6 +582,13 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("The registered navigation protocol is fixed at CEM N80/K5/OPT1/rep3")
     if args.microbatch_size < 1:
         raise ValueError("--microbatch-size must be positive")
+    if args.expected_sample_count < 1:
+        raise ValueError("--expected-sample-count must be positive")
+    if args.sample_indices is not None and (
+        len(args.sample_indices) != len(set(args.sample_indices))
+        or any(i < 0 or i >= args.expected_sample_count for i in args.sample_indices)
+    ):
+        raise ValueError("--sample-indices must be unique valid split positions")
     return args
 
 

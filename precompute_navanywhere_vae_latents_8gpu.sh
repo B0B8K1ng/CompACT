@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
+trap 'status=$?; echo "Launcher exit status: ${status}"' EXIT
 
 # Fast, resumable NavAnywhere SD-VAE posterior extraction.  Edit/override the
-# variables in this block; the default launch detaches through codex-exp.
+# variables in this block; the default launch detaches through nohup.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_PATH="${SCRIPT_DIR}/$(basename -- "${BASH_SOURCE[0]}")"
 cd "${SCRIPT_DIR}"
@@ -10,19 +11,18 @@ cd "${SCRIPT_DIR}"
 DETACH="${DETACH:-1}"
 RUN_TIMESTAMP="${RUN_TIMESTAMP:-$(date -u +%Y%m%d_%H%M%S)}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-navvae8-$(date -u +%m%d-%H%M%S)}"
-if [[ "${DETACH}" == "1" && "${RUN_UNDER_CODEX_EXP:-0}" != "1" ]]; then
-    if ! command -v codex-exp >/dev/null 2>&1; then
-        echo "ERROR: codex-exp is required for detached precompute; set DETACH=0 to run attached." >&2
-        exit 2
-    fi
-    echo "Starting experiment ${EXPERIMENT_NAME} in ${SCRIPT_DIR}"
-    echo "Monitor: codex-exp status ${EXPERIMENT_NAME}"
-    echo "Logs:    codex-exp logs ${EXPERIMENT_NAME}"
-    echo "Run log: ${LOG_DIR:-/file_system/nas/algorithm/dujun.nie/nwm/compact/logs/navanywhere_vae_latents}/precompute_${RUN_TIMESTAMP}.log"
-    exec codex-exp start "${EXPERIMENT_NAME}" -- \
-        env RUN_UNDER_CODEX_EXP=1 DETACH=0 \
-        EXPERIMENT_NAME="${EXPERIMENT_NAME}" RUN_TIMESTAMP="${RUN_TIMESTAMP}" \
-        "${SCRIPT_PATH}"
+if [[ "${DETACH}" == "1" ]]; then
+    DETACHED_LOG_DIR="${LOG_DIR:-/file_system/nas/algorithm/dujun.nie/nwm/compact/logs/navanywhere_vae_latents}"
+    mkdir -p "${DETACHED_LOG_DIR}"
+    DETACHED_LOG="${DETACHED_LOG_DIR}/background_${RUN_TIMESTAMP}.log"
+    nohup env DETACH=0 RUN_TIMESTAMP="${RUN_TIMESTAMP}" \
+        bash "${SCRIPT_PATH}" > "${DETACHED_LOG}" 2>&1 < /dev/null &
+    pid=$!
+    echo "${pid}" > "${DETACHED_LOG}.pid"
+    echo "cwd: ${SCRIPT_DIR}"
+    echo "PID: ${pid}"
+    echo "Log: ${DETACHED_LOG}"
+    exit 0
 fi
 
 CONDA_ENV="${CONDA_ENV:-nwm}"
@@ -161,6 +161,9 @@ ARGS=(
     --max-trajectories "${MAX_TRAJECTORIES}"
     --log-every-trajectories "${LOG_EVERY_TRAJECTORIES}"
 )
+if [[ -n "${VAE_REUSE_ROOT:-}" ]]; then
+    ARGS+=(--reuse-root "${VAE_REUSE_ROOT}")
+fi
 if [[ "${OVERWRITE}" == "1" ]]; then
     ARGS+=(--overwrite)
 fi

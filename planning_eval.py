@@ -279,6 +279,14 @@ class WM_Planning_Evaluator:
             dataset_val = get_dataset_eval(
                 self.config, dataset_name, predefined_index=True
             )
+            requested = self.config.get("planning_sample_indices")
+            if requested is not None:
+                requested = [int(value) for value in requested]
+                if len(requested) != len(set(requested)) or any(
+                    value < 0 or value >= len(dataset_val) for value in requested
+                ):
+                    raise ValueError("planning_sample_indices must be unique valid split positions")
+                dataset_val = torch.utils.data.Subset(dataset_val, requested)
 
             if len(dataset_val) % num_tasks != 0 and not self.config.get(
                 "exact_distributed_eval", True
@@ -927,7 +935,8 @@ class WM_Planning_Evaluator:
             output_fn = os.path.join(
                 self.config.output_dir, f"{dataset_name}_{self.eval_name}.json"
             )
-            save_metric_to_disk(metric_logger, output_fn)
+            if self.config.get("planning_write_aggregate", True):
+                save_metric_to_disk(metric_logger, output_fn)
 
         # gather the stats from all processes
         metric_logger.synchronize_between_processes()

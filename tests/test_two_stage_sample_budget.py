@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -210,6 +211,7 @@ def test_nav1_80gb_launcher_syntax_and_contract_dry_run() -> None:
     subprocess.run(["bash", "-n", str(LAUNCHER)], check=True)
     result = subprocess.run(
         ["bash", str(LAUNCHER), "--dry-run"],
+        env={**os.environ, "BUDGET_MODE": "samples"},
         cwd=ROOT,
         check=True,
         text=True,

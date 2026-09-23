@@ -25,7 +25,7 @@ num_workers: 12                 # Number of workers for data loading
 batch_size: 1                 # Batch size for planning evaluation
 
 # Evaluation-only datasets override any training dataset entry stored in the
-# checkpoint config. Every OOD navigation split is fixed to 100 real-pose windows.
+# checkpoint config. Each entry fixes the exact available navigation sample count.
 evaluation_datasets:
   recon:
     data_folder: ${oc.env:NWM_DATA_ROOT}/recon
@@ -67,11 +67,13 @@ evaluation_datasets:
   planetary_rover:
     data_folder: ${oc.env:NWM_DATA_ROOT}/planetary_rover
     test: data_splits/planetary_rover/test/
-    metric_waypoint_spacing: 0.9741752833246042
+    metric_waypoint_spacing: 1.0  # normalized median-step units, NOT meters
     navigation_index: data_splits/planetary_rover/test/navigation_eval.pkl
-    navigation_traj_names: rollout_traj_names.txt
-    navigation_sample_count: 100
-    temporal_semantics: spatial_index
+    navigation_traj_names: traj_names.txt
+    navigation_sample_count: 47
+    temporal_semantics: irregular_real_frame_index
+    position_units: sequence_median_step_units
+    metric_navigation_evaluation_allowed: false
   unitree_go2:
     data_folder: ${oc.env:NWM_DATA_ROOT}/unitree_go2
     test: data_splits/unitree_go2/test/
@@ -143,3 +145,5 @@ plan_datasets_hyperparams:
   unitree_go2: *ood_plan_distribution
   tum_rgbd: *ood_plan_distribution
   uzh_fpv: *ood_plan_distribution
+planning_sample_indices: null
+planning_write_aggregate: true

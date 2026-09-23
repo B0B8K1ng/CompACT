@@ -64,13 +64,16 @@ datasets:
     goals_per_obs: 4
     metric_waypoint_spacing: 0.12
   planetary_rover:
-    # Held-out real planetary data; never include it in NWM-real training.
+    # Real Chang'e-4/Yutu-2 and Tianwen-1/Zhurong native-colour imagery.
+    # Keep this held-out source disabled in NWM-real training/precompute runs.
     enabled: false
     evaluation_only: true
     data_folder: ${oc.env:NWM_DATA_ROOT}/planetary_rover
     test: data_splits/planetary_rover/test/
     goals_per_obs: 4
-    metric_waypoint_spacing: 0.9741752833246042
+    metric_waypoint_spacing: 1.0  # normalized median-step units, NOT meters
     wrap_delta_yaw: true
-    use_predefined_index: false
-    temporal_semantics: spatial_index
+    use_predefined_index: true
+    temporal_semantics: irregular_real_frame_index
+    position_units: sequence_median_step_units
+    metric_navigation_evaluation_allowed: false

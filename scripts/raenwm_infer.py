@@ -117,7 +117,20 @@ def save_image(path: Path, image: Any) -> None:
     array = (
         image.detach().float().cpu().nan_to_num().clamp(0, 1).permute(1, 2, 0).numpy()
     )
-    Image.fromarray((array * 255).astype(np.uint8), mode="RGB").save(path)
+    temporary = path.with_name(f"{path.stem}.tmp.{os.getpid()}.png")
+    Image.fromarray((array * 255).astype(np.uint8), mode="RGB").save(temporary)
+    temporary.replace(path)
+
+
+def valid_image(path: Path) -> bool:
+    from PIL import Image
+
+    try:
+        with Image.open(path) as image:
+            image.verify()
+        return True
+    except (FileNotFoundError, OSError, ValueError):
+        return False
 
 
 def configure_imports(source: Path) -> None:
@@ -187,14 +200,20 @@ def build_dataset(
     )
     dataset.dataset_name = dataset_name
     dataset.data_config = {"metric_waypoint_spacing": spacing}
-    expected_count = (
-        DIRECT_SAMPLE_COUNT if args.eval_type == "time" else ROLLOUT_SAMPLE_COUNT
-    )
+    expected_count = expected_sample_count(args)
     if len(dataset) != expected_count:
         raise RuntimeError(
             f"Expected {expected_count} samples in {split}, found {len(dataset)}"
         )
     return dataset
+
+
+def expected_sample_count(args: argparse.Namespace) -> int:
+    """Resolve the exact registered split size for this invocation."""
+
+    if args.expected_sample_count is not None:
+        return int(args.expected_sample_count)
+    return DIRECT_SAMPLE_COUNT if args.eval_type == "time" else ROLLOUT_SAMPLE_COUNT
 
 
 def waypoint_spacing(args: argparse.Namespace, dataset_name: str) -> float:
@@ -207,7 +226,14 @@ def waypoint_spacing(args: argparse.Namespace, dataset_name: str) -> float:
             f"No waypoint spacing for {dataset_name}; expected {config_path}"
         )
     payload = json.loads(config_path.read_text(encoding="utf-8"))
-    spacing = float(payload["metric_waypoint_spacing"])
+    if (
+        dataset_name == "planetary_rover"
+        and payload.get("position_units") == "sequence_median_step_units"
+    ):
+        # Refreshed rover poses already use normalized sequence-step units.
+        spacing = 1.0
+    else:
+        spacing = float(payload["metric_waypoint_spacing"])
     if not math.isfinite(spacing) or spacing <= 0:
         raise ValueError(f"Invalid waypoint spacing for {dataset_name}: {spacing}")
     return spacing
@@ -408,6 +434,8 @@ def predict_rollout(
     batch, steps = grouped.shape[:2]
     actions = compose_se2(grouped.flatten(0, 1)).unflatten(0, (batch, steps))
     observations = observations.to(device)
+    if args.single_image_context:
+        observations = observations[:, -1:].expand(-1, 4, -1, -1, -1).contiguous()
     with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
         pixels = observations.flatten(0, 1) * 0.5 + 0.5
         current = rae.encode(pixels).unflatten(
@@ -431,7 +459,14 @@ def predict_rollout(
             sample = output / f"id_{int(sample_index.item())}"
             sample.mkdir(parents=True, exist_ok=True)
             save_image(sample / f"{step}.png", decoded[offset])
-        current = torch.cat((current[:, 1:], prediction.unsqueeze(1)), dim=1)
+        if args.pixel_feedback:
+            # Follow the image-feedback rollout contract: decode the prediction
+            # to display-space pixels, then encode those pixels for the next step.
+            with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                feedback = rae.encode(decoded.clamp(0, 1)).unsqueeze(1)
+        else:
+            feedback = prediction.unsqueeze(1)
+        current = torch.cat((current[:, 1:], feedback), dim=1)
 
 
 def incomplete_indices(output: Path, indices: Any, force: bool, frames: Any) -> list[int]:
@@ -440,7 +475,7 @@ def incomplete_indices(output: Path, indices: Any, force: bool, frames: Any) -> 
     keep: list[int] = []
     for offset, value in enumerate(indices.view(-1)):
         sample = output / f"id_{int(value.item())}"
-        if not all((sample / f"{frame}.png").is_file() for frame in frames):
+        if not all(valid_image(sample / f"{frame}.png") for frame in frames):
             keep.append(offset)
     return keep
 
@@ -448,9 +483,7 @@ def incomplete_indices(output: Path, indices: Any, force: bool, frames: Any) -> 
 def write_manifest(args: argparse.Namespace, world_size: int) -> None:
     if int(os.environ.get("RANK", "0")) != 0:
         return
-    expected_count = (
-        DIRECT_SAMPLE_COUNT if args.eval_type == "time" else ROLLOUT_SAMPLE_COUNT
-    )
+    expected_count = expected_sample_count(args)
     dataset_manifest = {}
     for name in args.datasets:
         layout = DATASET_LAYOUTS[name]
@@ -502,7 +535,9 @@ def write_manifest(args: argparse.Namespace, world_size: int) -> None:
                 else "autoregressive visual rollout"
             ),
             "horizons_seconds": (
-                list(args.horizons) if args.eval_type == "time" else [1, 2, 4, 8, 16]
+                list(args.horizons)
+                if args.eval_type == "time"
+                else [args.future_frames // INPUT_FPS]
             ),
             "rollout_fps": (
                 list(args.rollout_fps) if args.eval_type == "rollout" else None
@@ -518,7 +553,13 @@ def write_manifest(args: argparse.Namespace, world_size: int) -> None:
             "distributed_world_size": world_size,
             "batch_size_per_rank": args.batch_size,
             "max_samples": args.max_samples,
+            "sample_indices": args.sample_indices,
             "compile": args.compile,
+            "context_initialization": (
+                "repeat_last_observed_image" if args.single_image_context
+                else "four_observed_images"
+            ),
+            "feedback": "decoded_image_reencoded" if args.pixel_feedback else "latent",
         },
     }
     temporary = output.with_suffix(".tmp.json")
@@ -540,12 +581,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-type", choices=("time", "rollout"), default="time")
     parser.add_argument("--horizons", nargs="+", type=int, default=list(HORIZONS))
     parser.add_argument("--rollout-fps", nargs="+", type=int, default=[1, 4])
+    parser.add_argument(
+        "--sample-indices",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Positions in the pinned evaluation split; output IDs remain the original positions.",
+    )
     parser.add_argument("--future-frames", type=int, default=64)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--sampling-method", default="euler")
     parser.add_argument("--num-steps", type=int, default=50)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--single-image-context", action="store_true")
+    parser.add_argument("--pixel-feedback", action="store_true")
+    parser.add_argument(
+        "--expected-sample-count",
+        type=int,
+        default=None,
+        help=(
+            "Exact registered split size. Defaults to the historical 500 direct "
+            "or 150 rollout samples when omitted."
+        ),
+    )
     parser.add_argument(
         "--max-samples",
         type=int,
@@ -561,6 +620,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if expected_sample_count(args) < 1:
+        raise ValueError("--expected-sample-count must be positive")
     args.horizons = tuple(args.horizons)
     if args.eval_type == "time" and (
         not args.horizons
@@ -578,8 +639,13 @@ def main() -> None:
             raise ValueError("--rollout-fps must be unique and increasing")
         if any(fps <= 0 or INPUT_FPS % fps for fps in args.rollout_fps):
             raise ValueError(f"--rollout-fps values must divide {INPUT_FPS}")
-        if args.future_frames != 64:
-            raise ValueError("The registered rollout protocol requires 64 future frames")
+        if args.future_frames not in (16, 64):
+            raise ValueError("Autoregressive rollouts require 16 (4 s) or 64 (16 s) future frames")
+    if args.sample_indices is not None:
+        if len(set(args.sample_indices)) != len(args.sample_indices):
+            raise ValueError("--sample-indices must be unique")
+        if any(index < 0 or index >= expected_sample_count(args) for index in args.sample_indices):
+            raise ValueError("--sample-indices are outside the pinned evaluation split")
     args.source = args.source.resolve()
     args.project_root = args.project_root.resolve()
     args.output_root = args.output_root.resolve()
@@ -611,6 +677,8 @@ def main() -> None:
 
     for dataset_name in args.datasets:
         dataset = build_dataset(args, dataset_name, official_misc, EvalDataset)
+        if args.sample_indices is not None:
+            dataset = torch.utils.data.Subset(dataset, args.sample_indices)
         if args.max_samples is not None:
             if args.max_samples < 1:
                 raise ValueError("--max-samples must be positive")
@@ -632,13 +700,13 @@ def main() -> None:
             if args.eval_type == "time":
                 output = args.output_root / dataset_name / "time"
                 output.mkdir(parents=True, exist_ok=True)
-                keep = incomplete_indices(output, indices, args.force, args.horizons)
-                if keep:
-                    select = torch.as_tensor(keep, dtype=torch.long)
-                    selected_indices = indices.index_select(0, select)
-                    selected_observations = observations.index_select(0, select)
-                    selected_deltas = deltas.index_select(0, select)
-                    for horizon in args.horizons:
+                for horizon in args.horizons:
+                    keep = incomplete_indices(output, indices, args.force, (horizon,))
+                    if keep:
+                        select = torch.as_tensor(keep, dtype=torch.long)
+                        selected_indices = indices.index_select(0, select)
+                        selected_observations = observations.index_select(0, select)
+                        selected_deltas = deltas.index_select(0, select)
                         action = compose_se2(
                             selected_deltas[:, : horizon * INPUT_FPS]
                         )
@@ -660,7 +728,7 @@ def main() -> None:
                             sample = output / f"id_{int(sample_index.item())}"
                             sample.mkdir(parents=True, exist_ok=True)
                             save_image(sample / f"{horizon}.png", predictions[offset])
-                    generated += len(keep)
+                        generated += len(keep)
             else:
                 for rollout_fps in args.rollout_fps:
                     output = (

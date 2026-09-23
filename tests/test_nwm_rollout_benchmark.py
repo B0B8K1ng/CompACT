@@ -1,6 +1,7 @@
 import importlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -11,6 +12,7 @@ from scripts.nwm_benchmark_registry import (
     MODELS,
     OOD_DATASET_CONTRACTS,
     PROTOCOLS,
+    dataset_sample_count,
     import_planning,
     import_prediction,
     load_registry,
@@ -153,7 +155,7 @@ def test_navigation_protocol_pins_splits_and_cem_settings() -> None:
     )
 
 
-def test_unified_prediction_protocols_pin_all_nine_datasets() -> None:
+def test_unified_prediction_protocols_pin_registered_dataset_eligibility() -> None:
     expected = [
         "recon",
         "scand",
@@ -173,12 +175,33 @@ def test_unified_prediction_protocols_pin_all_nine_datasets() -> None:
     assert direct["sample_count"] == 500
     assert direct["horizons_seconds"] == [4]
     assert direct["reproducibility"]["topology_independent"] is True
-    assert rollout["datasets"] == expected
+    assert rollout["datasets"] == [
+        dataset for dataset in expected if dataset != "planetary_rover"
+    ]
     assert rollout["sample_count"] == 150
     assert rollout["rollout_fps"] == [1, 4]
     assert rollout["reproducibility"]["topology_independent"] is True
     assert PROTOCOLS["navigation_cem80_v1"]["datasets"] == expected
     assert "go_stanford_unseen_rollout_10_v1" not in PROTOCOLS
+
+
+def test_planetary_sample_counts_do_not_change_other_dataset_contracts() -> None:
+    direct = PROTOCOLS["direct_4s_v1"]
+    ood_direct = PROTOCOLS["ood_direct_4s_v1"]
+    navigation = PROTOCOLS["navigation_cem80_v1"]
+    planetary = OOD_DATASET_CONTRACTS["planetary_rover"]
+
+    assert planetary["prediction_sample_count"] == 10
+    assert planetary["navigation_sample_count"] == 47
+    assert planetary["rollout_sample_count"] == 0
+    assert dataset_sample_count(direct, "planetary_rover", "time") == 10
+    assert dataset_sample_count(ood_direct, "planetary_rover", "time") == 10
+    assert dataset_sample_count(navigation, "planetary_rover", "navigation") == 47
+
+    for dataset in ("unitree_go2", "tum_rgbd", "uzh_fpv"):
+        assert dataset_sample_count(direct, dataset, "time") == 500
+        assert dataset_sample_count(ood_direct, dataset, "time") == 500
+        assert dataset_sample_count(navigation, dataset, "navigation") == 100
 
 
 def test_ood_direct_protocol_is_fully_pinned() -> None:
@@ -212,12 +235,7 @@ def test_ood_direct_protocol_is_fully_pinned() -> None:
         "sampling_steps": 50,
         "batch_size_per_rank": 16,
     }
-    expected_hashes = {
-        "planetary_rover": (
-            "cec1b5d0e9a7de2f1bac564721f81f17bb50819b6f96fc9e6751fbfb36897b43",
-            "3ef7bbabc0244d1e18fb50bb47c231ca3993eacd976e209838f30b32bf4350e6",
-            "7d3f27f694e5f554c944714a564b8d7bb354ca8fa604c1c2aab9e5664b6fd16f",
-        ),
+    expected_stable_hashes = {
         "unitree_go2": (
             "857142dfa00167fd19231c583b7c5af14ec2badfb19b44505aad8aafecff0030",
             "ec25e7b7811057a97a8a59ae5dadd2c683a48c8b8b2e861927e826a7478d1ccd",
@@ -241,7 +259,8 @@ def test_ood_direct_protocol_is_fully_pinned() -> None:
             contract["navigation_split"]["sha256"],
         )
         for dataset, contract in OOD_DATASET_CONTRACTS.items()
-    } == expected_hashes
+        if dataset != "planetary_rover"
+    } == expected_stable_hashes
     for contract in OOD_DATASET_CONTRACTS.values():
         for key in ("report", "prediction_split", "navigation_split"):
             sha256 = contract[key]["sha256"]
@@ -314,6 +333,82 @@ def test_ood_prediction_import_accepts_only_the_registered_4s_frame(
             audit,
             "ood_direct_4s_v1",
         )
+
+
+def test_planetary_prediction_import_requires_ten_samples(tmp_path: Path) -> None:
+    registry = new_registry()
+    audit = tmp_path / "planetary_prediction.json"
+    payload = {
+        "dataset": "planetary_rover",
+        "eval_name": "time",
+        "sample_count": 10,
+        "frame_indices": {"4s": 4},
+        "metrics": {
+            "4s": {
+                "sample_count": 10,
+                "lpips_alex": 0.5,
+                "dreamsim": 0.4,
+                "psnr": 12.0,
+            }
+        },
+        "inference": {
+            "backend": "nwm",
+            "sampler": "ddpm",
+            "sampling_steps": 250,
+            "seed": 0,
+        },
+    }
+    audit.write_text(json.dumps(payload), encoding="utf-8")
+
+    import_prediction(
+        registry,
+        "nwm-real",
+        "planetary_rover",
+        "time",
+        audit,
+        "ood_direct_4s_v1",
+    )
+    result = registry["models"]["nwm-real"]["results"][
+        "ood_direct_prediction"
+    ]["planetary_rover"]["time"]
+    assert result["sample_count"] == 10
+
+    payload["sample_count"] = 500
+    payload["metrics"]["4s"]["sample_count"] = 500
+    audit.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="expected 10, got 500"):
+        import_prediction(
+            registry,
+            "nwm-real",
+            "planetary_rover",
+            "time",
+            audit,
+            "ood_direct_4s_v1",
+        )
+
+
+def test_planetary_planning_import_requires_forty_seven_samples(tmp_path: Path) -> None:
+    registry = new_registry()
+    metrics = tmp_path / "planetary_planning.json"
+    payload = {
+        "planetary_rover_ate": 1.0,
+        "planetary_rover_rpe_trans": 0.2,
+        "planetary_rover_pos_diff_norm": 0.8,
+        "planetary_rover_yaw_diff_norm": 0.1,
+        "sample_count": 47,
+    }
+    metrics.write_text(json.dumps(payload), encoding="utf-8")
+
+    import_planning(registry, "nwm-real", "planetary_rover", metrics)
+    result = registry["models"]["nwm-real"]["results"][
+        "navigation_planning"
+    ]["planetary_rover"]
+    assert result["sample_count"] == 47
+
+    payload["sample_count"] = 100
+    metrics.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="expected 47, got 100"):
+        import_planning(registry, "nwm-real", "planetary_rover", metrics)
 
 
 def test_raenwm_navigation_action_bridge_preserves_physical_motion_and_yaw() -> None:
@@ -622,6 +717,7 @@ def test_raenwm_prediction_dry_run_uses_dedicated_backend(
     assert "scripts/raenwm_infer.py" in inference
     assert "--num-steps" in inference
     assert inference[inference.index("--num-steps") + 1] == "50"
+    assert inference[inference.index("--expected-sample-count") + 1] == "500"
     assert "isolated_nwm_infer.py" not in inference
 
 
@@ -666,6 +762,62 @@ def test_raenwm_rollout_dry_run_uses_autoregressive_backend(
     assert inference[inference.index("--rollout-fps") + 1 :] == ["1", "4"]
     assert inference[inference.index("--future-frames") + 1] == "64"
     assert inference[inference.index("--num-steps") + 1] == "50"
+    assert inference[inference.index("--expected-sample-count") + 1] == "150"
+
+
+def test_grouped_direct_prediction_separates_planetary_sample_count(
+    tmp_path: Path, monkeypatch
+) -> None:
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    monkeypatch.syspath_prepend(str(scripts))
+    runner = importlib.import_module("run_nwm_benchmark")
+    monkeypatch.setattr(runner, "BENCHMARK_ROOT", tmp_path)
+    monkeypatch.setattr(
+        runner,
+        "ensure_ground_truth",
+        lambda *args, **kwargs: tmp_path / "gt",
+    )
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        runner,
+        "run",
+        lambda command, env, dry_run: commands.append(command),
+    )
+    registry = new_registry()
+
+    runner.run_grouped_prediction_inference(
+        "nwm-real",
+        registry["models"]["nwm-real"],
+        ["planetary_rover", "unitree_go2"],
+        ("time",),
+        ["0"],
+        {"NWM_DATA_ROOT": "/datasets"},
+        False,
+        True,
+        reference_model=registry["models"]["nwm-real"],
+        raenwm_python=Path("/envs/raenwm/bin/python"),
+        batch_size=None,
+        time_horizons=(4,),
+    )
+
+    inference = [
+        command for command in commands if "isolated_nwm_infer.py" in command
+    ]
+    assert len(inference) == 2
+    by_count = {
+        next(
+            argument
+            for argument in command
+            if argument.startswith("eval_expected_full_count=")
+        ): command
+        for command in inference
+    }
+    assert "datasets_to_eval=[planetary_rover]" in by_count[
+        "eval_expected_full_count=10"
+    ]
+    assert "datasets_to_eval=[unitree_go2]" in by_count[
+        "eval_expected_full_count=500"
+    ]
 
 
 def test_local_direct_prediction_can_serialize_four_logical_ranks_on_one_gpu(
@@ -847,6 +999,139 @@ def test_local_ood_direct_can_serialize_four_logical_ranks_on_one_gpu(
         assert "batch_size=64" in command
 
 
+def test_local_ood_direct_groups_planetary_and_unitree_by_sample_count(
+    tmp_path: Path, monkeypatch
+) -> None:
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    monkeypatch.syspath_prepend(str(scripts))
+    runner = importlib.import_module("run_nwm_benchmark")
+    monkeypatch.setattr(runner, "BENCHMARK_ROOT", tmp_path)
+    monkeypatch.setattr(
+        runner,
+        "ensure_ood_ground_truth",
+        lambda *args, **kwargs: tmp_path / "gt",
+    )
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        runner,
+        "run",
+        lambda command, env, dry_run: commands.append(command),
+    )
+    registry = new_registry()
+
+    runner.run_ood_direct_prediction(
+        "nwm-real",
+        registry["models"]["nwm-real"],
+        ["planetary_rover", "unitree_go2"],
+        ["0", "1", "2", "3"],
+        {"NWM_DATA_ROOT": PROTOCOLS["ood_direct_4s_v1"]["data_root"]},
+        tmp_path / "registry.json",
+        registry,
+        False,
+        True,
+    )
+
+    inference = [
+        command for command in commands if "isolated_nwm_infer.py" in command
+    ]
+    assert len(inference) == 2
+    by_count = {
+        next(
+            argument
+            for argument in command
+            if argument.startswith("eval_expected_full_count=")
+        ): command
+        for command in inference
+    }
+    assert "datasets_to_eval=[planetary_rover]" in by_count[
+        "eval_expected_full_count=10"
+    ]
+    assert "datasets_to_eval=[unitree_go2]" in by_count[
+        "eval_expected_full_count=500"
+    ]
+
+
+def test_local_ood_planetary_partitions_samples_across_four_logical_ranks(
+    tmp_path: Path, monkeypatch
+) -> None:
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    monkeypatch.syspath_prepend(str(scripts))
+    runner = importlib.import_module("run_nwm_benchmark")
+    monkeypatch.setattr(runner, "BENCHMARK_ROOT", tmp_path)
+    monkeypatch.setattr(
+        runner,
+        "ensure_ood_ground_truth",
+        lambda *args, **kwargs: tmp_path / "gt",
+    )
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        runner,
+        "run",
+        lambda command, env, dry_run: commands.append(command),
+    )
+    registry = new_registry()
+
+    runner.run_ood_direct_prediction(
+        "nwm-real",
+        registry["models"]["nwm-real"],
+        ["planetary_rover"],
+        ["7"],
+        {"NWM_DATA_ROOT": PROTOCOLS["ood_direct_4s_v1"]["data_root"]},
+        tmp_path / "registry.json",
+        registry,
+        False,
+        True,
+        serialize_logical_ranks=True,
+    )
+
+    inference = [
+        command for command in commands if "isolated_nwm_infer.py" in command
+    ]
+    assert len(inference) == 4
+    for logical_rank, command in enumerate(inference):
+        assert "eval_expected_full_count=10" in command
+        indices_argument = next(
+            argument
+            for argument in command
+            if argument.startswith("eval_sample_indices=")
+        )
+        indices = [
+            int(value)
+            for value in indices_argument.removeprefix("eval_sample_indices=[")
+            .removesuffix("]")
+            .split(",")
+        ]
+        assert indices == list(range(logical_rank, 10, 4))
+        assert "seed=0" in command
+
+
+
+def test_local_ood_direct_rejects_a_sample_count_smaller_than_world_size(
+    tmp_path: Path, monkeypatch
+) -> None:
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    monkeypatch.syspath_prepend(str(scripts))
+    runner = importlib.import_module("run_nwm_benchmark")
+    monkeypatch.setattr(runner, "BENCHMARK_ROOT", tmp_path)
+    registry = new_registry()
+    registry["protocols"]["ood_direct_4s_v1"]["datasets"]["planetary_rover"][
+        "prediction_sample_count"
+    ] = 3
+
+    with pytest.raises(ValueError, match="at least one sample per logical rank"):
+        runner.run_ood_direct_prediction(
+            "nwm-real",
+            registry["models"]["nwm-real"],
+            ["planetary_rover"],
+            ["0", "1", "2", "3"],
+            {"NWM_DATA_ROOT": PROTOCOLS["ood_direct_4s_v1"]["data_root"]},
+            tmp_path / "registry.json",
+            registry,
+            False,
+            True,
+        )
+
+
 def test_raenwm_ood_direct_dry_run_forces_full_euler50_recompute(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -885,6 +1170,7 @@ def test_raenwm_ood_direct_dry_run_forces_full_euler50_recompute(
     assert inference[inference.index("--horizons") + 1] == "4"
     assert inference[inference.index("--future-frames") + 1] == "16"
     assert inference[inference.index("--num-steps") + 1] == "50"
+    assert inference[inference.index("--expected-sample-count") + 1] == "500"
     assert "--force" in inference
 
 
@@ -968,6 +1254,104 @@ def test_raenwm_navigation_dry_run_uses_shared_cem_protocol(
         "scand",
     ]
     assert "planning_eval.py" not in command
+
+
+def test_raenwm_navigation_groups_planetary_and_unitree_by_sample_count(
+    tmp_path: Path, monkeypatch
+) -> None:
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    monkeypatch.syspath_prepend(str(scripts))
+    runner = importlib.import_module("run_nwm_benchmark")
+    monkeypatch.setattr(runner, "BENCHMARK_ROOT", tmp_path)
+
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        runner,
+        "run",
+        lambda command, env, dry_run: commands.append(command),
+    )
+    registry = new_registry()
+    runner.run_planning(
+        "rae-nwm",
+        registry["models"]["rae-nwm"],
+        ["2", "6"],
+        {"NWM_DATA_ROOT": "/datasets"},
+        tmp_path / "registry.json",
+        False,
+        True,
+        80,
+        ["planetary_rover", "unitree_go2"],
+        raenwm_python=Path("/envs/raenwm/bin/python"),
+        raenwm_num_steps=50,
+    )
+
+    assert len(commands) == 2
+    by_count = {
+        command[command.index("--expected-sample-count") + 1]: command
+        for command in commands
+    }
+    assert set(by_count) == {"47", "100"}
+    assert by_count["47"][
+        by_count["47"].index("--datasets") + 1 : by_count["47"].index("--num-samples")
+    ] == ["planetary_rover"]
+    assert by_count["100"][
+        by_count["100"].index("--datasets")
+        + 1 : by_count["100"].index("--num-samples")
+    ] == ["unitree_go2"]
+
+
+def test_raenwm_planning_manifest_merges_sample_count_groups(
+    tmp_path: Path, monkeypatch
+) -> None:
+    planning = importlib.import_module("scripts.raenwm_planning_eval")
+    project_root = tmp_path / "project"
+    output_root = tmp_path / "output"
+    checkpoint = tmp_path / "checkpoint.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    for dataset in ("planetary_rover", "unitree_go2"):
+        split = (
+            project_root
+            / "data_splits"
+            / planning.DATASET_LAYOUTS[dataset]["split"]
+            / "test/navigation_eval.pkl"
+        )
+        split.parent.mkdir(parents=True, exist_ok=True)
+        split.write_bytes(dataset.encode())
+    monkeypatch.setattr(planning, "source_revision", lambda source: "revision")
+    monkeypatch.setitem(planning.EXPECTED_SPLIT_SHA256, "unitree_go2", "pinned")
+    monkeypatch.setitem(planning.EVAL_WAYPOINT_SPACING, "unitree_go2", 0.076)
+    monkeypatch.setitem(planning.RAENWM_WAYPOINT_SPACING, "unitree_go2", 0.076)
+
+    common = {
+        "source": tmp_path / "source",
+        "checkpoint": checkpoint,
+        "project_root": project_root,
+        "output_root": output_root,
+        "num_samples": 80,
+        "topk": 5,
+        "num_repeat_eval": 3,
+        "opt_steps": 1,
+        "seed": 42,
+        "sampling_method": "euler",
+        "num_steps": 50,
+        "microbatch_size": 80,
+    }
+    planning.write_manifest(
+        SimpleNamespace(
+            **common, datasets=["planetary_rover"], expected_sample_count=47
+        ),
+        world_size=2,
+    )
+    planning.write_manifest(
+        SimpleNamespace(**common, datasets=["unitree_go2"], expected_sample_count=100),
+        world_size=2,
+    )
+
+    manifest = json.loads((output_root / "planning_manifest.json").read_text())
+    assert set(manifest["datasets"]) == {"planetary_rover", "unitree_go2"}
+    assert manifest["datasets"]["planetary_rover"]["sample_count"] == 47
+    assert manifest["datasets"]["unitree_go2"]["sample_count"] == 100
+    assert manifest["created_at"] != manifest["updated_at"]
 
 
 def test_local_ood_navigation_dry_run_uses_per_sample_seed(

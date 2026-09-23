@@ -680,6 +680,9 @@ def _make_optimizer(
     if training_stage == "real_finetune":
         adapter_lr = float(finetune.get("adapter_lr", base_lr))
         backbone_lr = float(finetune.get("backbone_lr", base_lr))
+        if scheme == "reset":
+            phase_key = "warmup_adapter_lr" if substage == "warmup" else "joint_adapter_lr"
+            adapter_lr = float(finetune.get(phase_key, adapter_lr))
         if scheme == "state_conditioned_controller":
             if substage == "warmup":
                 adapter_lr = float(
@@ -2047,6 +2050,7 @@ def run_two_stage_training(config, device, rank, local_gpu, experiment_dir, log=
                                     config.dataset.mean, config.dataset.std
                                 ),
                                 offload_model=eval_offload_models,
+                                num_batches=config.training.get("eval_num_batches", 1),
                             )
                             eval_times[eval_name] = time() - current_eval_start
                     finally:

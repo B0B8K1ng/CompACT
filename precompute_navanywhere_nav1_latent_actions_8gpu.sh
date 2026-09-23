@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
+trap 'status=$?; echo "Launcher exit status: ${status}"' EXIT
 
 # Resumable 8-GPU extraction of raw 32-D navigation-LAM posterior means.
-# The default launch is detached and monitored by codex-exp.
+# The default launch uses nohup; logs and PID are printed.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_PATH="${SCRIPT_DIR}/$(basename -- "${BASH_SOURCE[0]}")"
 cd "${SCRIPT_DIR}"
@@ -16,43 +17,18 @@ else
     DEFAULT_EXPERIMENT_NAME="nav1latent8-$(date -u +%m%d-%H%M%S)"
 fi
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-${DEFAULT_EXPERIMENT_NAME}}"
-if [[ "${DETACH}" == "1" && "${RUN_UNDER_CODEX_EXP:-0}" != "1" ]]; then
-    if ! command -v codex-exp >/dev/null 2>&1; then
-        echo "ERROR: codex-exp is required for detached precompute; set DETACH=0 to run attached." >&2
-        exit 2
-    fi
-    echo "Starting experiment ${EXPERIMENT_NAME} in ${SCRIPT_DIR}"
-    echo "Monitor: codex-exp status ${EXPERIMENT_NAME}"
-    echo "Logs:    codex-exp logs ${EXPERIMENT_NAME}"
-    if [[ "${PLAN_ONLY}" == "1" ]]; then
-        echo "Run log: ${LOG_DIR:-/file_system/nas/algorithm/dujun.nie/nwm/compact/logs/navanywhere_nav1_latent_actions}/plan_${RUN_TIMESTAMP}.log"
-    else
-        echo "Run log: ${LOG_DIR:-/file_system/nas/algorithm/dujun.nie/nwm/compact/logs/navanywhere_nav1_latent_actions}/precompute_${RUN_TIMESTAMP}.log"
-    fi
-    exec codex-exp start "${EXPERIMENT_NAME}" -- \
-        env RUN_UNDER_CODEX_EXP=1 DETACH=0 \
-        EXPERIMENT_NAME="${EXPERIMENT_NAME}" RUN_TIMESTAMP="${RUN_TIMESTAMP}" \
-        VENV_PYTHON="${VENV_PYTHON:-}" PLAN_PYTHON="${PLAN_PYTHON:-}" \
-        LAM_PROJECT_ROOT="${LAM_PROJECT_ROOT:-}" NAVANYWHERE_ROOT="${NAVANYWHERE_ROOT:-}" \
-        COMPACT_NAS_ROOT="${COMPACT_NAS_ROOT:-}" SAMPLING_RECIPE="${SAMPLING_RECIPE:-}" \
-        CHECKPOINT="${CHECKPOINT:-}" CHECKPOINT_SHA256="${CHECKPOINT_SHA256:-}" \
-        OUTPUT_ROOT="${OUTPUT_ROOT:-}" LOG_DIR="${LOG_DIR:-}" \
-        GPU_IDS="${GPU_IDS:-}" NPROC="${NPROC:-}" \
-        REQUIRE_IDLE_GPUS="${REQUIRE_IDLE_GPUS:-}" \
-        MAX_GPU_UTILIZATION="${MAX_GPU_UTILIZATION:-}" MIN_FREE_GPU_MB="${MIN_FREE_GPU_MB:-}" \
-        BATCH_SIZE="${BATCH_SIZE:-}" LOADER_THREADS="${LOADER_THREADS:-}" \
-        DINO_FRAME_BATCH_SIZE="${DINO_FRAME_BATCH_SIZE:-}" \
-        DINO_LAM_BATCH_SIZE="${DINO_LAM_BATCH_SIZE:-}" \
-        PRECISION="${PRECISION:-}" MAX_TRAJECTORIES="${MAX_TRAJECTORIES:-}" \
-        TRAJECTORIES="${TRAJECTORIES:-}" OVERWRITE="${OVERWRITE:-}" \
-        LOG_EVERY_TRAJECTORIES="${LOG_EVERY_TRAJECTORIES:-}" \
-        PLAN_WORLD_SIZE="${PLAN_WORLD_SIZE:-}" PLAN_TRAIN_BATCH_SIZE="${PLAN_TRAIN_BATCH_SIZE:-}" \
-        PLAN_MAX_TRAIN_STEPS="${PLAN_MAX_TRAIN_STEPS:-}" PLAN_WORKERS="${PLAN_WORKERS:-}" \
-        PLAN_CHUNK_SIZE="${PLAN_CHUNK_SIZE:-}" PLAN_OUTPUT="${PLAN_OUTPUT:-}" \
-        PLAN_PAIR_BITMAP="${PLAN_PAIR_BITMAP:-}" TRAINING_PAIR_PLAN="${TRAINING_PAIR_PLAN:-}" \
-        TIMEPT_REFERENCE_LOG="${TIMEPT_REFERENCE_LOG:-}" \
-        GEOPT_REFERENCE_LOG="${GEOPT_REFERENCE_LOG:-}" \
-        "${SCRIPT_PATH}"
+if [[ "${DETACH}" == "1" ]]; then
+    DETACHED_LOG_DIR="${LOG_DIR:-/file_system/nas/algorithm/dujun.nie/nwm/compact/logs/navanywhere_nav1_latent_actions}"
+    mkdir -p "${DETACHED_LOG_DIR}"
+    DETACHED_LOG="${DETACHED_LOG_DIR}/background_${RUN_TIMESTAMP}.log"
+    nohup env DETACH=0 RUN_TIMESTAMP="${RUN_TIMESTAMP}" \
+        bash "${SCRIPT_PATH}" > "${DETACHED_LOG}" 2>&1 < /dev/null &
+    pid=$!
+    echo "${pid}" > "${DETACHED_LOG}.pid"
+    echo "cwd: ${SCRIPT_DIR}"
+    echo "PID: ${pid}"
+    echo "Log: ${DETACHED_LOG}"
+    exit 0
 fi
 
 VENV_PYTHON="${VENV_PYTHON:-/file_system/vepfs/algorithm/dujun.nie/code/DreamDojo/.venv/bin/python}"
@@ -87,6 +63,9 @@ PLAN_CHUNK_SIZE="${PLAN_CHUNK_SIZE:-50000}"
 PLAN_OUTPUT="${PLAN_OUTPUT:-${COMPACT_NAS_ROOT}/plans/navanywhere_latent_action_seed20260901_ws${PLAN_WORLD_SIZE}_bs${PLAN_TRAIN_BATCH_SIZE}_steps${PLAN_MAX_TRAIN_STEPS}.json}"
 PLAN_PAIR_BITMAP="${PLAN_PAIR_BITMAP:-${PLAN_OUTPUT%.json}.pairs.bin}"
 TRAINING_PAIR_PLAN="${TRAINING_PAIR_PLAN:-${PLAN_OUTPUT}}"
+FULL_PAIRS="${FULL_PAIRS:-0}"
+REUSE_ROOT="${REUSE_ROOT:-}"
+[[ "${FULL_PAIRS}" == 0 || "${FULL_PAIRS}" == 1 ]] || { echo "ERROR: FULL_PAIRS must be 0 or 1"; exit 2; }
 TIMEPT_REFERENCE_LOG="${TIMEPT_REFERENCE_LOG:-${COMPACT_NAS_ROOT}/logs/navanywhere_stage1/train_timept_20260902_130035.log}"
 GEOPT_REFERENCE_LOG="${GEOPT_REFERENCE_LOG:-${COMPACT_NAS_ROOT}/logs/navanywhere_stage1/train_geopt_20260905_020847.log}"
 
@@ -120,8 +99,9 @@ if [[ "${PLAN_ONLY}" == "1" ]]; then
         --expected-recipe-sha256 "${RECIPE_SHA256}"
 fi
 
-for required in "${VENV_PYTHON}" "${SAMPLING_RECIPE}" "${CHECKPOINT}" \
-    "${TRAINING_PAIR_PLAN}"; do
+REQUIRED_INPUTS=("${VENV_PYTHON}" "${SAMPLING_RECIPE}" "${CHECKPOINT}")
+if [[ "${FULL_PAIRS}" == 0 ]]; then REQUIRED_INPUTS+=("${TRAINING_PAIR_PLAN}"); fi
+for required in "${REQUIRED_INPUTS[@]}"; do
     [[ -r "${required}" ]] || { echo "ERROR: required input is missing: ${required}" >&2; exit 2; }
 done
 [[ -d "${LAM_PROJECT_ROOT}/lam" ]] || { echo "ERROR: navigation LAM project missing: ${LAM_PROJECT_ROOT}" >&2; exit 2; }
@@ -197,7 +177,6 @@ export TORCH_NCCL_ENABLE_MONITORING=0
 ARGS=(
     --data-root "${NAVANYWHERE_ROOT}"
     --sampling-recipe "${SAMPLING_RECIPE}"
-    --training-pair-plan "${TRAINING_PAIR_PLAN}"
     --output-root "${OUTPUT_ROOT}"
     --lam-project-root "${LAM_PROJECT_ROOT}"
     --checkpoint "${CHECKPOINT}"
@@ -214,6 +193,8 @@ ARGS=(
     --max-trajectories "${MAX_TRAJECTORIES}"
     --log-every-trajectories "${LOG_EVERY_TRAJECTORIES}"
 )
+if [[ "${FULL_PAIRS}" == 0 ]]; then ARGS+=(--training-pair-plan "${TRAINING_PAIR_PLAN}"); fi
+if [[ -n "${REUSE_ROOT}" ]]; then ARGS+=(--reuse-root "${REUSE_ROOT}"); fi
 if [[ "${OVERWRITE}" == "1" ]]; then
     ARGS+=(--overwrite)
 fi
@@ -224,6 +205,8 @@ if [[ -n "${TRAJECTORIES}" ]]; then
     done
 fi
 
+echo "  PID: $$; full pairs: ${FULL_PAIRS}"
+printf "Exact command: "; printf "%q " "${VENV_PYTHON}" -m torch.distributed.run --standalone --nnodes=1 --nproc-per-node="${NPROC}" precompute_navanywhere_nav1_latent_actions.py "${ARGS[@]}"; printf "\n"
 "${VENV_PYTHON}" -m torch.distributed.run \
     --standalone --nnodes=1 --nproc-per-node="${NPROC}" \
     precompute_navanywhere_nav1_latent_actions.py "${ARGS[@]}"

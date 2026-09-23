@@ -55,10 +55,14 @@ evaluation_datasets:
     evaluation_only: true
     data_folder: ${oc.env:NWM_DATA_ROOT}/planetary_rover
     test: data_splits/planetary_rover/test/
-    metric_waypoint_spacing: 0.9741752833246042
+    prediction_sample_count: 10
+    eval_len_traj_pred: 16
+    metric_waypoint_spacing: 1.0  # normalized median-step units, NOT meters
     wrap_delta_yaw: true
     use_predefined_index: true
-    temporal_semantics: spatial_index
+    temporal_semantics: irregular_real_frame_index
+    position_units: sequence_median_step_units
+    metric_navigation_evaluation_allowed: false
   unitree_go2:
     evaluation_only: true
     data_folder: ${oc.env:NWM_DATA_ROOT}/unitree_go2
@@ -107,3 +111,5 @@ eval_context_size: 4
 rollout_fps_values: [1,4]      # Comma-separated list of fps values for rollout evaluation
 gt: 0                           # Set to 1 to produce ground truth evaluation set (no model prediction)
 use_efficient_rollout: true     # Use efficient rollout that operates in latent space (faster)
+single_image_context: false     # Repeat the last observed frame to cold-start the context window
+save_initial_image: false       # Save the single starting image for comparison videos

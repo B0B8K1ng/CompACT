@@ -19,22 +19,32 @@ OOD_DATA_ROOT = "/file_system/nas/algorithm/dujun.nie/nwm/data"
 
 OOD_DATASET_CONTRACTS = {
     "planetary_rover": {
-        "scene": "Mars Perseverance and lunar Yutu-2 rover imagery",
+        "version": "real_native_color_camera_endpoint_expanded_239_20260921",
+        "position_units": "sequence_median_step_units",
+        "metric_navigation_evaluation_allowed": False,
+        "prediction_sample_count": 10,
+        "navigation_sample_count": 47,
+        "rollout_sample_count": 0,
+        "scene": (
+            "15 Chang'e-4/Yutu-2 lunar clips and "
+            "13 Tianwen-1/Zhurong Mars clips; real native-colour "
+            "forward terrain with horizon"
+        ),
         "report": {
             "path": f"{OOD_DATA_ROOT}/planetary_rover/dataset_report.json",
-            "sha256": "cec1b5d0e9a7de2f1bac564721f81f17bb50819b6f96fc9e6751fbfb36897b43",
+            "sha256": "a8bf9534cd8b025eedcd7e553a684ab0e7033937ab7d299735251a1ae6867fbb",
         },
         "prediction_split": {
             "path": "data_splits/planetary_rover/test/time.pkl",
-            "sha256": "3ef7bbabc0244d1e18fb50bb47c231ca3993eacd976e209838f30b32bf4350e6",
+            "sha256": "6e022d19ee5788539c0d1d021be1d64e01086f6f7cf21dd1219fdff65bd5a8ff",
         },
         "navigation_split": {
             "path": "data_splits/planetary_rover/test/navigation_eval.pkl",
-            "sha256": "7d3f27f694e5f554c944714a564b8d7bb354ca8fa604c1c2aab9e5664b6fd16f",
+            "sha256": "99cdf0b934c2b275e4f80dc2a923268bb785d2ef336beee7a05cee3439e4ad77",
         },
-        "metric_waypoint_spacing": 0.9741752833246042,
-        "trajectory_cadence": "irregular_waypoint_sequence",
-        "temporal_semantics": "spatial_index",
+        "metric_waypoint_spacing": 1.0,
+        "trajectory_cadence": "irregular_real_frame_sequence",
+        "temporal_semantics": "irregular_real_frame_index",
     },
     "unitree_go2": {
         "scene": "locally recorded Unitree Go2 quadruped videos",
@@ -157,10 +167,13 @@ DATASET_CONTRACTS = {
             "split_name": name,
             "metric_waypoint_spacing": contract["metric_waypoint_spacing"],
             "temporal_semantics": contract["temporal_semantics"],
+            "prediction_sample_count": contract.get("prediction_sample_count", 500),
+            "navigation_sample_count": contract.get("navigation_sample_count", 100),
+            "rollout_sample_count": contract.get("rollout_sample_count", 150),
             "splits": {
                 "time": contract["prediction_split"]["sha256"],
                 "rollout": {
-                    "planetary_rover": "68033e7f9830bc44c9c351b01589448a11421c9e455fb31b3bb81c7abaface4e",
+                    "planetary_rover": "ec0a6ccf9debf1c16781445c4b9106080d00478b0559469336db7c7b7b9711c8",
                     "unitree_go2": "0b618aa4cbbfd1e2b18d8fc32b19c6311c5e6e519842590ecc67df88a9d8a9b3",
                     "tum_rgbd": "d6f5b4e5077a3f220e8957b602f34341e0727b7eae7a98f738b570988765d62c",
                     "uzh_fpv": "45af1a0579b203a2803c8f3c206d737562a1c238873606b8345c9866045956d6",
@@ -173,6 +186,48 @@ DATASET_CONTRACTS = {
 }
 
 ALL_DATASETS = tuple(DATASET_CONTRACTS)
+ROLLOUT_DATASETS = tuple(
+    name
+    for name, contract in DATASET_CONTRACTS.items()
+    if int(contract.get("rollout_sample_count", 150)) > 0
+)
+
+
+def dataset_sample_count(
+    protocol: dict[str, Any], dataset: str, evaluation: str
+) -> int:
+    """Resolve a protocol count while preserving its dataset-level overrides."""
+
+    if evaluation == "navigation":
+        override_key = "navigation_sample_count"
+        default = protocol.get("navigation_sample_count", protocol.get("sample_count"))
+    elif evaluation == "time":
+        override_key = "prediction_sample_count"
+        default = protocol.get("sample_counts", {}).get(
+            evaluation, protocol.get("sample_count")
+        )
+    elif evaluation.startswith("rollout"):
+        override_key = "rollout_sample_count"
+        default = protocol.get("sample_counts", {}).get(
+            evaluation, protocol.get("sample_count")
+        )
+    else:
+        raise ValueError(f"Unknown evaluation kind for sample count: {evaluation}")
+
+    datasets = protocol.get("datasets", {})
+    contract = datasets.get(dataset, {}) if isinstance(datasets, dict) else {}
+    split = protocol.get("splits", {}).get(dataset, {})
+    value = contract.get(override_key, split.get("sample_count", default))
+    if value is None:
+        raise ValueError(
+            f"Protocol has no sample-count contract for {dataset}/{evaluation}"
+        )
+    count = int(value)
+    if count < 0:
+        raise ValueError(
+            f"Protocol has a negative sample count for {dataset}/{evaluation}: {count}"
+        )
+    return count
 
 MODELS = {
     "rae-nwm": {
@@ -463,6 +518,7 @@ PROTOCOLS = {
             name: {
                 "path": f"data_splits/{contract['split_name']}/test/time.pkl",
                 "sha256": contract["splits"]["time"],
+                "sample_count": contract.get("prediction_sample_count", 500),
             }
             for name, contract in DATASET_CONTRACTS.items()
         },
@@ -483,7 +539,7 @@ PROTOCOLS = {
     },
     "rollout_v1": {
         "category": "rollout_prediction",
-        "datasets": list(ALL_DATASETS),
+        "datasets": list(ROLLOUT_DATASETS),
         "data_root": OOD_DATA_ROOT,
         "evaluation": ["rollout_1fps", "rollout_4fps"],
         "sample_count": 150,
@@ -500,6 +556,7 @@ PROTOCOLS = {
                 "sha256": contract["splits"]["rollout"],
             }
             for name, contract in DATASET_CONTRACTS.items()
+            if name in ROLLOUT_DATASETS
         },
         "inference": {
             "nwm": {"sampler": "ddpm", "sampling_steps": 250},
@@ -583,6 +640,7 @@ PROTOCOLS = {
                 dataset: {
                     "path": contract["navigation_split"]["path"],
                     "sha256": contract["navigation_split"]["sha256"],
+                    "sample_count": contract.get("navigation_sample_count", 100),
                     "metric_waypoint_spacing": contract[
                         "metric_waypoint_spacing"
                     ],
@@ -822,11 +880,7 @@ def import_prediction(
         protocol_evaluations = [protocol_evaluations]
     if protocol_evaluations is not None and evaluation not in protocol_evaluations:
         raise ValueError(f"{evaluation} is not part of {protocol}")
-    expected_count = (
-        protocol_config["sample_counts"][evaluation]
-        if "sample_counts" in protocol_config
-        else protocol_config["sample_count"]
-    )
+    expected_count = dataset_sample_count(protocol_config, dataset, evaluation)
     if protocol_config.get("frame_indices") is not None:
         expected_frames = protocol_config["frame_indices"]
     elif evaluation == "time":
@@ -912,7 +966,7 @@ def import_planning(
         raise ValueError(f"{dataset} is not part of {protocol}")
     category = protocol_config["category"]
     model = require_model(registry, model_name)
-    expected_count = protocol_config["sample_count"]
+    expected_count = dataset_sample_count(protocol_config, dataset, "navigation")
     if payload.get("sample_count", expected_count) != expected_count:
         raise ValueError(
             f"Planning sample count does not match {protocol}: expected "
@@ -980,10 +1034,12 @@ def render_ood_latex(registry: dict[str, Any]) -> str:
     lines = [
         r"\begin{table}[t]",
         r"\centering",
-        r"\caption{\textbf{Out-of-domain direct visual prediction at the nominal "
-        r"4\,s / 16-step horizon.} All rows use 500 fixed samples per dataset. "
-        r"Planetary Rover is a spatial waypoint sequence without physical fixed-rate "
-        r"timestamps. DS: DreamSim.}",
+        (
+            r"\caption{\textbf{Out-of-domain direct visual prediction at the nominal "
+            r"4\,s / 16-step horizon.} Rows use each dataset's pinned sample count. "
+            r"Planetary Rover is a spatial waypoint sequence without physical fixed-rate "
+            r"timestamps. DS: DreamSim.}"
+        ),
         r"\label{tab:ood_direct_4s}",
         r"\renewcommand{\arraystretch}{1.12}",
         r"\begin{tabular}{llccc}",
@@ -1187,8 +1243,11 @@ def render_markdown(registry: dict[str, Any]) -> str:
             "",
             "## Unified direct visual prediction at 4 seconds",
             "",
-            "All rows use `direct_4s_v1`: 500 fixed samples, sample-ID keyed randomness, "
-            "250-step DDPM for NWM or 50-step Euler for RAE-NWM.",
+            (
+                "All rows use `direct_4s_v1` with each dataset's pinned sample count, "
+                "sample-ID keyed randomness, "
+                "250-step DDPM for NWM or 50-step Euler for RAE-NWM."
+            ),
             "",
             "| Model | Dataset | LPIPS | DreamSim | PSNR | Samples |",
             "|---|---|---:|---:|---:|---:|",
@@ -1212,8 +1271,10 @@ def render_markdown(registry: dict[str, Any]) -> str:
             "",
             "## Unified autoregressive rollout",
             "",
-            "All rows use `rollout_v1`: all 150 fixed samples and exact 1/4-fps "
-            "autoregressive rollout at 1/2/4/8/16 seconds.",
+            (
+                "All rows use `rollout_v1`: all 150 fixed samples and exact 1/4-fps "
+                "autoregressive rollout at 1/2/4/8/16 seconds."
+            ),
             "",
             "| Model | Dataset | Mode | Horizon | LPIPS | DreamSim | PSNR | Samples |",
             "|---|---|---|---:|---:|---:|---:|---:|",
@@ -1239,9 +1300,12 @@ def render_markdown(registry: dict[str, Any]) -> str:
             "",
             "## Out-of-domain direct visual prediction at 4 seconds",
             "",
-            "Each measured row uses the pinned `ood_direct_4s_v1` protocol and 500 fixed samples. "
-            "The horizon is physical 4 s for the fixed-4-Hz datasets; `planetary_rover` "
-            "uses the same 16-step spatial horizon because physical fixed-rate timestamps are unavailable.",
+            (
+                "Each measured row uses the pinned `ood_direct_4s_v1` protocol and its "
+                "dataset-specific fixed sample count. The horizon is physical 4 s for "
+                "the fixed-4-Hz datasets; `planetary_rover` uses the same 16-step spatial "
+                "horizon because physical fixed-rate timestamps are unavailable."
+            ),
             "",
             "| Model | Dataset | LPIPS | DreamSim | PSNR | Samples |",
             "|---|---|---:|---:|---:|---:|",

@@ -17,16 +17,26 @@ Main overrides (environment variables):
   GPU_IDS                   Exactly eight physical GPU indices (default: 0..7)
   GPU_MEMORY_GB             GPU memory profile: 80 (default) or 48
   BATCH_SIZE                Per-GPU batch: 16/32/64/96 (default: 96 on 80GB, 32 on 48GB)
+  LATENT_CHECKPOINT         Expected LAM checkpoint (default: pinned Nav1)
+  LATENT_CHECKPOINT_STEP    Expected LAM step (default: 100000)
+  SAMPLING_RECIPE           Frozen full or original recipe
+  NAV1_PROXY_ROOT           Matching completed latent-action cache
+  STAGE1_VAE_LATENT_ROOT    Matching completed NavAnywhere VAE cache
+  STAGE2_EVAL_EVERY         Eval interval, 0 disables (default: 0)
+  STAGE2_EVAL_BATCH_SIZE    Eval batch per GPU (default: 16)
+  STAGE2_EVAL_NUM_BATCHES   Batches per GPU per eval (default: 1)
   RESULTS_ROOT              NAS parent for outputs
   WANDB_ENABLED             true/false (default: true)
   WANDB_MODE                online/offline/disabled (default: online)
   RESUME                    1 resumes this RUN_ID from latest checkpoints
   KEEP_INTERMEDIATE         1 keeps periodic checkpoints (default: 0)
 
-The sample budgets are fixed and cannot be overridden:
-  Stage 1: 3,200,000/rank (25.6M global)
-  Warmup:    160,000/rank (1.28M global)
-  Joint:   1,600,000/rank (12.8M global)
+  BUDGET_MODE               steps (default) or legacy samples
+  PRETRAIN_STEPS            Default: 20000
+  FINETUNE_STEPS            Total warmup + joint (default: 10000)
+  FINETUNE_WARMUP_STEPS     Default: 1667
+  WARMUP_ADAPTER_LR         Default: 2e-4
+  JOINT_ADAPTER_LR          Default: 1e-4
 EOF
 }
 
@@ -57,6 +67,8 @@ WORLD_SIZE=8
 SEED=20260901
 RECIPE_SHA256=604fd1e3ad4dc541198cf41b0a430adb586c07719e7994089872d0639b85bc1b
 NAV1_CHECKPOINT_SHA256=ec7d4c159a0bcd661167b35ea88a1c61ac42d73a771a0de5de660cced4325ac1
+LATENT_CHECKPOINT="${LATENT_CHECKPOINT:-}"
+LATENT_CHECKPOINT_STEP="${LATENT_CHECKPOINT_STEP:-100000}"
 
 # Original batch16 budgets, expressed per rank so the global sample counts stay
 # identical on the required eight-GPU topology.
@@ -67,11 +79,21 @@ REFERENCE_SAMPLES_PER_RANK_PER_EPOCH=516544
 
 STAGE1_LR="${STAGE1_LR:-2e-4}"
 ADAPTER_LR="${ADAPTER_LR:-2e-4}"
-BACKBONE_LR="${BACKBONE_LR:-2e-5}"
+BACKBONE_LR="${BACKBONE_LR:-1e-4}"
+WARMUP_ADAPTER_LR="${WARMUP_ADAPTER_LR:-2e-4}"
+JOINT_ADAPTER_LR="${JOINT_ADAPTER_LR:-1e-4}"
+BUDGET_MODE="${BUDGET_MODE:-steps}"
+PRETRAIN_STEPS="${PRETRAIN_STEPS:-20000}"
+FINETUNE_STEPS="${FINETUNE_STEPS:-10000}"
+FINETUNE_WARMUP_STEPS="${FINETUNE_WARMUP_STEPS:-1667}"
 STAGE1_NUM_WORKERS="${STAGE1_NUM_WORKERS:-16}"
 STAGE2_NUM_WORKERS="${STAGE2_NUM_WORKERS:-8}"
+STAGE2_EVAL_EVERY="${STAGE2_EVAL_EVERY:-0}"
+STAGE2_EVAL_BATCH_SIZE="${STAGE2_EVAL_BATCH_SIZE:-16}"
+STAGE2_EVAL_NUM_BATCHES="${STAGE2_EVAL_NUM_BATCHES:-1}"
+STAGE2_EVAL_AT_FIRST_STEP=false
 LOG_EVERY="${LOG_EVERY:-50}"
-CKPT_EVERY="${CKPT_EVERY:-1667}"
+CKPT_EVERY="${CKPT_EVERY:-500}"
 WANDB_ENABLED="${WANDB_ENABLED:-true}"
 WANDB_MODE="${WANDB_MODE:-online}"
 WANDB_PROJECT="${WANDB_PROJECT:-compact-nwm}"
@@ -97,13 +119,18 @@ if ! [[ "${RUN_ID}" =~ ^[A-Za-z0-9._-]+$ ]]; then
     echo "ERROR: RUN_ID may contain only letters, digits, dot, underscore, and dash." >&2
     exit 2
 fi
-for value_name in BATCH_SIZE STAGE1_NUM_WORKERS STAGE2_NUM_WORKERS LOG_EVERY CKPT_EVERY; do
+for value_name in BATCH_SIZE STAGE1_NUM_WORKERS STAGE2_NUM_WORKERS LOG_EVERY CKPT_EVERY STAGE2_EVAL_BATCH_SIZE STAGE2_EVAL_NUM_BATCHES PRETRAIN_STEPS FINETUNE_STEPS FINETUNE_WARMUP_STEPS; do
     value="${!value_name}"
     if ! [[ "${value}" =~ ^[1-9][0-9]*$ ]]; then
         echo "ERROR: ${value_name} must be a positive integer, got ${value}." >&2
         exit 2
     fi
 done
+if ! [[ "${STAGE2_EVAL_EVERY}" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: STAGE2_EVAL_EVERY must be a non-negative integer." >&2
+    exit 2
+fi
+if (( STAGE2_EVAL_EVERY > 0 )); then STAGE2_EVAL_AT_FIRST_STEP=true; fi
 for flag_name in DRY_RUN RESUME KEEP_INTERMEDIATE CLEAN_WANDB_DEBUG_LOGS; do
     flag="${!flag_name}"
     if [[ "${flag}" != "0" && "${flag}" != "1" ]]; then
@@ -130,6 +157,16 @@ ceil_div() {
     echo $(( (numerator + denominator - 1) / denominator ))
 }
 
+# Derive epoch length and identity from the selected recipe, including full inventories.
+RECIPE_PYTHON="${NWM_CONDA_ENV_PATH}/bin/python"
+RECIPE_SHA256="$(sha256sum "${SAMPLING_RECIPE}" | awk '{print $1}')"
+DATASET_LENGTH="$("${RECIPE_PYTHON}" -c 'import json,sys; print(json.load(open(sys.argv[1]))["samples_per_epoch"])' "${SAMPLING_RECIPE}")"
+REFERENCE_SAMPLES_PER_RANK_PER_EPOCH=$(( ((DATASET_LENGTH + WORLD_SIZE - 1) / WORLD_SIZE / REFERENCE_BATCH_SIZE) * REFERENCE_BATCH_SIZE ))
+(( REFERENCE_SAMPLES_PER_RANK_PER_EPOCH > 0 )) || { echo "ERROR: recipe is too small"; exit 2; }
+if [[ -n "${LATENT_CHECKPOINT}" && "${DRY_RUN}" != 1 ]]; then
+    NAV1_CHECKPOINT_SHA256="$(sha256sum "${LATENT_CHECKPOINT}" | awk '{print $1}')"
+fi
+
 # Reference rebatching emits one smaller, 16-aligned tail at every NavAnywhere
 # epoch, so Stage 1 needs two more optimizer steps than a plain ceil at batch96.
 full_reference_epochs=$(( STAGE1_SAMPLES_PER_RANK / REFERENCE_SAMPLES_PER_RANK_PER_EPOCH ))
@@ -139,6 +176,23 @@ remaining_stage1_steps="$(ceil_div "${remaining_stage1_samples}" "${BATCH_SIZE}"
 STAGE1_STEPS=$(( full_reference_epochs * steps_per_reference_epoch + remaining_stage1_steps ))
 WARMUP_STEPS="$(ceil_div "${WARMUP_SAMPLES_PER_RANK}" "${BATCH_SIZE}")"
 JOINT_STEPS="$(ceil_div "${JOINT_SAMPLES_PER_RANK}" "${BATCH_SIZE}")"
+case "${BUDGET_MODE}" in
+    steps)
+        if (( FINETUNE_WARMUP_STEPS >= FINETUNE_STEPS )); then
+            echo "ERROR: FINETUNE_WARMUP_STEPS must be below FINETUNE_STEPS." >&2
+            exit 2
+        fi
+        STAGE1_STEPS="${PRETRAIN_STEPS}"
+        WARMUP_STEPS="${FINETUNE_WARMUP_STEPS}"
+        JOINT_STEPS=$(( FINETUNE_STEPS - FINETUNE_WARMUP_STEPS ))
+        # Disable sample-based early stopping: budgets now count optimizer steps.
+        STAGE1_SAMPLES_PER_RANK=null
+        WARMUP_SAMPLES_PER_RANK=null
+        JOINT_SAMPLES_PER_RANK=null
+        ;;
+    samples) ;;
+    *) echo "ERROR: BUDGET_MODE must be steps or samples." >&2; exit 2 ;;
+esac
 
 RUN_ROOT="${RESULTS_ROOT}/${RUN_ID}"
 STAGE1_RUN_NAME="stage1_latentpt_nav1_bs${BATCH_SIZE}"
@@ -201,6 +255,11 @@ STAGE1_OVERRIDES=(
 
 STAGE2_OVERRIDES=(
     "${COMMON_OVERRIDES[@]}"
+    "eval_every=${STAGE2_EVAL_EVERY}"
+    "eval_at_first_step=${STAGE2_EVAL_AT_FIRST_STEP}"
+    "eval_offload_models=true"
+    "training.eval_batch_size=${STAGE2_EVAL_BATCH_SIZE}"
+    "training.eval_num_batches=${STAGE2_EVAL_NUM_BATCHES}"
     "seed=${SEED}"
     "dataset.precomputed_latents.enabled=true"
     "dataset.precomputed_latents.root=${STAGE2_VAE_LATENT_ROOT}"
@@ -212,6 +271,8 @@ STAGE2_OVERRIDES=(
     "training.notes=Nav1_LatentPT_latent_reset_${HARDWARE_LABEL}_bs${BATCH_SIZE}"
     "training.wandb_tags=[Nav1,LatentPT,latent-reset,CDiT-B,${HARDWARE_LABEL},bs${BATCH_SIZE}]"
     "finetune.adapter_lr=${ADAPTER_LR}"
+    "+finetune.warmup_adapter_lr=${WARMUP_ADAPTER_LR}"
+    "+finetune.joint_adapter_lr=${JOINT_ADAPTER_LR}"
     "finetune.backbone_lr=${BACKBONE_LR}"
     "finetune.warmup_steps=${WARMUP_STEPS}"
     "finetune.joint_steps=${JOINT_STEPS}"
@@ -249,6 +310,9 @@ echo "  warmup samples/rank, steps:  ${WARMUP_SAMPLES_PER_RANK}, ${WARMUP_STEPS}
 echo "  joint samples/rank, steps:   ${JOINT_SAMPLES_PER_RANK}, ${JOINT_STEPS}"
 echo "  Stage-1 LR:                  ${STAGE1_LR}"
 echo "  Stage-2 adapter/backbone LR: ${ADAPTER_LR} / ${BACKBONE_LR}"
+echo "  Budget mode:                 ${BUDGET_MODE}"
+echo "  Stage-2 warmup adapter LR:   ${WARMUP_ADAPTER_LR}"
+echo "  Stage-2 joint adapter LR:    ${JOINT_ADAPTER_LR}"
 echo "  Nav1 cache:                  ${NAV1_PROXY_ROOT}"
 echo "  recipe SHA-256:              ${RECIPE_SHA256}"
 echo "Stage 1 command:"
@@ -309,11 +373,11 @@ require_completed_cache "${STAGE1_VAE_LATENT_ROOT}"
 require_completed_cache "${STAGE2_VAE_LATENT_ROOT}"
 
 python - "${NAV1_PROXY_ROOT}/metadata.json" "${RECIPE_SHA256}" \
-    "${NAV1_CHECKPOINT_SHA256}" <<'PY'
+    "${NAV1_CHECKPOINT_SHA256}" "${LATENT_CHECKPOINT_STEP}" "${DATASET_LENGTH}" <<'PY'
 import json
 import sys
 
-path, expected_recipe, expected_checkpoint = sys.argv[1:]
+path, expected_recipe, expected_checkpoint, expected_step, dataset_length = sys.argv[1:]
 with open(path, "r", encoding="utf-8") as stream:
     metadata = json.load(stream)
 actual = metadata.get("sampling_recipe", {}).get("sha256")
@@ -327,17 +391,24 @@ if actual != expected_recipe:
 checkpoint = metadata.get("checkpoint", {})
 if (
     checkpoint.get("class_path") != "lam.navigation_variants.PixelActionLAM"
-    or checkpoint.get("global_step") != 100000
+    or checkpoint.get("global_step") != int(expected_step)
     or checkpoint.get("sha256") != expected_checkpoint
 ):
-    raise SystemExit("ERROR: proxy cache is not the pinned Nav1 step-100000 cache")
-contract = metadata.get("training_pair_plan", {}).get("training_contract", {})
+    raise SystemExit("ERROR: proxy cache does not match the expected PixelActionLAM checkpoint SHA/step")
+plan = metadata.get("training_pair_plan")
+if plan is None:
+    policy = metadata.get("policy", {}).get("configuration", {})
+    if (policy.get("pair_domain") != "NavAnywhere_observations_and_existing_local_targets_v1"
+        or policy.get("context_size") != 4 or policy.get("max_abs_frame_offset") != 8):
+        raise SystemExit("ERROR: incompatible full-pair cache policy")
+    sys.exit(0)
+contract = plan.get("training_contract", {})
 expected_contract = {
     "batch_size_per_rank": 16,
-    "dataset_length": 4132468,
+    "dataset_length": int(dataset_length),
     "max_train_steps": 200000,
     "seed": 20260901,
-    "steps_per_epoch": 32284,
+    "steps_per_epoch": ((int(dataset_length) + 7) // 8) // 16,
     "world_size": 8,
 }
 changed = {

@@ -15,7 +15,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from nwm_benchmark_registry import load_registry
+from nwm_benchmark_registry import PROTOCOLS, dataset_sample_count, load_registry
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BENCHMARK_ROOT = Path(
@@ -47,6 +47,16 @@ def progress(message: str) -> None:
 
 def csv(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def datasets_grouped_by_sample_count(
+    protocol: dict, datasets: list[str], evaluation: str
+) -> dict[int, list[str]]:
+    grouped: dict[int, list[str]] = {}
+    for dataset in datasets:
+        count = dataset_sample_count(protocol, dataset, evaluation)
+        grouped.setdefault(count, []).append(dataset)
+    return grouped
 
 
 def sha256_file(path: Path) -> str:
@@ -210,34 +220,69 @@ def validate_ood_protocol_inputs(
                 )
             checked[key] = {"path": str(path.resolve()), "sha256": actual}
         report = json.loads(Path(checked["report"]["path"]).read_text(encoding="utf-8"))
+        prediction_count = dataset_sample_count(protocol, dataset, "time")
+        navigation_count = dataset_sample_count(protocol, dataset, "navigation")
+        reported_prediction_count = report.get(
+            "prediction_sample_count", report.get("prediction_samples")
+        )
+        reported_navigation_count = report.get(
+            "navigation_sample_count", report.get("navigation_samples")
+        )
         expected_fields = {
             "dataset": dataset,
-            "prediction_samples": protocol["sample_count"],
-            "navigation_samples": protocol["navigation_sample_count"],
+            "prediction_sample_count": prediction_count,
+            "navigation_sample_count": navigation_count,
+        }
+        reported_fields = {
+            "dataset": report.get("dataset"),
+            "prediction_sample_count": reported_prediction_count,
+            "navigation_sample_count": reported_navigation_count,
+        }
+        if "rollout_sample_count" in contract:
+            expected_fields["rollout_sample_count"] = dataset_sample_count(
+                protocol, dataset, "rollout"
+            )
+            reported_fields["rollout_sample_count"] = report.get(
+                "rollout_sample_count", report.get("rollout_samples")
+            )
+        optional_expected_fields = {
             "context_frames": protocol["context_frames"],
             "future_frames": protocol["future_frames"],
             "input_fps": protocol["input_fps"],
             "horizon_seconds": protocol["horizons_seconds"][0],
             "trajectory_cadence": contract["trajectory_cadence"],
+            "temporal_semantics": contract["temporal_semantics"],
         }
+        for key, expected in optional_expected_fields.items():
+            if key in report:
+                expected_fields[key] = expected
+                reported_fields[key] = report[key]
+        for key in (
+            "position_units",
+            "metric_navigation_evaluation_allowed",
+        ):
+            if key in contract:
+                expected_fields[key] = contract[key]
+                reported_fields[key] = report.get(key)
         mismatched = {
-            key: (expected, report.get(key))
+            key: (expected, reported_fields.get(key))
             for key, expected in expected_fields.items()
-            if report.get(key) != expected
+            if reported_fields.get(key) != expected
         }
         if mismatched:
             raise RuntimeError(f"{dataset} report contract mismatch: {mismatched}")
-        report_spacing = float(report["metric_waypoint_spacing"])
         contract_spacing = float(contract["metric_waypoint_spacing"])
-        if report_spacing != contract_spacing:
-            raise RuntimeError(
-                f"{dataset} waypoint spacing mismatch: expected "
-                f"{contract_spacing}, got {report_spacing}"
-            )
+        if "metric_waypoint_spacing" in report:
+            report_spacing = float(report["metric_waypoint_spacing"])
+            if report_spacing != contract_spacing:
+                raise RuntimeError(
+                    f"{dataset} waypoint spacing mismatch: expected "
+                    f"{contract_spacing}, got {report_spacing}"
+                )
         checked["metric_waypoint_spacing"] = contract[
             "metric_waypoint_spacing"
         ]
-        checked["trajectory_cadence"] = report["trajectory_cadence"]
+        checked["trajectory_cadence"] = contract["trajectory_cadence"]
         checked["temporal_semantics"] = contract["temporal_semantics"]
         verified[dataset] = checked
     return verified
@@ -352,11 +397,13 @@ def ensure_ground_truth(
     env: dict[str, str],
     dry_run: bool,
     time_horizons: tuple[int, ...] = (1, 2, 4, 8, 16),
+    expected_count: int | None = None,
 ) -> Path:
     if dataset == "recon":
         return RECON_GT
     gt_dataset_root = ground_truth_root(dataset)
-    expected_count = 500 if inference_type == "time" else 150
+    if expected_count is None:
+        expected_count = 500 if inference_type == "time" else 150
     evaluation_names = (
         ("time",) if inference_type == "time" else ("rollout_1fps", "rollout_4fps")
     )
@@ -389,6 +436,7 @@ def ensure_ground_truth(
             "gt=1",
             f"datasets_to_eval=[{dataset}]",
             f"eval_type={inference_type}",
+            f"eval_expected_full_count={expected_count}",
             "batch_size=64",
             "num_workers=8",
             "pin_memory=false",
@@ -491,6 +539,16 @@ def run_prediction(
             model_name, dataset, evaluation, protocol
         )
 
+    def evaluation_sample_count(evaluation: str) -> int:
+        protocol_name = (
+            protocol_by_evaluation.get(evaluation)
+            if protocol_by_evaluation
+            else None
+        )
+        if protocol_name is None:
+            return 500 if evaluation == "time" else 150
+        return dataset_sample_count(PROTOCOLS[protocol_name], dataset, evaluation)
+
     for inference_type in ("time", "rollout"):
         selected = [
             name
@@ -499,6 +557,13 @@ def run_prediction(
         ]
         if not selected:
             continue
+        selected_counts = {evaluation_sample_count(name) for name in selected}
+        if len(selected_counts) != 1:
+            raise ValueError(
+                f"Mixed sample counts for {dataset}/{inference_type}: "
+                f"{sorted(selected_counts)}"
+            )
+        sample_count = selected_counts.pop()
         if inference_already_prepared:
             continue
         if not force and all(
@@ -514,6 +579,7 @@ def run_prediction(
             env,
             dry_run,
             time_horizons=time_horizons,
+            expected_count=sample_count,
         )
         if backend == "rae-nwm":
             assets = Path(model["assets_root"])
@@ -552,6 +618,8 @@ def run_prediction(
                 str(model["provenance"]["sampling_steps"]),
                 "--seed",
                 str(EVAL_SEED),
+                "--expected-sample-count",
+                str(sample_count),
             ]
             if inference_type == "time":
                 command.extend(["--horizons", *map(str, time_horizons)])
@@ -583,7 +651,7 @@ def run_prediction(
                     f"prediction_dir={output_root}",
                     f"datasets_to_eval=[{dataset}]",
                     f"eval_type={inference_type}",
-                    f"eval_expected_full_count={500 if inference_type == 'time' else 150}",
+                    f"eval_expected_full_count={sample_count}",
                     "eval_diffusion_steps=250",
                     f"batch_size={batch_size or 64}",
                     "num_workers=4",
@@ -599,14 +667,18 @@ def run_prediction(
                 if logical_rank is None:
                     command.append(f"seed={EVAL_SEED}")
                 else:
-                    sample_count = 500
+                    if sample_count % DIRECT_PREDICTION_WORLD_SIZE != 0:
+                        raise ValueError(
+                            "Serialized direct prediction requires a sample count "
+                            f"divisible by {DIRECT_PREDICTION_WORLD_SIZE}; got "
+                            f"{sample_count} for {dataset}"
+                        )
                     sample_indices = range(
                         logical_rank, sample_count, DIRECT_PREDICTION_WORLD_SIZE
                     )
                     indices = ",".join(map(str, sample_indices))
                     command.extend(
                         [
-                            f"eval_expected_full_count={sample_count}",
                             f"eval_sample_indices=[{indices}]",
                             f"seed={EVAL_SEED}",
                         ]
@@ -626,13 +698,13 @@ def run_prediction(
         if not dry_run:
             if inference_type == "time":
                 complete = direct_time_complete(
-                    output_root / dataset / "time", 500, time_horizons
+                    output_root / dataset / "time", sample_count, time_horizons
                 )
             else:
                 complete = all(
                     rollout_sequences_complete(
                         output_root / dataset / evaluation,
-                        150,
+                        sample_count,
                         16 * int(evaluation.removeprefix("rollout_").removesuffix("fps")),
                     )
                     for evaluation in selected
@@ -741,19 +813,28 @@ def run_grouped_prediction_inference(
         ]
         if not selected_evaluations:
             continue
+        protocol = PROTOCOLS[
+            DIRECT_PROTOCOL if inference_type == "time" else ROLLOUT_PROTOCOL
+        ]
+        count_evaluation = selected_evaluations[0]
+        sample_counts = {
+            dataset: dataset_sample_count(protocol, dataset, count_evaluation)
+            for dataset in datasets
+        }
         incomplete: list[str] = []
         for dataset in datasets:
+            sample_count = sample_counts[dataset]
             if force or dry_run:
                 incomplete.append(dataset)
             elif inference_type == "time":
                 if not direct_time_complete(
-                    output_root / dataset / "time", 500, time_horizons
+                    output_root / dataset / "time", sample_count, time_horizons
                 ):
                     incomplete.append(dataset)
             elif not all(
                 rollout_sequences_complete(
                     output_root / dataset / evaluation,
-                    150,
+                    sample_count,
                     16 * int(evaluation.removeprefix("rollout_").removesuffix("fps")),
                 )
                 for evaluation in selected_evaluations
@@ -771,104 +852,112 @@ def run_grouped_prediction_inference(
                 env,
                 dry_run,
                 time_horizons=time_horizons,
+                expected_count=sample_counts[dataset],
             )
 
-        if backend == "rae-nwm":
-            assets = Path(model["assets_root"])
-            command = [
-                *raenwm_torchrun_prefix(raenwm_python, gpus),
-                "scripts/raenwm_infer.py",
-                "--source",
-                model["source_dir"],
-                "--checkpoint",
-                model["checkpoint"],
-                "--decoder",
-                str(assets / "models/decoders/dinov2/wReg_base/ViTXL_n08/model.pt"),
-                "--normalization-stats",
-                str(assets / "models/stats/dinov2/wReg_base/imagenet1k/stat.pt"),
-                "--dino-model",
-                str(assets / "models/dinov2-with-registers-base"),
-                "--project-root",
-                str(PROJECT_ROOT),
-                "--data-root",
-                model_env["NWM_DATA_ROOT"],
-                "--output-root",
-                str(output_root),
-                "--datasets",
-                *incomplete,
-                "--eval-type",
-                inference_type,
-                "--future-frames",
-                str(64 if inference_type == "rollout" else max(time_horizons) * 4),
-                "--batch-size",
-                str(batch_size or 16),
-                "--num-workers",
-                "4",
-                "--sampling-method",
-                model["provenance"]["sampling_method"],
-                "--num-steps",
-                str(model["provenance"]["sampling_steps"]),
-                "--seed",
-                str(EVAL_SEED),
-            ]
-            if inference_type == "time":
-                command.extend(["--horizons", *map(str, time_horizons)])
-            else:
-                command.extend(["--rollout-fps", "1", "4"])
-            if force:
-                command.append("--force")
-            run(
-                command,
-                {
-                    **model_env,
-                    "HF_HOME": str(assets / "hf_cache"),
-                    "HF_HUB_OFFLINE": "1",
-                    "TRANSFORMERS_OFFLINE": "1",
-                    "PYTORCH_ALLOC_CONF": "expandable_segments:True",
-                },
-                dry_run,
-            )
-        else:
-            command = [
-                *torchrun_prefix(gpus),
-                "isolated_nwm_infer.py",
-                f"exp_dir={model['exp_dir']}",
-                f"ckp={model['checkpoint_id']}",
-                f"output_dir={output_root}",
-                f"prediction_dir={output_root}",
-                f"datasets_to_eval=[{','.join(incomplete)}]",
-                f"eval_type={inference_type}",
-                f"eval_expected_full_count={500 if inference_type == 'time' else 150}",
-                "eval_diffusion_steps=250",
-                f"batch_size={batch_size or 64}",
-                "num_workers=4",
-                "pin_memory=false",
-                f"seed={EVAL_SEED}",
-            ]
-            if inference_type == "time":
-                command.extend(
-                    [
-                        f"eval_len_traj_pred={max(time_horizons) * 4}",
-                        f"time_horizons_seconds=[{','.join(map(str, time_horizons))}]",
-                    ]
+        grouped = datasets_grouped_by_sample_count(
+            protocol, incomplete, count_evaluation
+        )
+        for sample_count, grouped_datasets in grouped.items():
+            if backend == "rae-nwm":
+                assets = Path(model["assets_root"])
+                command = [
+                    *raenwm_torchrun_prefix(raenwm_python, gpus),
+                    "scripts/raenwm_infer.py",
+                    "--source",
+                    model["source_dir"],
+                    "--checkpoint",
+                    model["checkpoint"],
+                    "--decoder",
+                    str(assets / "models/decoders/dinov2/wReg_base/ViTXL_n08/model.pt"),
+                    "--normalization-stats",
+                    str(assets / "models/stats/dinov2/wReg_base/imagenet1k/stat.pt"),
+                    "--dino-model",
+                    str(assets / "models/dinov2-with-registers-base"),
+                    "--project-root",
+                    str(PROJECT_ROOT),
+                    "--data-root",
+                    model_env["NWM_DATA_ROOT"],
+                    "--output-root",
+                    str(output_root),
+                    "--datasets",
+                    *grouped_datasets,
+                    "--eval-type",
+                    inference_type,
+                    "--future-frames",
+                    str(64 if inference_type == "rollout" else max(time_horizons) * 4),
+                    "--batch-size",
+                    str(batch_size or 16),
+                    "--num-workers",
+                    "4",
+                    "--sampling-method",
+                    model["provenance"]["sampling_method"],
+                    "--num-steps",
+                    str(model["provenance"]["sampling_steps"]),
+                    "--seed",
+                    str(EVAL_SEED),
+                    "--expected-sample-count",
+                    str(sample_count),
+                ]
+                if inference_type == "time":
+                    command.extend(["--horizons", *map(str, time_horizons)])
+                else:
+                    command.extend(["--rollout-fps", "1", "4"])
+                if force:
+                    command.append("--force")
+                run(
+                    command,
+                    {
+                        **model_env,
+                        "HF_HOME": str(assets / "hf_cache"),
+                        "HF_HUB_OFFLINE": "1",
+                        "TRANSFORMERS_OFFLINE": "1",
+                        "PYTORCH_ALLOC_CONF": "expandable_segments:True",
+                    },
+                    dry_run,
                 )
             else:
-                command.extend(
-                    ["rollout_fps_values=[1,4]", "use_efficient_rollout=true"]
-                )
-            run(command, model_env, dry_run)
+                command = [
+                    *torchrun_prefix(gpus),
+                    "isolated_nwm_infer.py",
+                    f"exp_dir={model['exp_dir']}",
+                    f"ckp={model['checkpoint_id']}",
+                    f"output_dir={output_root}",
+                    f"prediction_dir={output_root}",
+                    f"datasets_to_eval=[{','.join(grouped_datasets)}]",
+                    f"eval_type={inference_type}",
+                    f"eval_expected_full_count={sample_count}",
+                    "eval_diffusion_steps=250",
+                    f"batch_size={batch_size or 64}",
+                    "num_workers=4",
+                    "pin_memory=false",
+                    f"seed={EVAL_SEED}",
+                ]
+                if inference_type == "time":
+                    command.extend(
+                        [
+                            f"eval_len_traj_pred={max(time_horizons) * 4}",
+                            f"time_horizons_seconds=[{','.join(map(str, time_horizons))}]",
+                        ]
+                    )
+                else:
+                    command.extend(
+                        ["rollout_fps_values=[1,4]", "use_efficient_rollout=true"]
+                    )
+                run(command, model_env, dry_run)
 
         if not dry_run:
             for dataset in incomplete:
+                sample_count = sample_counts[dataset]
                 if inference_type == "time":
                     complete = direct_time_complete(
-                        output_root / dataset / "time", 500, time_horizons
+                        output_root / dataset / "time", sample_count, time_horizons
                     )
                 else:
                     complete = all(
                         rollout_sequences_complete(
                             output_root / dataset / evaluation,
-                            150,
+                            sample_count,
                             16
                             * int(
                                 evaluation.removeprefix("rollout_").removesuffix("fps")
@@ -893,46 +982,52 @@ def ensure_ood_ground_truth(
 ) -> Path:
     protocol_root = shared_ood_protocol_root()
     gt_root = protocol_root / "gt"
-    sample_count = int(protocol["sample_count"])
     horizons = tuple(int(value) for value in protocol["horizons_seconds"])
+    sample_counts = {
+        dataset: dataset_sample_count(protocol, dataset, "time")
+        for dataset in datasets
+    }
     incomplete = [
         dataset
         for dataset in datasets
         if not direct_time_complete(
-            gt_root / dataset / "time", sample_count, horizons
+            gt_root / dataset / "time", sample_counts[dataset], horizons
         )
     ]
     if not incomplete:
         return gt_root
     gt_env = {**env, "CUDA_VISIBLE_DEVICES": gpus[0]}
-    run(
-        [
-            "torchrun",
-            "--standalone",
-            "--nproc-per-node=1",
-            "isolated_nwm_infer.py",
-            f"exp_dir={reference_model['exp_dir']}",
-            f"output_dir={protocol_root}",
-            "gt=1",
-            f"datasets_to_eval=[{','.join(incomplete)}]",
-            "eval_type=time",
-            f"eval_len_traj_pred={protocol['future_frames']}",
-            f"time_horizons_seconds=[{','.join(map(str, horizons))}]",
-            f"eval_expected_full_count={sample_count}",
-            "batch_size=64",
-            "num_workers=8",
-            "pin_memory=false",
-            f"seed={protocol['seed']}",
-        ],
-        gt_env,
-        dry_run,
-    )
+    for sample_count, grouped_datasets in datasets_grouped_by_sample_count(
+        protocol, incomplete, "time"
+    ).items():
+        run(
+            [
+                "torchrun",
+                "--standalone",
+                "--nproc-per-node=1",
+                "isolated_nwm_infer.py",
+                f"exp_dir={reference_model['exp_dir']}",
+                f"output_dir={protocol_root}",
+                "gt=1",
+                f"datasets_to_eval=[{','.join(grouped_datasets)}]",
+                "eval_type=time",
+                f"eval_len_traj_pred={protocol['future_frames']}",
+                f"time_horizons_seconds=[{','.join(map(str, horizons))}]",
+                f"eval_expected_full_count={sample_count}",
+                "batch_size=64",
+                "num_workers=8",
+                "pin_memory=false",
+                f"seed={protocol['seed']}",
+            ],
+            gt_env,
+            dry_run,
+        )
     if not dry_run:
         remaining = [
             dataset
             for dataset in incomplete
             if not direct_time_complete(
-                gt_root / dataset / "time", sample_count, horizons
+                gt_root / dataset / "time", sample_counts[dataset], horizons
             )
         ]
         if remaining:
@@ -956,7 +1051,10 @@ def run_ood_direct_prediction(
     serialize_logical_ranks: bool = False,
 ) -> None:
     protocol = registry["protocols"][OOD_DIRECT_PROTOCOL]
-    sample_count = int(protocol["sample_count"])
+    sample_counts = {
+        dataset: dataset_sample_count(protocol, dataset, "time")
+        for dataset in datasets
+    }
     expected_world_size = int(protocol["execution"]["distributed_world_size"])
     if serialize_logical_ranks:
         if len(gpus) != 1:
@@ -969,10 +1067,15 @@ def run_ood_direct_prediction(
             f"{OOD_DIRECT_PROTOCOL} requires exactly {expected_world_size} unique GPUs "
             f"for reproducible stochastic sampling; got {len(gpus)}"
         )
-    if sample_count % expected_world_size != 0:
+    undersized = {
+        dataset: count
+        for dataset, count in sample_counts.items()
+        if count < expected_world_size
+    }
+    if undersized:
         raise ValueError(
-            f"{OOD_DIRECT_PROTOCOL} requires a logical world size that exactly divides "
-            f"{sample_count}; got {expected_world_size}"
+            f"{OOD_DIRECT_PROTOCOL} requires at least one sample per logical rank; "
+            f"world size {expected_world_size}, undersized counts {undersized}"
         )
     horizons = tuple(int(value) for value in protocol["horizons_seconds"])
     if horizons != (4,):
@@ -990,7 +1093,7 @@ def run_ood_direct_prediction(
         dataset
         for dataset in datasets
         if not direct_time_complete(
-            output_root / dataset / "time", sample_count, horizons
+            output_root / dataset / "time", sample_counts[dataset], horizons
         )
     ]
     prediction_ran = bool(force or incomplete)
@@ -1007,46 +1110,6 @@ def run_ood_direct_prediction(
                     "execution before using this recovery mode"
                 )
             assets = Path(model["assets_root"])
-            command = [
-                *raenwm_torchrun_prefix(raenwm_python, gpus),
-                "scripts/raenwm_infer.py",
-                "--source",
-                model["source_dir"],
-                "--checkpoint",
-                model["checkpoint"],
-                "--decoder",
-                str(assets / "models/decoders/dinov2/wReg_base/ViTXL_n08/model.pt"),
-                "--normalization-stats",
-                str(assets / "models/stats/dinov2/wReg_base/imagenet1k/stat.pt"),
-                "--dino-model",
-                str(assets / "models/dinov2-with-registers-base"),
-                "--project-root",
-                str(PROJECT_ROOT),
-                "--data-root",
-                model_env["NWM_DATA_ROOT"],
-                "--output-root",
-                str(output_root),
-                "--datasets",
-                *selected,
-                "--horizons",
-                "4",
-                "--future-frames",
-                str(protocol["future_frames"]),
-                "--batch-size",
-                str(inference["batch_size_per_rank"]),
-                "--num-workers",
-                "4",
-                "--sampling-method",
-                model["provenance"]["sampling_method"],
-                "--num-steps",
-                str(inference["sampling_steps"]),
-                "--seed",
-                str(protocol["seed"]),
-            ]
-            # RAE-NWM normally skips completed images. Recompute every sample in
-            # each incomplete dataset so a resumed run consumes the identical
-            # random stream as an uninterrupted fixed-topology run.
-            command.append("--force")
             model_env.update(
                 {
                     "HF_HOME": str(assets / "hf_cache"),
@@ -1055,54 +1118,102 @@ def run_ood_direct_prediction(
                     "PYTORCH_ALLOC_CONF": "expandable_segments:True",
                 }
             )
-        else:
-            logical_ranks = (
-                range(expected_world_size) if serialize_logical_ranks else (None,)
-            )
-            for logical_rank in logical_ranks:
+        for sample_count, grouped_datasets in datasets_grouped_by_sample_count(
+            protocol, selected, "time"
+        ).items():
+            if backend == "rae-nwm":
                 command = [
-                    *torchrun_prefix(gpus),
-                    "isolated_nwm_infer.py",
-                    f"exp_dir={model['exp_dir']}",
-                    f"ckp={model['checkpoint_id']}",
-                    f"output_dir={output_root}",
-                    f"prediction_dir={output_root}",
-                    f"datasets_to_eval=[{','.join(selected)}]",
-                    "eval_type=time",
-                    f"eval_len_traj_pred={protocol['future_frames']}",
-                    "time_horizons_seconds=[4]",
-                    f"eval_expected_full_count={sample_count}",
-                    f"eval_diffusion_steps={inference['sampling_steps']}",
-                    f"batch_size={inference['batch_size_per_rank']}",
-                    "num_workers=4",
-                    "pin_memory=false",
+                    *raenwm_torchrun_prefix(raenwm_python, gpus),
+                    "scripts/raenwm_infer.py",
+                    "--source",
+                    model["source_dir"],
+                    "--checkpoint",
+                    model["checkpoint"],
+                    "--decoder",
+                    str(assets / "models/decoders/dinov2/wReg_base/ViTXL_n08/model.pt"),
+                    "--normalization-stats",
+                    str(assets / "models/stats/dinov2/wReg_base/imagenet1k/stat.pt"),
+                    "--dino-model",
+                    str(assets / "models/dinov2-with-registers-base"),
+                    "--project-root",
+                    str(PROJECT_ROOT),
+                    "--data-root",
+                    model_env["NWM_DATA_ROOT"],
+                    "--output-root",
+                    str(output_root),
+                    "--datasets",
+                    *grouped_datasets,
+                    "--horizons",
+                    "4",
+                    "--future-frames",
+                    str(protocol["future_frames"]),
+                    "--batch-size",
+                    str(inference["batch_size_per_rank"]),
+                    "--num-workers",
+                    "4",
+                    "--sampling-method",
+                    model["provenance"]["sampling_method"],
+                    "--num-steps",
+                    str(inference["sampling_steps"]),
+                    "--seed",
+                    str(protocol["seed"]),
+                    "--expected-sample-count",
+                    str(sample_count),
+                    "--force",
                 ]
-                if logical_rank is None:
-                    command.append(f"seed={protocol['seed']}")
-                else:
-                    sample_indices = range(
-                        logical_rank, sample_count, expected_world_size
-                    )
-                    indices = ",".join(map(str, sample_indices))
-                    command.extend(
-                        [
-                            f"eval_sample_indices=[{indices}]",
-                            f"seed={protocol['seed']}",
-                        ]
-                    )
-                    progress(
-                        f"SERIAL logical_rank={logical_rank}/{expected_world_size - 1} "
-                        f"physical_gpu={gpus[0]} samples={sample_count // expected_world_size}"
-                    )
+                # RAE-NWM normally skips completed images. Recompute every sample in
+                # each incomplete dataset so a resumed run consumes the identical
+                # random stream as an uninterrupted fixed-topology run.
                 run(command, model_env, dry_run)
-        if backend == "rae-nwm":
-            run(command, model_env, dry_run)
+            else:
+                logical_ranks = (
+                    range(expected_world_size)
+                    if serialize_logical_ranks
+                    else (None,)
+                )
+                for logical_rank in logical_ranks:
+                    command = [
+                        *torchrun_prefix(gpus),
+                        "isolated_nwm_infer.py",
+                        f"exp_dir={model['exp_dir']}",
+                        f"ckp={model['checkpoint_id']}",
+                        f"output_dir={output_root}",
+                        f"prediction_dir={output_root}",
+                        f"datasets_to_eval=[{','.join(grouped_datasets)}]",
+                        "eval_type=time",
+                        f"eval_len_traj_pred={protocol['future_frames']}",
+                        "time_horizons_seconds=[4]",
+                        f"eval_expected_full_count={sample_count}",
+                        f"eval_diffusion_steps={inference['sampling_steps']}",
+                        f"batch_size={inference['batch_size_per_rank']}",
+                        "num_workers=4",
+                        "pin_memory=false",
+                    ]
+                    if logical_rank is None:
+                        command.append(f"seed={protocol['seed']}")
+                    else:
+                        sample_indices = range(
+                            logical_rank, sample_count, expected_world_size
+                        )
+                        indices = ",".join(map(str, sample_indices))
+                        command.extend(
+                            [
+                                f"eval_sample_indices=[{indices}]",
+                                f"seed={protocol['seed']}",
+                            ]
+                        )
+                        progress(
+                            f"SERIAL logical_rank={logical_rank}/"
+                            f"{expected_world_size - 1} physical_gpu={gpus[0]} "
+                            f"samples={len(range(logical_rank, sample_count, expected_world_size))}"
+                        )
+                    run(command, model_env, dry_run)
         if not dry_run:
             remaining = [
                 dataset
                 for dataset in selected
                 if not direct_time_complete(
-                    output_root / dataset / "time", sample_count, horizons
+                    output_root / dataset / "time", sample_counts[dataset], horizons
                 )
             ]
             if remaining:
@@ -1434,46 +1545,6 @@ def run_planning(
         planning_env = {**env, "CUDA_VISIBLE_DEVICES": ",".join(gpus)}
         if is_raenwm:
             assets = Path(model["assets_root"])
-            command = [
-                *raenwm_torchrun_prefix(raenwm_python, gpus),
-                "scripts/raenwm_planning_eval.py",
-                "--source",
-                model["source_dir"],
-                "--checkpoint",
-                model["checkpoint"],
-                "--decoder",
-                str(assets / "models/decoders/dinov2/wReg_base/ViTXL_n08/model.pt"),
-                "--normalization-stats",
-                str(assets / "models/stats/dinov2/wReg_base/imagenet1k/stat.pt"),
-                "--dino-model",
-                str(assets / "models/dinov2-with-registers-base"),
-                "--project-root",
-                str(PROJECT_ROOT),
-                "--data-root",
-                planning_env["NWM_DATA_ROOT"],
-                "--output-root",
-                str(output_root),
-                "--datasets",
-                *datasets,
-                "--num-samples",
-                "80",
-                "--topk",
-                "5",
-                "--opt-steps",
-                "1",
-                "--num-repeat-eval",
-                "3",
-                "--microbatch-size",
-                str(microbatch_size or 80),
-                "--sampling-method",
-                model["provenance"]["sampling_method"],
-                "--num-steps",
-                str(raenwm_num_steps),
-                "--seed",
-                str(42 + EVAL_SEED),
-            ]
-            if force:
-                command.append("--no-resume")
             planning_env.update(
                 {
                     "HF_HOME": str(assets / "hf_cache"),
@@ -1482,32 +1553,85 @@ def run_planning(
                     "PYTORCH_ALLOC_CONF": "expandable_segments:True",
                 }
             )
+            commands = []
+            for sample_count, grouped_datasets in datasets_grouped_by_sample_count(
+                PROTOCOLS["navigation_cem80_v1"], datasets, "navigation"
+            ).items():
+                command = [
+                    *raenwm_torchrun_prefix(raenwm_python, gpus),
+                    "scripts/raenwm_planning_eval.py",
+                    "--source",
+                    model["source_dir"],
+                    "--checkpoint",
+                    model["checkpoint"],
+                    "--decoder",
+                    str(
+                        assets
+                        / "models/decoders/dinov2/wReg_base/ViTXL_n08/model.pt"
+                    ),
+                    "--normalization-stats",
+                    str(assets / "models/stats/dinov2/wReg_base/imagenet1k/stat.pt"),
+                    "--dino-model",
+                    str(assets / "models/dinov2-with-registers-base"),
+                    "--project-root",
+                    str(PROJECT_ROOT),
+                    "--data-root",
+                    planning_env["NWM_DATA_ROOT"],
+                    "--output-root",
+                    str(output_root),
+                    "--datasets",
+                    *grouped_datasets,
+                    "--num-samples",
+                    "80",
+                    "--topk",
+                    "5",
+                    "--opt-steps",
+                    "1",
+                    "--num-repeat-eval",
+                    "3",
+                    "--microbatch-size",
+                    str(microbatch_size or 80),
+                    "--sampling-method",
+                    model["provenance"]["sampling_method"],
+                    "--num-steps",
+                    str(raenwm_num_steps),
+                    "--seed",
+                    str(42 + EVAL_SEED),
+                    "--expected-sample-count",
+                    str(sample_count),
+                ]
+                if force:
+                    command.append("--no-resume")
+                commands.append(command)
         else:
-            command = [
-                *torchrun_prefix(gpus),
-                "planning_eval.py",
-                f"exp_dir={model['exp_dir']}",
-                f"ckp={model['checkpoint_id']}",
-                f"datasets_to_eval=[{','.join(datasets)}]",
-                f"output_dir={output_root}",
-                "batch_size=1",
-                "num_workers=4",
-                "num_samples=80",
-                "topk=5",
-                "rollout_stride=1",
-                "opt_steps=1",
-                "num_repeat_eval=3",
-                f"seed={42 + EVAL_SEED}",
-                f"planning_sample_seed={42 + EVAL_SEED}",
-                "cost_fn=lpips",
-                "compute_cost_with_recon=true",
-                "save_preds=false",
-                "plot=false",
-                f"resume_planning_samples={'false' if force else 'true'}",
+            commands = [
+                [
+                    *torchrun_prefix(gpus),
+                    "planning_eval.py",
+                    f"exp_dir={model['exp_dir']}",
+                    f"ckp={model['checkpoint_id']}",
+                    f"datasets_to_eval=[{','.join(datasets)}]",
+                    f"output_dir={output_root}",
+                    "batch_size=1",
+                    "num_workers=4",
+                    "num_samples=80",
+                    "topk=5",
+                    "rollout_stride=1",
+                    "opt_steps=1",
+                    "num_repeat_eval=3",
+                    f"seed={42 + EVAL_SEED}",
+                    f"planning_sample_seed={42 + EVAL_SEED}",
+                    "cost_fn=lpips",
+                    "compute_cost_with_recon=true",
+                    "save_preds=false",
+                    "plot=false",
+                    f"resume_planning_samples={'false' if force else 'true'}",
+                ]
             ]
             if microbatch_size is not None:
-                command.append(f"planning_microbatch_size={microbatch_size}")
-        run(command, planning_env, dry_run)
+                commands[0].append(f"planning_microbatch_size={microbatch_size}")
+        for command in commands:
+            run(command, planning_env, dry_run)
     for dataset in datasets:
         result = planning_result_path(output_root, dataset)
         if result is None:

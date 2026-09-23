@@ -70,6 +70,14 @@ def main() -> None:
     parser.add_argument("--sampler")
     parser.add_argument("--sampling-steps", type=int)
     parser.add_argument("--seed", type=int)
+    parser.add_argument("--sample-ids-file", type=Path,
+                        help="JSON array of original split positions to evaluate")
+    parser.add_argument("--sample-ids-by-frame-file", type=Path,
+                        help="JSON mapping from frame label to original split positions")
+    parser.add_argument("--reuse-frame-metrics-file", type=Path,
+                        help="Verified per-frame metrics to include without recomputing")
+    parser.add_argument("--checkpoint-sha256")
+    parser.add_argument("--split-sha256")
     args = parser.parse_args()
     inference_fields = (
         args.inference_backend,
@@ -87,9 +95,25 @@ def main() -> None:
 
     gt_samples = sample_directories(args.gt_dir)
     pred_samples = sample_directories(args.pred_dir)
+    if args.sample_ids_file is not None and args.sample_ids_by_frame_file is not None:
+        raise ValueError("Choose one sample ID filter")
+    by_frame = None
+    if args.sample_ids_by_frame_file is not None:
+        by_frame = json.loads(args.sample_ids_by_frame_file.read_text(encoding="utf-8"))
+        if set(by_frame) != set(args.frames):
+            raise ValueError("Per-frame sample ID labels must match --frames")
+    if args.sample_ids_file is not None:
+        requested = json.loads(args.sample_ids_file.read_text(encoding="utf-8"))
+        if not isinstance(requested, list) or len(requested) != len(set(requested)) or not requested:
+            raise ValueError("--sample-ids-file must contain a nonempty unique JSON array")
+        wanted = {f"id_{int(value)}" for value in requested}
+        gt_samples = [path for path in gt_samples if path.name in wanted]
+        pred_samples = [path for path in pred_samples if path.name in wanted]
+        if len(gt_samples) != len(wanted):
+            raise ValueError("ground truth does not contain every requested sample ID")
     gt_names = [path.name for path in gt_samples]
     pred_names = [path.name for path in pred_samples]
-    if gt_names != pred_names:
+    if by_frame is None and gt_names != pred_names:
         missing = sorted(set(gt_names) - set(pred_names), key=natural_key)
         extra = sorted(set(pred_names) - set(gt_names), key=natural_key)
         raise ValueError(f"sample mismatch: missing={missing[:10]}, extra={extra[:10]}")
@@ -103,9 +127,26 @@ def main() -> None:
     )
     dreamsim_model.eval()
 
-    metrics: dict[str, dict[str, float | int]] = {}
+    reused = (json.loads(args.reuse_frame_metrics_file.read_text(encoding="utf-8"))
+              if args.reuse_frame_metrics_file is not None else {})
+    if not isinstance(reused, dict) or not set(reused).issubset(args.frames):
+        raise ValueError("Reused frame labels must be a subset of --frames")
+    metrics: dict[str, dict[str, float | int]] = dict(reused)
     with torch.inference_mode():
         for label, frame_index in args.frames.items():
+            if label in reused:
+                continue
+            if by_frame is not None:
+                values = by_frame[label]
+                if not isinstance(values, list) or not values or len(values) != len(set(values)):
+                    raise ValueError(f"Invalid sample IDs for {label}")
+                wanted = {f"id_{int(value)}" for value in values}
+                selected_gt = [path for path in gt_samples if path.name in wanted]
+                selected_pred = [path for path in pred_samples if path.name in wanted]
+                if len(selected_gt) != len(wanted) or [p.name for p in selected_gt] != [p.name for p in selected_pred]:
+                    raise ValueError(f"GT/prediction sample mismatch for {label}")
+            else:
+                selected_gt, selected_pred = gt_samples, pred_samples
             lpips_sum = 0.0
             dreamsim_sum = 0.0
             psnr_sum = 0.0
@@ -116,14 +157,14 @@ def main() -> None:
                 else None
             )
 
-            for start in range(0, len(gt_samples), args.batch_size):
+            for start in range(0, len(selected_gt), args.batch_size):
                 gt_batch: list[torch.Tensor] = []
                 pred_batch: list[torch.Tensor] = []
                 gt_dreamsim: list[torch.Tensor] = []
                 pred_dreamsim: list[torch.Tensor] = []
                 for gt_sample, pred_sample in zip(
-                    gt_samples[start : start + args.batch_size],
-                    pred_samples[start : start + args.batch_size],
+                    selected_gt[start : start + args.batch_size],
+                    selected_pred[start : start + args.batch_size],
                 ):
                     gt_image, gt_tensor = load_rgb(gt_sample / f"{frame_index}.png")
                     pred_image, pred_tensor = load_rgb(pred_sample / f"{frame_index}.png")
@@ -170,12 +211,14 @@ def main() -> None:
         "eval_type": args.eval_type,
         "eval_name": args.eval_name,
         "rollout_fps": args.rollout_fps,
-        "sample_count": len(gt_samples),
+        "sample_count": len(gt_samples) if by_frame is None else None,
         "sample_order": "natural_sorted",
         "gt_eval_dir": str(args.gt_dir.resolve()),
         "pred_eval_dir": str(args.pred_dir.resolve()),
         "device": str(device),
         "frame_indices": args.frames,
+        "sample_ids": requested if args.sample_ids_file is not None else None,
+        "sample_ids_by_frame": by_frame,
         "aggregation": {
             "lpips_alex": "arithmetic mean of per-sample distances",
             "dreamsim": "arithmetic mean of per-sample distances",
@@ -183,6 +226,7 @@ def main() -> None:
             "fid": "global Inception feature statistics" if args.fid else "not computed",
         },
         "metrics": metrics,
+        "reused_metric_frames": (str(args.reuse_frame_metrics_file) if reused else None),
     }
     if all(value is not None for value in inference_fields):
         result["inference"] = {
@@ -190,9 +234,13 @@ def main() -> None:
             "sampler": args.sampler,
             "sampling_steps": args.sampling_steps,
             "seed": args.seed,
+            "checkpoint_sha256": args.checkpoint_sha256,
+            "split_sha256": args.split_sha256,
         }
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    temporary = args.output.with_name(f"{args.output.name}.tmp")
+    temporary.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(args.output)
     print(json.dumps(result, indent=2))
 
 

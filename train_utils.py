@@ -414,8 +414,13 @@ def evaluate(
     num_cond,
     unnormalize_fn,
     offload_model=False,
+    num_batches=1,
 ):
-    """Evaluate model on test dataset."""
+    """Evaluate consecutive batches, weighting every goal image equally."""
+    if not isinstance(num_batches, int) or num_batches < 1:
+        raise ValueError("Evaluation num_batches must be a positive integer")
+    if num_batches > len(eval_loader):
+        raise ValueError("Evaluation num_batches exceeds available loader batches")
     from isolated_nwm_infer import model_forward_wrapper
 
     global _eval_model_cache
@@ -469,104 +474,103 @@ def evaluate(
     if device.type == "cuda":
         torch.cuda.manual_seed(eval_seed)
 
-    # Run for 1 step. New datasets return a dictionary so heterogeneous
-    # conditions are not padded; legacy configs retain their tuple contract.
-    batch = next(iter(loader))
-    motion = None
-    if isinstance(batch, dict):
-        if "video" not in batch:
-            raise RuntimeError("Evaluation requires pixel video samples")
-        x = batch["video"].to(device)
-        y = None
-        rel_t = batch["k"].to(device)
-    else:
-        x, y, rel_t = batch
-        x = x.to(device)
-        y = y.to(device)
-        rel_t = rel_t.to(device)
-    with torch.amp.autocast("cuda", enabled=bfloat_enable, dtype=torch.bfloat16):
-        B, T = x.shape[:2]
-        num_goals = T - num_cond
+    # Reuse one iterator so successive batches contain distinct examples.
+    iterator = iter(loader)
+    for batch_index in range(num_batches):
+        batch = next(iterator)
+        motion = None
         if isinstance(batch, dict):
-            motion = flatten_motion_groups(
-                batch.get("motion"),
-                batch_size=B,
-                num_goals=num_goals,
+            if "video" not in batch:
+                raise RuntimeError("Evaluation requires pixel video samples")
+            x = batch["video"].to(device)
+            y = None
+            rel_t = batch["k"].to(device)
+        else:
+            x, y, rel_t = batch
+            x = x.to(device)
+            y = y.to(device)
+            rel_t = rel_t.to(device)
+        with torch.amp.autocast("cuda", enabled=bfloat_enable, dtype=torch.bfloat16):
+            B, T = x.shape[:2]
+            num_goals = T - num_cond
+            if isinstance(batch, dict):
+                motion = flatten_motion_groups(
+                    batch.get("motion"),
+                    batch_size=B,
+                    num_goals=num_goals,
+                    device=device,
+                )
+            rel_t = rel_t.flatten(0, 1)
+
+            start_time = time()
+            samples = model_forward_wrapper(
+                (model, diffusion, vae),
+                x,
+                y,
+                num_timesteps=None,
+                latent_size=latent_size,
                 device=device,
+                num_cond=num_cond,
+                num_goals=num_goals,
+                rel_t=rel_t,
+                motion=motion,
             )
-        rel_t = rel_t.flatten(0, 1)
+            logger.info(
+                f"Time taken for generating {samples.shape}: {time() - start_time:.2f} seconds"
+            )
 
-        start_time = time()
-        samples = model_forward_wrapper(
-            (model, diffusion, vae),
-            x,
-            y,
-            num_timesteps=None,
-            latent_size=latent_size,
-            device=device,
-            num_cond=num_cond,
-            num_goals=num_goals,
-            rel_t=rel_t,
-            motion=motion,
-        )
-        logger.info(
-            f"Time taken for generating {samples.shape}: {time() - start_time:.2f} seconds"
-        )
+            x_start_pixels = x[:, num_cond:].flatten(0, 1)
+            x_cond_pixels = (
+                x[:, :num_cond]
+                .unsqueeze(1)
+                .expand(B, num_goals, num_cond, x.shape[2], x.shape[3], x.shape[4])
+                .flatten(0, 1)
+            )
+            # Unnormalize pixels directly using tokenizer's unnormalization
+            # samples = vae.unnormalize_image(samples)
+            x_start_pixels = unnormalize_fn(x_start_pixels)
+            x_cond_pixels = unnormalize_fn(x_cond_pixels)
 
-        x_start_pixels = x[:, num_cond:].flatten(0, 1)
-        x_cond_pixels = (
-            x[:, :num_cond]
-            .unsqueeze(1)
-            .expand(B, num_goals, num_cond, x.shape[2], x.shape[3], x.shape[4])
-            .flatten(0, 1)
-        )
-        # Unnormalize pixels directly using tokenizer's unnormalization
-        # samples = vae.unnormalize_image(samples)
-        x_start_pixels = unnormalize_fn(x_start_pixels)
-        x_cond_pixels = unnormalize_fn(x_cond_pixels)
+            res = eval_model(x_start_pixels, samples)
 
-        res = eval_model(x_start_pixels, samples)
+            score += res.sum()
+            n_samples += len(res)
 
-        score += res.sum()
-        n_samples += len(res)
-
-    if rank == 0:
-        os.makedirs(save_dir, exist_ok=True)
-        for i in range(min(samples.shape[0], 10)):
-            fig, ax = plt.subplots(1, 3, dpi=256)
-            ax[0].imshow(
-                (x_cond_pixels[i, -1].permute(1, 2, 0).cpu().numpy() * 255).astype(
-                    "uint8"
+        if rank == 0 and batch_index == 0:
+            os.makedirs(save_dir, exist_ok=True)
+            for i in range(min(samples.shape[0], 10)):
+                fig, ax = plt.subplots(1, 3, dpi=256)
+                ax[0].imshow(
+                    (x_cond_pixels[i, -1].permute(1, 2, 0).cpu().numpy() * 255).astype(
+                        "uint8"
+                    )
                 )
-            )
-            ax[1].imshow(
-                (x_start_pixels[i].permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")
-            )
-            ax[2].imshow(
-                (samples[i].permute(1, 2, 0).cpu().float().numpy() * 255).astype(
-                    "uint8"
+                ax[1].imshow(
+                    (x_start_pixels[i].permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")
                 )
-            )
-            plt.savefig(f"{save_dir}/{i}.png")
-            plt.clf()  # Clear current figure
-            plt.close(fig)  # Close specific figure
-            del fig  # Explicitly delete figure reference
+                ax[2].imshow(
+                    (samples[i].permute(1, 2, 0).cpu().float().numpy() * 255).astype(
+                        "uint8"
+                    )
+                )
+                plt.savefig(f"{save_dir}/{i}.png")
+                plt.clf()  # Clear current figure
+                plt.close(fig)  # Close specific figure
+                del fig  # Explicitly delete figure reference
+
+        del batch, x, y, rel_t, motion, samples, x_start_pixels, x_cond_pixels, res
+
+    del iterator
 
     dist.all_reduce(score)
     dist.all_reduce(n_samples)
     sim_score = score / n_samples
 
-    # Explicitly delete large tensors and clear cache
+    # Batch tensors were released before fetching the next batch.
     import gc
 
-    try:
-        del x, y, rel_t, motion, samples, x_start_pixels, x_cond_pixels
-        if "res" in locals():
-            del res
-        if "ax" in locals():
-            del ax
-    except Exception:
-        pass
+    if "ax" in locals():
+        del ax
 
     # Force garbage collection and CUDA cache cleanup
     gc.collect()

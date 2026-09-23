@@ -62,6 +62,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", required=True)
     parser.add_argument("--sampling-recipe", required=True)
     parser.add_argument("--output-root", required=True)
+    parser.add_argument("--reuse-root", help="Completed VAE cache whose matching trajectories are imported without encoding")
     parser.add_argument(
         "--dataset-config", default=str(repo / "conf" / "dataset" / "navanywhere.yaml")
     )
@@ -420,7 +421,7 @@ def _build_state(
     if args.max_trajectories:
         tasks = tasks[: int(args.max_trajectories)]
     _assign(tasks, world_size)
-    return {
+    state = {
         "data_root": str(data_root),
         "output_root": str(output_root),
         "dataset_config": str(Path(args.dataset_config).resolve()),
@@ -434,6 +435,64 @@ def _build_state(
         "hardware": {**hardware, "homogeneous_world_size": world_size},
         "encoding": encoding,
     }
+    reuse_root = getattr(args, "reuse_root", None)
+    if reuse_root:
+        root = Path(reuse_root).expanduser().resolve()
+        if root == output_root:
+            raise ValueError("Reuse root must differ from output root")
+        metadata_path = root / "metadata.json"
+        metadata = json.loads(metadata_path.read_text())
+        success = json.loads((root / "_SUCCESS.json").read_text())
+        if (metadata.get("complete") is not True or success.get("complete") is not True
+                or success.get("metadata_sha256") != sha256_file(metadata_path)):
+            raise ValueError("Reuse VAE cache is incomplete or its metadata changed")
+        _validate_reuse_descriptors(state, metadata)
+        old_recipe, _, old_sha = load_sampling_recipe(metadata["sampling_recipe"]["path"])
+        if old_sha != metadata["sampling_recipe"]["sha256"]:
+            raise ValueError("Reuse recipe SHA mismatch")
+        identities = {(item["source_id"], item["trajectory_id"]) for item in old_recipe["trajectories"]}
+        for task in tasks:
+            task["reuse"] = (task["source_id"], task["trajectory_id"]) in identities
+        state["reuse"] = {
+            "root": str(root), "metadata_sha256": sha256_file(metadata_path),
+            "sampling_recipe_sha256": old_sha,
+            **{key: metadata[key] for key in ("vae", "transform", "encoding", "hardware", "software")},
+        }
+    return state
+
+
+def _validate_reuse_descriptors(state: dict[str, Any], metadata: dict[str, Any]) -> None:
+    # Device/software provenance may differ; VAE weights, preprocessing, batching
+    # and numeric dtypes must agree. Keep original provenance on imported shards.
+    for key in ("vae", "transform"):
+        if metadata[key]["fingerprint"] != state[key]["fingerprint"]:
+            raise ValueError(f"Reuse {key} fingerprint mismatch")
+    provenance = {"fingerprint", "hardware_fingerprint", "software_fingerprint"}
+    for key in (set(metadata["encoding"]) | set(state["encoding"])) - provenance:
+        if metadata["encoding"].get(key) != state["encoding"].get(key):
+            raise ValueError(f"Reuse encoding.{key} mismatch")
+
+
+def _reuse_task(state, task, frames, source_fingerprint):
+    reuse = state["reuse"]
+    old_state = {
+        **state, "output_root": reuse["root"],
+        **{key: reuse[key] for key in ("vae", "transform", "encoding", "sampling_recipe_sha256")},
+    }
+    # Fail on changed/missing old data instead of silently re-encoding it.
+    _cache_record(old_state, task, frames, source_fingerprint)
+    source = _safe_path(Path(reuse["root"]), task["source_id"], task["trajectory_id"], ".pt")
+    payload = _load_cache(source)
+    original = payload["metadata"]
+    payload["metadata"] = {
+        **original, **_file_metadata(state, source_fingerprint),
+        "reused_from": {"path": str(source), "metadata": original,
+                        "cache_metadata_sha256": reuse["metadata_sha256"]},
+    }
+    output = _safe_path(Path(state["output_root"]), task["source_id"], task["trajectory_id"], ".pt")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    atomic_torch_save(output, payload)
+    return _cache_record(state, task, frames, source_fingerprint)
 
 
 def _write_completion(
@@ -486,6 +545,7 @@ def _write_completion(
         "software": state["software"],
         "hardware": state["hardware"],
         "encoding": state["encoding"],
+        "reused_cache": state.get("reuse"),
         "storage": {
             "dtype": "bfloat16",
             "layout": "NCHW",
@@ -565,7 +625,8 @@ def main() -> None:
     log(
         rank,
         f"assigned trajectories={len(assigned)}, frames="
-        f"{sum(int(task['frame_count']) for task in assigned)}",
+        f"{sum(int(task['frame_count']) for task in assigned)}, "
+        f"reuse_trajectories={sum(bool(task.get('reuse')) for task in assigned)}",
     )
     vae = None
     transform = get_transform(
@@ -586,6 +647,9 @@ def main() -> None:
                 record = _cache_record(state, task, frames, source_fingerprint)
             except Exception as exc:
                 log(rank, f"recomputing invalid cache {output}: {type(exc).__name__}: {exc}")
+        if record is None:
+            if task.get("reuse"):
+                record = _reuse_task(state, task, frames, source_fingerprint)
         if record is None:
             if vae is None:
                 vae = load_vae(state, device, rank)

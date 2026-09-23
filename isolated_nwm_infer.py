@@ -58,7 +58,36 @@ def save_image(output_file, img):
     img = img.byte()
     image = Image.fromarray(img.permute(1, 2, 0).numpy(), mode="RGB")
 
-    image.save(output_file)
+    temporary = f"{output_file}.tmp.{os.getpid()}.png"
+    image.save(temporary, format="PNG")
+    os.replace(temporary, output_file)
+
+
+def valid_image(path):
+    try:
+        with Image.open(path) as image:
+            image.verify()
+        return True
+    except (FileNotFoundError, OSError, ValueError):
+        return False
+
+
+def select_missing(output_dir, idxs, frames, *tensors):
+    """Keep original split IDs while removing fully written samples."""
+    positions = [
+        offset
+        for offset, value in enumerate(idxs.reshape(-1))
+        if not all(
+            valid_image(os.path.join(output_dir, f"id_{int(value.item())}", f"{frame}.png"))
+            for frame in frames
+        )
+    ]
+    if not positions:
+        return None
+    selected = torch.as_tensor(positions, dtype=torch.long)
+    return (idxs.index_select(0, selected.to(idxs.device)),) + tuple(
+        tensor.index_select(0, selected.to(tensor.device)) for tensor in tensors
+    )
 
 
 def get_dataset_eval(config, dataset_name, eval_type, predefined_index=True):
@@ -436,16 +465,20 @@ def generate_time(
     """
     eval_timesteps = [sec * config.input_fps for sec in secs]
     for sec, timestep in zip(secs, eval_timesteps):
-        curr_delta = delta[:, :timestep].sum(dim=1, keepdim=True)
+        selected = select_missing(output_dir, idxs, (sec,), obs_image, gt_output, delta)
+        if selected is None:
+            continue
+        selected_ids, selected_obs, selected_gt, selected_delta = selected
+        curr_delta = selected_delta[:, :timestep].sum(dim=1, keepdim=True)
         if config.gt:
-            x_pred_pixels = gt_output[:, timestep - 1].clone().to(device)
+            x_pred_pixels = selected_gt[:, timestep - 1].clone().to(device)
             x_pred_pixels = misc.get_unnormalize(
                 config.dataset.mean, config.dataset.std
             )(x_pred_pixels)
         else:
             x_pred_pixels = model_forward_wrapper(
                 all_models,
-                obs_image,
+                selected_obs,
                 curr_delta,
                 timestep,
                 config.latent_size,
@@ -453,13 +486,13 @@ def generate_time(
                 num_goals=1,
                 device=device,
                 motion_type="real",
-                sample_keys=idxs,
+                sample_keys=selected_ids,
                 noise_seed=config.seed,
                 noise_stream=f"{dataset_name}/time/{int(sec)}s",
             )
         visualize_preds(
             output_dir,
-            idxs,
+            selected_ids,
             sec,
             x_pred_pixels,
         )
@@ -654,6 +687,8 @@ def main(config: DictConfig):
         for data_iter_step, (idxs, obs_image, gt_image, delta) in enumerate(
             metric_logger.log_every(curr_data_loader, print_freq, header)
         ):
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats(device)
             with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
                 obs_image = obs_image[:, -num_cond:].to(device)
                 gt_image = gt_image.to(device)
@@ -666,6 +701,35 @@ def main(config: DictConfig):
                             dataset_save_output_dir, f"rollout_{rollout_fps}fps"
                         )
                         os.makedirs(curr_rollout_output_dir, exist_ok=True)
+                        selected = select_missing(
+                            curr_rollout_output_dir,
+                            idxs,
+                            range(16 * int(rollout_fps)),
+                            obs_image,
+                            gt_image,
+                            delta,
+                        )
+                        if selected is None:
+                            continue
+                        selected_ids, selected_obs, selected_gt, selected_delta = selected
+
+                        if bool(config.get("single_image_context", False)) and not config.gt:
+                            if bool(config.get("save_initial_image", False)):
+                                initial_dir = os.path.join(config.output_dir, "initial", dataset_name)
+                                initial_pixels = misc.get_unnormalize(
+                                    config.dataset.mean, config.dataset.std
+                                )(selected_obs[:, -1])
+                                for offset, sample_index in enumerate(selected_ids.reshape(-1)):
+                                    initial_path = os.path.join(
+                                        initial_dir, f"id_{int(sample_index.item())}.png"
+                                    )
+                                    os.makedirs(initial_dir, exist_ok=True)
+                                    save_image(initial_path, initial_pixels[offset])
+                            # Match the official single-image interactive demo:
+                            # repeat the current frame to fill the model's context.
+                            selected_obs = selected_obs[:, -1:].expand(
+                                -1, num_cond, -1, -1, -1
+                            ).contiguous()
 
                         # Use efficient rollout if configured (default: True for better performance)
                         use_efficient_rollout = getattr(
@@ -681,11 +745,11 @@ def main(config: DictConfig):
                             config,
                             curr_rollout_output_dir,
                             rollout_fps,
-                            idxs,
+                            selected_ids,
                             model_lst,
-                            obs_image,
-                            gt_image,
-                            delta,
+                            selected_obs,
+                            selected_gt,
+                            selected_delta,
                             num_cond,
                             device,
                             dataset_name,
@@ -712,6 +776,15 @@ def main(config: DictConfig):
                     raise ValueError(
                         f"Unknown eval_type: {config.eval_type}, must be 'time' or 'rollout'"
                     )
+            if torch.cuda.is_available():
+                logger.info(
+                    "eval_progress dataset=%s batch=%d/%d samples=%d peak_memory_gib=%.2f",
+                    dataset_name,
+                    data_iter_step + 1,
+                    len(curr_data_loader),
+                    len(idxs),
+                    torch.cuda.max_memory_allocated(device) / 1024**3,
+                )
 
     logger.info(f"Inference completed. Results saved to {save_output_dir}")
 

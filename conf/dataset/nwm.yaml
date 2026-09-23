@@ -65,14 +65,17 @@ datasets:
     goals_per_obs: 4
     metric_waypoint_spacing: 0.12
   planetary_rover:
-    # Real NASA/CLEP Mars + Moon imagery. This source is test-only and must
-    # remain disabled for every training/precompute selection.
+    # Real Chang'e-4/Yutu-2 and Tianwen-1/Zhurong native-colour imagery.
+    # This source is test-only and must remain disabled for every
+    # training/precompute selection.
     enabled: false
     evaluation_only: true
     data_folder: ${oc.env:NWM_DATA_ROOT}/planetary_rover
     test: data_splits/planetary_rover/test/
     goals_per_obs: 4
-    metric_waypoint_spacing: 0.9741752833246042
+    metric_waypoint_spacing: 1.0  # normalized median-step units, NOT meters
     wrap_delta_yaw: true
-    use_predefined_index: false
-    temporal_semantics: spatial_index
+    use_predefined_index: true
+    temporal_semantics: irregular_real_frame_index
+    position_units: sequence_median_step_units
+    metric_navigation_evaluation_allowed: false

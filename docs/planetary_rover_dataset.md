@@ -1,189 +1,156 @@
-# Planetary Rover unseen test set
+# Planetary rover real-colour evaluation set
 
-`planetary_rover` is one evaluation-only dataset containing real Mars and Moon
-rover observations. It has no train split and is disabled by default in both
-NWM dataset configurations, so it cannot silently enter training or latent
-precomputation.
+`planetary_rover` is a small, evaluation-only NWM test set made from real
+mission imagery. It contains 15 Chang'e-4/Yutu-2 Moon clips and
+13 Tianwen-1/Zhurong Mars clips. All 239 frames are native colour
+captures with 211 adjacent-pose actions. No simulated, colourised,
+cropped-to-hide-hardware, duplicated, padded, or temporally interpolated image
+is included.
 
-## Authoritative sources
+The dataset remains disabled in both `conf/dataset/nwm.yaml` and
+`conf/dataset/nwm_real.yaml`. It has no training split and must not enter model
+training or latent precomputation.
 
-- Mars localization: NASA Planetary Data System, Mars 2020 Rover PLACES,
-  [DOI 10.17189/btz6-5a82](https://doi.org/10.17189/btz6-5a82), bundle
-  `urn:nasa:pds:mars2020_rover_places::16.0`.
-- Mars images and PDS4 labels: NASA PDS Mars 2020 Navcam Operations Raw,
-  [DOI 10.17189/d3nm-pp09](https://doi.org/10.17189/d3nm-pp09), bundle
-  `mars2020_navcam_ops_raw`. Product discovery uses the official JPL PDS
-  Imaging Atlas API; only products carrying a published Atlas release ID are
-  accepted.
-- Moon images and labels: the
-  [Chinese Lunar Exploration Program scientific data system](https://moon.bao.ac.cn/)
-  (CLEP), Chang'e-4/Yutu-2 PCAM calibrated level 2B, catalogue ID 672. The
-  official catalogue lists
-  [2019](https://doi.org/10.12350/CLPDS.GRAS.CE4.PCAM-2B-2019.vB),
-  [2020](https://doi.org/10.12350/CLPDS.GRAS.CE4.PCAM-2B-2020.vB), and
-  [2021](https://doi.org/10.12350/CLPDS.GRAS.CE4.PCAM-2B-2021.vB) DOIs and
-  identifies the producer as the National Astronomical Observatories/CLEP
-  Ground Research and Application System.
+## Contents
 
-Every selected frame records its official label URL, image URL, label SHA-256,
-downloaded source-image SHA-256, and processed-JPEG SHA-256 in
-`frame_metadata.jsonl`. Checksums for the source indexes and PLACES tables are
-in the cache `sources/source_manifest.json`. The CLEP host currently serves an
-expired TLS certificate; the builder records this fact, connects only to the
-fixed official host, and hashes every returned payload. Users redistributing
-the source products remain responsible for the providers' citation and usage
-terms.
+| body | mission and camera | trajectories | frames | actions | view |
+|---|---|---:|---:|---:|---|
+| Moon | Chang'e-4/Yutu-2 PCAML Level 2B | 15 | 66 | 51 | original full-frame ego view, forward terrain and horizon, no rover component or rover shadow |
+| Mars | Tianwen-1/Zhurong NaTeCamA Level 2C | 13 | 173 | 160 | rover-mounted forward or forward-oblique terrain with horizon; no nadir view |
+| **total** |  | **28** | **239** | **211** |  |
 
-No simulated image, synthesized frame, visual odometry, learned pose, SLAM
-pose, or interpolated image is used.
+The exact trajectory names and per-trajectory counts are frozen in
+`dataset_report.json` and `source_manifest.json`. The source products and labels
+come from the NAOC/CNSA Ground Research and Application System planetary
+archive:
 
-## Selection and poses
+- Moon: [Chang'e-4 rover archive](https://moon.bao.ac.cn/PUBDATA/CE4ROLL/),
+  PCAML `COLOR` Level 2B products.
+- Mars: [Tianwen-1 rover archive](https://moon.bao.ac.cn/WEBDATA/HX1ROLL/HX1-Ro/NaTeCamA/2C/),
+  NaTeCamA Level 2C products.
 
-Mars uses the left regular EDR Navcam view and keeps one representative product
-per `(site, drive)`. Only `VCE_` and `TRAV` activities with absolute rover-frame
-camera azimuth at most 5 degrees are eligible. Position is the official PLACES
-`best_interp` solution when the RMC is present. Otherwise, official image-time
-telemetry is mapped into PLACES with the local similarity transform bracketed
-by neighboring PLACES RMCs. Yaw comes from the official telemetry quaternion.
-Segments do not cross a site, a displacement above 5 m, an SCLK gap above
-900,000 s, or a wrapped yaw step above 120 degrees.
+`source_manifest.json` and each `frame_metadata.jsonl` record the exact product
+and label URLs and SHA-256 hashes. Provider citation and redistribution terms
+still apply to the original products.
 
-For Moon, a PCAM observation sequence is a panorama taken at one rover pose.
-Using panorama frames as vehicle motion would be incorrect, so exactly one
-left-eye image minimizing the magnitude of the official wrapped mast yaw and
-mast pitch is selected from each sequence; the accepted score must be within
-30 degrees. Rover body yaw is recovered entirely from two official label
-quantities:
+## Image selection and processing
+
+All 66 accepted Moon source frames were reviewed as complete original
+images. Every frame shows forward terrain near the horizon and contains neither
+a rover component nor a rover shadow. No crop, mask, inpainting, retouching, or
+artificial colourisation was used to meet that condition. Frames with a
+downward-looking composition, severe glare or overexposure, or colour-row
+artifacts were excluded; no action crosses an excluded frame or clip boundary.
+
+The lunar products contain a physical 10-bit RGGB Bayer mosaic. Processing is
+fixed for every frame: little-endian `uint16`, OpenCV
+`COLOR_BayerRGGB2RGB`, then `rgb_uint8 = rgb_uint16 >> 2`. There is no
+scene-dependent stretch, white balance, or artificial colourisation. The
+natural lunar colour is consequently low in saturation. The complete
+2352 x 1728 image content is resized to 224 x 224 with LANCZOS; it is not
+cropped.
+
+The 173 Mars frames are native three-channel NaTeCamA products. Their
+complete source frames are resized to 224 x 224 with LANCZOS. Every accepted
+view is rover-mounted, forward or forward-oblique, and includes the horizon;
+drone, nadir, and downward-looking views are excluded. A thin yellow
+rover-mounted element remains visible at the lower edge of some Mars frames;
+the full images are retained instead of hiding it.
+
+All 211 adjacent image pairs passed reciprocal feature matching and robust
+geometric verification. These checks establish useful visual overlap between
+the selected observations; they do not imply a fixed capture rate or an
+observed continuous drive.
+
+## Official poses and action semantics
+
+The dataset does not use three-dimensional reconstruction, visual odometry,
+SLAM, learned poses, or interpolated poses:
+
+- Moon and Mars camera XY endpoints are the sum of official rover XY and the
+  official exterior-orientation camera-center XY offset in the declared global
+  coordinate frame. Camera yaw is the official optical-axis direction projected
+  into that same frame. The camera-center offset is already global and is never
+  rotated a second time by rover yaw.
+
+For loader compatibility, each trajectory translates its first official XY
+position to the origin. A moving trajectory applies one uniform scale so that
+its median nonzero adjacent translation is 1. A rotation-only trajectory keeps
+its fixed XY at zero. The exact official metre coordinates and reversible
+transform remain in `frame_metadata.jsonl` and `metadata.json`. Thus
+`metric_waypoint_spacing: 1.0` denotes sequence-normalized units, not metres;
+metric navigation evaluation is explicitly disabled.
+
+For adjacent captures `i` and `i + 1`, the action is the net planar pose change
+expressed in camera/ego axes at capture `i`:
 
 ```text
-rover_yaw = wrap(atan2(center_point_observe_vector.y,
-                       center_point_observe_vector.x)
-                 - Rotation_Angle.yawing)
+world_delta = normalized_xy[i + 1] - normalized_xy[i]
+forward     =  cos(yaw[i]) * world_delta.x + sin(yaw[i]) * world_delta.y
+left        = -sin(yaw[i]) * world_delta.x + cos(yaw[i]) * world_delta.y
+delta_yaw   = wrap(yaw[i + 1] - yaw[i])
+action      = [forward, left, delta_yaw]
 ```
 
-The circular mean across all views at that fixed pose is used. A sequence is
-accepted only when its circular standard deviation is at most 2 degrees; the
-median over all official sequences is about 0.30 degrees. As a direct audit,
-five independently panned views from sequence 0362 recover one body heading
-with circular standard deviation below 0.003 degrees. The within-sequence
-pose-span check is 0.05 m.
+This is an official-endpoint-derived net SE(2) displacement. It is not
+throttle, steering, wheel speed, motor command, or a record of the unobserved
+path between the two captures.
 
-The Moon observations are genuinely sparse: the raw nonzero adjacent-distance
-median is `11.200689830543231 m`, and timestamps are irregular. They remain a
-sparse spatial sequence; no frames are filled in. To put Mars and Moon into one
-dataset with one action scale, Moon XY written to `traj_data.pkl` is transformed
-reversibly:
+Some Moon clips are camera-turn observations at a fixed official rover XY.
+Their camera-center endpoints can still move because the published global
+camera-center offset changes with the camera pose. The recorded action uses
+those camera endpoints and the wrapped difference between adjacent official
+optical-axis yaws. It does not claim wheel travel or a low-level vehicle
+control.
 
-```text
-evaluation_xy = (official_rover_xy_m - [-1.759764, -12.692296])
-                * 0.08697457907173892
-official_rover_xy_m = evaluation_xy / 0.08697457907173892
-                      + [-1.759764, -12.692296]
-```
+## Installed layout
 
-This makes the lunar nonzero median step equal to the Mars waypoint spacing,
-`0.9741752833246042`. The unmodified official `rover_xyz`, explicit raw XY,
-transform, timestamps, and label values remain in per-frame provenance.
-
-CLEP stores the grayscale DN in an `UnsignedLSB2` container; selected products
-populate the 10-bit range `0..1023`. The fixed display conversion retains the
-most-significant eight bits (`uint8 = uint16_dn >> 2`) before cropping and
-resizing. It is scene-independent—there is no per-image histogram or percentile
-stretch—and each frame records its observed source DN range and formula.
-
-## Layout and action convention
-
-The installed data root is:
+The dataset root is:
 
 ```text
 /file_system/nas/algorithm/dujun.nie/nwm/data/planetary_rover/
-  mars_perseverance_navcam_0000/
-    0.jpg
-    1.jpg
-    ...
-    traj_data.pkl
-    frame_metadata.jsonl
-    metadata.json
-  ...
-  moon_yutu2_pcam_0000/
+  moon_yutu2_pcam_color_*/
+  mars_zhurong_natecam_color_*/
+  dataset_config.json
   dataset_report.json
+  source_manifest.json
+  validation.json
+  preview.jpg
   _SUCCESS
 ```
 
-This is the same loader-facing layout as RECON, SCAND, HuRoN/SACSoN,
-TartanDrive, and Go Stanford. Each image is RGB `224 x 224`; the official image
-is center-square cropped and resized. `traj_data.pkl` has exactly:
+Each trajectory contains contiguous `0.jpg`, `1.jpg`, ... images,
+`traj_data.pkl`, `actions.json`, `frame_metadata.jsonl`, `metadata.json`, and
+`pair_geometry.json`. `traj_data.pkl` keeps the standard loader payload:
 
 ```python
 {
-    "position": np.ndarray[N, 2],
-    "yaw": np.ndarray[N],
+    "position": np.ndarray[N, 2],  # sequence-normalized units
+    "yaw": np.ndarray[N],          # radians
 }
 ```
 
-Yaw is in radians. `BaseDataset` expresses future positions in the observation
-frame and divides XY by the configured waypoint spacing. `EvalDataset` then
-produces `[dx, dy, dyaw]`. For this dataset only, `dyaw` is the shortest signed
-angle in `[-pi, pi)`; this prevents false `2*pi` jumps at the branch cut while
-leaving historical datasets unchanged.
+The evaluation split is installed at
+`data_splits/planetary_rover/test/`. Its frozen counts are:
 
-The only split is
-`data_splits/planetary_rover/test/traj_names.txt`. There is deliberately no
-train path. Inference uses the complete deterministic test index rather than a
-separately sampled `time.pkl` or `rollout.pkl`; set `NWM_INDEX_ROOT` to a NAS
-cache directory to keep generated loader indexes out of the repository.
+| index | samples | configured future length | source trajectories |
+|---|---:|---:|---|
+| `time.pkl` | 10 | 16 | eligible Mars clips only |
+| `navigation_eval.pkl` | 47 | 8 | eligible Mars clips only |
+| `rollout.pkl` | 0 | 64 | none |
 
-Frame indices in this dataset are spatial observation indices, not a fixed-rate
-camera clock. In particular, lunar timestamps can be separated by days. Do not
-label frame offsets as seconds or compare time-based FPS metrics directly with
-4 Hz terrestrial datasets. Use spatial-step or action-conditioned evaluation;
-the config records `temporal_semantics: spatial_index` to make this explicit.
+`traj_names.txt` lists all 28 accepted trajectories. Short clips remain
+available for qualitative, action-conditioned sequence tests but do not enter
+an indexed task unless they contain a complete context and future window. The
+indexes contain no duplicates, padding, cross-clip samples, or samples that
+cross a failed visual-overlap edge. Inference therefore uses the
+planetary-only overrides `prediction_sample_count: 10` and
+`eval_len_traj_pred: 16`; planning uses `navigation_sample_count: 47`.
+Other datasets retain their existing defaults.
 
-## Frozen scale
-
-With `context_size=4` and `len_traj_pred=64`, a trajectory of length `N`
-contributes `N-67` windows:
-
-| subset | trajectories | frames | windows |
-|---|---:|---:|---:|
-| Mars | 75 | 11,278 | 6,253 |
-| Moon | 1 | 135 | 68 |
-| combined test set | 76 | 11,413 | 6,321 |
-
-For comparison, counts from the locally installed test splits are:
-
-| dataset | frames | windows |
-|---|---:|---:|
-| TartanDrive | 13,197 | 5,742 |
-| planetary_rover | 11,413 | 6,321 |
-| Go Stanford | 26,463 | 16,815 |
-| SCAND | 22,757 | 18,138 |
-| HuRoN/SACSoN (available trajectories) | 46,901 | 27,587 |
-| RECON | 120,920 | 31,711 |
-
-Thus the new test set is closest to TartanDrive in both frame and window
-count. It is large enough to be a full unseen test set but is never an
-adaptation or training set.
-
-## Rebuild and validation
-
-The builder is `scripts/prepare_planetary_rover.py`. Large data and all
-authoritative caches stay on NAS:
-
-```bash
-conda run --no-capture-output -n nwm-preprocess python -u \
-  scripts/prepare_planetary_rover.py all \
-  --cache-root /file_system/nas/algorithm/dujun.nie/datasets/planetary_rover/cache \
-  --output-root /file_system/nas/algorithm/dujun.nie/nwm/data/planetary_rover \
-  --split-output data_splits/planetary_rover/test/traj_names.txt \
-  --workers 32
-
-conda run --no-capture-output -n nwm-preprocess python -u \
-  scripts/prepare_planetary_rover.py validate \
-  --cache-root /file_system/nas/algorithm/dujun.nie/datasets/planetary_rover/cache \
-  --output-root /file_system/nas/algorithm/dujun.nie/nwm/data/planetary_rover \
-  --split-output data_splits/planetary_rover/test/traj_names.txt
-```
-
-The build is frame-resumable. A trajectory is committed only after every
-image, pose array, provenance row, checksum, and shape check succeeds.
+Capture intervals are irregular mission observation intervals, sometimes much
+longer than terrestrial video frame intervals. Frame indices are ordered
+observations and do not define a fixed FPS. Do not report time-based FPS claims
+or metre-scale navigation metrics from this normalized test set. Use it for
+small qualitative and out-of-distribution NWM evaluation, and report the exact
+split and action convention with any result.

@@ -6,6 +6,8 @@ results_dir: /file_system/nas/algorithm/dujun.nie/nwm/compact/runs
 batch_size: 16
 # Per-GPU evaluation batch; null preserves the training batch size.
 eval_batch_size: null
+# Consecutive batches per evaluation, per GPU.
+eval_num_batches: 1
 num_workers: 4
 grad_clip_val: 2.0
 

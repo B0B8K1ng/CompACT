@@ -14,6 +14,7 @@ import json
 import math
 import os
 import re
+import sys
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -132,7 +133,13 @@ def discover_inventory(
             raise FileNotFoundError(f"NavAnywhere sources do not exist: {missing}")
 
     inventory: list[dict[str, Any]] = []
-    for source in source_entries:
+    progress = os.environ.get("NAVANYWHERE_RECIPE_PROGRESS", "0") == "1"
+    started = time.monotonic()
+    scanned_frames = 0
+    last_report = started
+    for source_number, source in enumerate(source_entries, 1):
+        if progress:
+            print(f"[recipe] source {source_number}/{len(source_entries)}: {source.name}; listing trajectories", file=sys.stderr, flush=True)
         trajectories = sorted(
             (
                 entry
@@ -141,8 +148,20 @@ def discover_inventory(
             ),
             key=lambda entry: entry.name,
         )
-        for trajectory in trajectories:
+        if progress:
+            print(f"[recipe] {source.name}: 0/{len(trajectories)} trajectories", file=sys.stderr, flush=True)
+        for trajectory_number, trajectory in enumerate(trajectories, 1):
             frames = scan_trajectory_frames(trajectory.path)
+            scanned_frames += len(frames)
+            now = time.monotonic()
+            if progress and (now - last_report >= 30 or trajectory_number == len(trajectories)):
+                print(
+                    f"[recipe] source {source_number}/{len(source_entries)} {source.name}: "
+                    f"{trajectory_number}/{len(trajectories)} trajectories; "
+                    f"total_frames={scanned_frames}; elapsed={now - started:.0f}s",
+                    file=sys.stderr, flush=True,
+                )
+                last_report = now
             observation_count = max(0, len(frames) - int(context_size) + 1)
             if observation_count == 0:
                 continue
