@@ -1324,17 +1324,36 @@ def _prepare_loader(
 ):
     stage = str(config.training_stage)
     if stage == "proxy_pretrain":
-        from data_utils import (
-            prepare_proxy_pretrain_dataset,
-            prepare_proxy_pretrain_validation_dataset,
+        selected = set(
+            map(
+                str,
+                config.get("dataset_selection", {}).get(
+                    "pretrain", ["navanywhere"]
+                ),
+            )
         )
+        if selected == {"navanywhere"}:
+            from data_utils import (
+                prepare_proxy_pretrain_dataset,
+                prepare_proxy_pretrain_validation_dataset,
+            )
 
-        dataset = prepare_proxy_pretrain_dataset(config)
-        eval_dataset = (
-            prepare_proxy_pretrain_validation_dataset(config)
-            if include_eval
-            else None
-        )
+            dataset = prepare_proxy_pretrain_dataset(config)
+            eval_dataset = (
+                prepare_proxy_pretrain_validation_dataset(config)
+                if include_eval
+                else None
+            )
+        else:
+            # Local LAM ablations precompute latent actions for the complete
+            # four-dataset NWM-real split. Reuse the shared TrainingDataset
+            # path so Stage 1 consumes those exact trajectory shards while
+            # retaining the normal pixel-backed test loader for evaluation.
+            dataset, eval_dataset = prepare_datasets(
+                config,
+                finetune_substage=None,
+                include_test=bool(include_eval),
+            )
     else:
         dataset, eval_dataset = prepare_datasets(
             config,
@@ -1438,9 +1457,20 @@ def run_two_stage_training(config, device, rank, local_gpu, experiment_dir, log=
     eval_at_first_step = bool(config.get("eval_at_first_step", True))
     log_cuda_memory = bool(config.get("log_cuda_memory", False))
     eval_offload_models = bool(config.get("eval_offload_models", False))
+    proxy_pretrain_datasets = set(
+        map(
+            str,
+            config.get("dataset_selection", {}).get(
+                "pretrain", ["navanywhere"]
+            ),
+        )
+    )
     proxy_validation_enabled = bool(
         training_stage == "proxy_pretrain"
-        and config.dataset.get("validation", {}).get("enabled", False)
+        and (
+            proxy_pretrain_datasets != {"navanywhere"}
+            or config.dataset.get("validation", {}).get("enabled", False)
+        )
     )
     eval_enabled = bool(
         (training_stage == "real_finetune" or proxy_validation_enabled)

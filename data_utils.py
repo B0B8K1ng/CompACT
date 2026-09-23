@@ -142,6 +142,70 @@ def _validate_descriptor_fingerprint(descriptor: dict, field: str) -> None:
     )
 
 
+def _validate_runtime_latent_software(
+    metadata: dict,
+    *,
+    allow_software_mismatch: bool = False,
+) -> None:
+    """Validate the reader stack used for an immutable posterior cache."""
+    software = metadata["software"]
+    expected_software = {
+        "python": sys.version.split()[0],
+        "torch": torch.__version__,
+        "torchvision": torchvision.__version__,
+        "diffusers": diffusers.__version__,
+        "pillow": pillow_version,
+        "cuda_runtime": torch.version.cuda,
+        "cudnn": torch.backends.cudnn.version(),
+    }
+    mismatches = {
+        key: (software.get(key), expected_value)
+        for key, expected_value in expected_software.items()
+        if software.get(key) != expected_value
+    }
+    if not mismatches:
+        return
+    if not allow_software_mismatch:
+        key = next(iter(mismatches))
+        actual_value, expected_value = mismatches[key]
+        _require_equal(actual_value, expected_value, f"software.{key}")
+
+    # The cache contains immutable posterior mean/logvar tensors rather than
+    # executable artifacts. Its recorded descriptor fingerprint is still
+    # checked before this opt-in, as are the VAE, transform, tensor metadata,
+    # manifests, and file hashes below.
+    logger.warning(
+        "Opt-in cross-software cached-posterior training: extraction/runtime "
+        "mismatches=%s",
+        mismatches,
+    )
+
+
+def _validate_latent_source_root(
+    source_root: str,
+    recorded_source_root: str,
+    *,
+    dataset_name: str,
+    allow_data_root_relocation: bool = False,
+) -> None:
+    """Allow an explicitly opted-in relocation of the source-data tree."""
+    actual = os.path.realpath(source_root)
+    recorded = os.path.realpath(recorded_source_root)
+    if actual == recorded:
+        return
+    if not allow_data_root_relocation:
+        _require_equal(actual, recorded, f"datasets.{dataset_name}.data_folder")
+    # Split hashes, trajectory membership, cache manifests, and every cached
+    # tensor's size/metadata are still checked by the caller. Only the absolute
+    # mount point recorded when the cache was built is allowed to change.
+    logger.warning(
+        "Opt-in precomputed-latent source relocation for %s: recorded=%s, runtime=%s",
+        dataset_name,
+        recorded,
+        actual,
+    )
+
+
 def _validate_precomputed_latent_cache_local(config: DictConfig) -> dict:
     """Strictly validate a completed cache before any DataLoader is created."""
     latent_config = config.dataset.precomputed_latents
@@ -260,17 +324,12 @@ def _validate_precomputed_latent_cache_local(config: DictConfig) -> dict:
     )
 
     _validate_descriptor_fingerprint(software, "software")
-    expected_software = {
-        "python": sys.version.split()[0],
-        "torch": torch.__version__,
-        "torchvision": torchvision.__version__,
-        "diffusers": diffusers.__version__,
-        "pillow": pillow_version,
-        "cuda_runtime": torch.version.cuda,
-        "cudnn": torch.backends.cudnn.version(),
-    }
-    for key, expected_value in expected_software.items():
-        _require_equal(software.get(key), expected_value, f"software.{key}")
+    _validate_runtime_latent_software(
+        metadata,
+        allow_software_mismatch=bool(
+            latent_config.get("allow_training_software_mismatch", False)
+        ),
+    )
 
     hardware_core = {
         "gpu_name": hardware.get("gpu_name"),
@@ -575,10 +634,13 @@ def _validate_precomputed_latent_cache_local(config: DictConfig) -> dict:
         if not os.path.isabs(source_root):
             source_root = os.path.join(_original_cwd(), source_root)
         source_root = os.path.realpath(source_root)
-        _require_equal(
+        _validate_latent_source_root(
             source_root,
-            os.path.realpath(str(dataset_metadata.get("data_folder"))),
-            f"datasets.{dataset_name}.data_folder",
+            str(dataset_metadata.get("data_folder")),
+            dataset_name=dataset_name,
+            allow_data_root_relocation=bool(
+                latent_config.get("allow_training_data_root_relocation", False)
+            ),
         )
         missing_source = []
         missing_cache = []

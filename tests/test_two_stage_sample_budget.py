@@ -10,7 +10,12 @@ from unittest import mock
 import torch
 from omegaconf import OmegaConf
 
-from data_utils import ReferenceBatchSampler, _validate_runtime_latent_hardware
+from data_utils import (
+    ReferenceBatchSampler,
+    _validate_latent_source_root,
+    _validate_runtime_latent_hardware,
+    _validate_runtime_latent_software,
+)
 from motion_condition import flatten_motion_groups, motion_condition_collate
 from two_stage_checkpoint import (
     build_data_resume_fingerprint,
@@ -158,6 +163,48 @@ def test_cross_hardware_cached_posterior_is_explicit_opt_in() -> None:
         )
 
 
+def test_cross_software_cached_posterior_is_explicit_opt_in() -> None:
+    metadata = {
+        "software": {
+            "python": "incompatible",
+            "torch": "incompatible",
+            "torchvision": "incompatible",
+            "diffusers": "incompatible",
+            "pillow": "incompatible",
+            "cuda_runtime": "incompatible",
+            "cudnn": -1,
+        }
+    }
+    try:
+        _validate_runtime_latent_software(metadata)
+    except ValueError as error:
+        assert "software.python" in str(error)
+    else:
+        raise AssertionError("Software mismatch must remain strict by default")
+    _validate_runtime_latent_software(
+        metadata, allow_software_mismatch=True
+    )
+
+
+def test_cached_posterior_source_relocation_is_explicit_opt_in() -> None:
+    try:
+        _validate_latent_source_root(
+            "/local/data/recon",
+            "/nas/data/recon",
+            dataset_name="recon",
+        )
+    except ValueError as error:
+        assert "datasets.recon.data_folder" in str(error)
+    else:
+        raise AssertionError("Source relocation must remain strict by default")
+    _validate_latent_source_root(
+        "/local/data/recon",
+        "/nas/data/recon",
+        dataset_name="recon",
+        allow_data_root_relocation=True,
+    )
+
+
 def test_phase_targets_and_runtime_checkpoint_counter_are_opt_in() -> None:
     config = OmegaConf.create(
         {
@@ -220,6 +267,8 @@ def test_nav1_80gb_launcher_syntax_and_contract_dry_run() -> None:
     assert "nav15" not in output.lower()
     assert "model/generator=cdit_b" in output
     assert "training.batch_size=96" in output
+    assert "training.eval_batch_size=16" in output
+    assert "eval_offload_models=true" in output
     assert "+training.reference_batch_size=16" in output
     assert "+training.target_samples_per_rank=3200000" in output
     assert "finetune.warmup_steps=1667" in output
@@ -229,5 +278,13 @@ def test_nav1_80gb_launcher_syntax_and_contract_dry_run() -> None:
     assert output.count(
         "+dataset.precomputed_latents.allow_training_hardware_mismatch=true"
     ) == 2
+    assert (
+        "+dataset.precomputed_latents.allow_training_software_mismatch=false"
+        in output
+    )
+    assert (
+        "+dataset.precomputed_latents.allow_training_data_root_relocation=false"
+        in output
+    )
     assert "stage2 latent_reset" in output
     assert "codex-exp" not in output
