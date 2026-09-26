@@ -1,0 +1,4 @@
+method,parameters_m,id_mean_lpips,id_mean_dreamsim,id_mean_psnr,recon_ate,scand_ate,office_go2_ate
+NWM,279,0.405,0.230,13.811,1.13,1.01,3.03
+RAE-NWM,867,0.442,0.254,13.957,1.36,1.14,3.01
+OpenNWM,280,0.368,0.196,14.299,1.12,0.98,2.89

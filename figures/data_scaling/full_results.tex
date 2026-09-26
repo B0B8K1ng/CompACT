@@ -1,0 +1,54 @@
+\begin{table*}[t]
+\centering
+\caption{Complete data-scaling results for direct 4\,s prediction. Six checkpoints are evaluated on identical windows within each dataset (500 each, except HuRoN: 329). Mean rows give equal-weight means across datasets; mean FID is not pooled FID. All entries are single-checkpoint, single-evaluation-seed estimates.}
+\label{tab:data_scaling_complete}
+\scriptsize
+\setlength{\tabcolsep}{7pt}
+\begin{tabular}{llrrrr}
+\toprule
+Dataset & Setting & LPIPS $\downarrow$ & DreamSim $\downarrow$ & PSNR $\uparrow$ & FID $\downarrow$ \\
+\midrule
+RECON & U25L100 & 0.43845 & 0.20059 & 13.189 & 33.833 \\
+RECON & U50L100 & 0.43322 & 0.19686 & 13.355 & 34.805 \\
+RECON & U75L100 & 0.43257 & 0.19078 & 13.382 & 32.152 \\
+RECON & U100L100 & 0.42702 & 0.18840 & 13.463 & 31.927 \\
+RECON & U25L0 & 0.43322 & 0.19333 & 13.281 & 32.067 \\
+RECON & U25L50 & 0.44405 & 0.19705 & 13.088 & 32.179 \\
+\midrule
+SCAND & U25L100 & 0.44844 & 0.32888 & 11.883 & 57.102 \\
+SCAND & U50L100 & 0.46406 & 0.34612 & 11.561 & 64.868 \\
+SCAND & U75L100 & 0.44897 & 0.32705 & 11.920 & 59.231 \\
+SCAND & U100L100 & 0.43932 & 0.31707 & 12.110 & 57.664 \\
+SCAND & U25L0 & 0.44836 & 0.32672 & 11.789 & 59.576 \\
+SCAND & U25L50 & 0.45987 & 0.33426 & 11.538 & 58.879 \\
+\midrule
+TartanDrive & U25L100 & 0.46685 & 0.25239 & 12.735 & 30.149 \\
+TartanDrive & U50L100 & 0.47380 & 0.25917 & 12.599 & 33.010 \\
+TartanDrive & U75L100 & 0.46394 & 0.25241 & 12.852 & 30.848 \\
+TartanDrive & U100L100 & 0.46154 & 0.24360 & 12.893 & 30.028 \\
+TartanDrive & U25L0 & 0.46711 & 0.25540 & 12.718 & 31.367 \\
+TartanDrive & U25L50 & 0.47864 & 0.25279 & 12.316 & 29.997 \\
+\midrule
+HuRoN & U25L100 & 0.40354 & 0.22831 & 13.278 & 59.978 \\
+HuRoN & U50L100 & 0.42143 & 0.24675 & 13.096 & 65.498 \\
+HuRoN & U75L100 & 0.39877 & 0.22305 & 13.475 & 56.464 \\
+HuRoN & U100L100 & 0.41555 & 0.24437 & 13.137 & 61.065 \\
+HuRoN & U25L0 & 0.40853 & 0.23423 & 13.364 & 60.334 \\
+HuRoN & U25L50 & 0.40253 & 0.22978 & 13.453 & 59.814 \\
+\midrule
+Go Stanford & U25L100 & 0.65678 & 0.46756 & 11.195 & 99.675 \\
+Go Stanford & U50L100 & 0.66193 & 0.48438 & 10.963 & 113.875 \\
+Go Stanford & U75L100 & 0.64673 & 0.45959 & 11.451 & 99.157 \\
+Go Stanford & U100L100 & 0.64555 & 0.45549 & 11.414 & 101.420 \\
+Go Stanford & U25L0 & 0.65142 & 0.47076 & 11.377 & 103.562 \\
+Go Stanford & U25L50 & 0.64852 & 0.46266 & 11.291 & 101.687 \\
+\midrule
+Mean & U25L100 & 0.48281 & 0.29555 & 12.456 & 56.147 \\
+Mean & U50L100 & 0.49089 & 0.30666 & 12.315 & 62.411 \\
+Mean & U75L100 & 0.47820 & 0.29058 & 12.616 & 55.570 \\
+Mean & U100L100 & 0.47779 & 0.28979 & 12.603 & 56.421 \\
+Mean & U25L0 & 0.48173 & 0.29609 & 12.506 & 57.381 \\
+Mean & U25L50 & 0.48672 & 0.29531 & 12.337 & 56.511 \\
+\bottomrule
+\end{tabular}
+\end{table*}

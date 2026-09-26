@@ -1,0 +1,262 @@
+% Revised against the implemented OpenNWM-finalLAM-100k and navigation-LAM
+% checkpoints on 2026-09-23.  The two figures in the supplied draft are
+% intentionally omitted because their image contents were not available for
+% verification; do not restore their placeholder captions.
+
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Experimental Setup}
+
+\paragraph{Datasets.}
+The world-model batches in OpenNWM's two NWM training stages draw from
+disjoint source sets.  Stage~1 uses the 13-source \textsc{NavAnywhere}
+action-free video corpus.  Stage~2 uses the training splits of RECON, HuRoN
+(stored under the historical \texttt{sacson} key in our implementation),
+SCAND, and TartanDrive.  Go Stanford is excluded from both stages and is used
+only to evaluate transfer to an unseen environment.  We retain signed temporal
+offsets and do not discard an example merely because its target precedes its
+observation.  The standalone LAM benchmark described below uses a different
+model and data protocol; we state it separately to avoid conflating LAM
+reconstruction with OpenNWM training.
+
+\paragraph{Main-comparison scope and provenance.}
+Table~\ref{tab:main_prediction_navigation} contains three distinct comparisons.
+Autoregressive visual prediction is evaluated on RECON, direct visual
+prediction is evaluated on SACSoN, and navigation is evaluated on RECON.
+Visual results are reported at 4 and 16\,s.  These dataset--horizon pairs
+define the intended comparison layout, not an already frozen local OpenNWM
+protocol.  We compare methods only within an evaluation block: in particular,
+the direct and autoregressive rows use different datasets and do not support a
+cross-block ranking.  Baseline values in this table are taken from their cited
+publications and retain the original training and evaluation protocols; they
+are reference points rather than a fully unified re-evaluation.  The published
+NWM navigation result, for example, uses a CEM population of 120, whereas our
+local planning protocol uses 80 candidates.  Unless stated otherwise, the
+OpenNWM row uses the final checkpoint defined in the implementation paragraph
+below.
+
+Our canonical local direct-prediction benchmark currently contains 500 fixed
+RECON windows at 4\,s and is used for the controlled ablations below.  It does
+not provide the SACSoN 4- and 16-s measurements required by the direct block
+of Table~\ref{tab:main_prediction_navigation}; those cells remain unreported
+until a separate SACSoN protocol is frozen and evaluated.  Autoregressive
+rollout uses 150 fixed RECON windows, four context frames, evaluation at 1 and
+4\,FPS and at horizons of 1, 2, 4, 8, and 16\,s, and prediction seed 0.
+OpenNWM uses 250-step DDPM sampling.  Planning uses 100 fixed cases per
+dataset, CEM with a population of 80 and five elites, three stochastic
+repetitions, one optimization update, and an eight-step horizon at 0.25\,s per
+step.  The planning seed is 42 and the cost is LPIPS-Alex.  Consequently, our
+reported values are fixed-seed, single-checkpoint point estimates, not means
+and standard deviations over five generated rollouts or multiple independently
+trained models.
+
+\paragraph{Controlled NWM-ablation protocol.}
+The controlled NWM ablations intentionally use a different training recipe
+from the main OpenNWM checkpoint.  TimePT, GeoPT, and LatentPT use the same
+CDiT-B/2 backbone and downstream splits and, unless explicitly stated, the
+earlier schedule of a 10k-step real-action-adapter warm-up followed by 100k
+steps of joint fine-tuning.  Direct prediction is measured on RECON at 4\,s,
+rollout is measured on RECON at 1 and 4\,FPS, and OOD direct prediction is
+measured on Go Stanford at 4\,s.  The full internal planning benchmark uses
+the CEM80 protocol above on RECON and SCAND.  These ablations support
+within-table comparisons only; their absolute values should not be compared
+to the main-model row, which uses the final 60k-stage-1/3k-warm-up/100k-joint
+recipe.
+
+\paragraph{Metrics.}
+We use LPIPS-Alex~\citep{zhang2018unreasonable},
+DreamSim~\citep{fu2023dreamsim}, and PSNR for locally run visual-prediction
+experiments.  The main table additionally retains published FID
+values~\citep{heusel2017gans} where supplied by prior work; our current local
+benchmark does not compute FID, and we make no FVD claim.  In our local
+OpenNWM evaluation, ATE and RPE~\citep{sturm2012benchmark} are translation
+RMSEs in waypoint-normalized units, computed without trajectory alignment or
+scale correction; RPE uses adjacent poses ($\Delta=1$).  They are evaluated on
+the waypoint trajectories selected through model-predicted observations, not
+on outputs of a separately trained trajectory-regression head.  The published
+navigation baselines retain the metric definitions and protocols of their
+source papers.  The LAM reconstruction benchmark uses PSNR and LPIPS as its
+primary metrics.
+
+\paragraph{Baselines.}
+The autoregressive block compares with NWM and AR Forcing, the direct block
+with NWM and RAE-NWM, and the navigation block with GNM, NoMaD, NWM, and LAM.
+DIAMOND is not part of the reported main table.  The standalone LAM benchmark
+separately evaluates the released DreamDojo LAM~\citep{gao2026dreamdojo},
+villa-X~\citep{chen2025villa0x0}, DiLA~\citep{zhang2026dila},
+Olaf-World~\citep{jiang2026olaf}, and the MoTo tokenizer released with
+LARA~\citep{liu2026lara,chen2024moto}.  We use ``public DreamDojo LAM'' for
+that baseline to distinguish it from our navigation LAM implementation in the
+DreamDojo codebase.
+
+\paragraph{OpenNWM implementation.}
+We instantiate OpenNWM with a CDiT-B/2 diffusion transformer (approximately
+197M parameters), rather than CDiT-XL, and encode $224\times224$ images with
+the frozen \texttt{stabilityai/sd-vae-ft-ema} tokenizer.  Each observation has
+four context frames and four sampled target frames.  Stage~1 conditions the
+world model on layer-normalized, 32-dimensional proxies precomputed by our
+60k-step Pixel+Action navigation LAM.  We sample signed frame offsets in
+$[-64,64]$ and condition every sample on relative time.  When
+$|\Delta t|\leq 8$, the valid pair additionally receives its exact LAM proxy;
+larger-offset samples have no proxy but still contribute to the diffusion
+objective.  No LAM is executed online during NWM training.
+
+We train Stage~1 for 60k steps with AdamW, learning rate
+$2\times10^{-4}$, $(\beta_1,\beta_2)=(0.9,0.999)$, weight decay $0.01$, and
+gradient clipping at 2.0.  Stage~2 replaces the latent adapter with a newly
+initialized three-dimensional real-motion adapter for
+$(\Delta x,\Delta y,\Delta\psi)$.
+We train only this adapter for 3k steps and then jointly fine-tune it with the
+world-model backbone for 100k steps; both use learning rate $10^{-4}$ and
+AdamW with weight decay $0.01$.  Both stages use BF16 on eight NVIDIA L20 GPUs
+with 48 examples per GPU, giving a global batch of 384 examples (1,536
+context--target pairs per update).  We use the resulting 100k-step joint
+checkpoint as the final OpenNWM model throughout; its internal experiment name
+is \emph{OpenNWM-finalLAM-100k}.
+
+For physical grounding, every target pose is expressed relative to the latest
+context frame.  We divide planar translation by the dataset-specific waypoint
+spacing---0.25 for RECON, 0.255 for HuRoN, 0.38 for SCAND, and 0.72 for
+TartanDrive, all in meters per waypoint---and apply fixed min--max
+normalization with
+$x\in[-2.5,5]$, $y\in[-4,4]$, and
+$\Delta\psi\in[-\pi,\pi]$.  Go Stanford uses 0.12 meters per waypoint at
+evaluation time.  Thus, the implementation does not normalize translations by
+an empirically estimated average step length.
+
+\paragraph{Standalone Pixel-LAM implementation.}
+The LAM reconstruction results use a Pixel-LAM trained independently of the
+Pixel+Action LAM that supplies OpenNWM's offline proxies.  It processes
+$240\times320$ RGB frames with $16\times16$ patches and represents a frame
+transition with a 32-dimensional variational latent.  The architecture has a
+24-block spatiotemporal encoder and a 24-block spatial decoder, both of width
+1024 with 16 attention heads, for approximately 709M parameters.  Its loss is
+\begin{equation}
+    \mathcal{L}_{\mathrm{Pixel}}
+    = \mathcal{L}_{\mathrm{RGB}}
+    + 10^{-6}\mathcal{L}_{\mathrm{KL}},
+\end{equation}
+where $\mathcal{L}_{\mathrm{RGB}}$ is pixel-space mean squared error.
+
+We train this model on 13 action-free sources together with RGB frames from
+the RECON, HuRoN, and SCAND training splits; it does not use their
+action annotations.  Training uses uniformly sampled signed offsets in
+$[-8,8]$, AdamW with learning rate $2.5\times10^{-5}$ and weight decay 0.01,
+a 12.8k-step linear warm-up followed by cosine decay to 0.1 of the peak rate,
+and BF16 mixed precision.  We train for 100k optimizer steps on eight GPUs
+with 20 examples per GPU (global batch 160).  This checkpoint is used only for
+the public LAM reconstruction comparison and is distinct from the Pixel+Action
+proxy used by OpenNWM.
+
+\paragraph{Public LAM benchmark protocol.}
+For each public baseline, we use its released checkpoint, native preprocessing,
+and native RGB decoder.  We evaluate these baselines and our Pixel-LAM on
+exactly the same record IDs, and compute all metrics through the same pipeline
+on RGB in $[0,1]$ at $240\times320$ resolution.  The navigation-domain
+aggregate contains the held-out RECON, HuRoN, and SCAND splits.  Go Stanford
+is the transfer split and is unseen by our Pixel-LAM.
+Because the full training exposure of every released checkpoint is not known,
+we do not claim that these labels define universal ID and OOD splits for all
+baselines.  For each dataset, we sample 100 valid pairs at each signed offset in
+$\{-8,-6,-4,-2,2,4,6,8\}$, giving 2,400 navigation-domain pairs and 800 Go
+Stanford pairs.
+Offset zero is excluded.  Since several public LAMs do not release compatible
+navigation-action decoders, this comparison is restricted to RGB
+reconstruction.
+
+\subsection{Comparison Results}
+
+\input{tables/main_results_revised}
+
+\paragraph{Visual prediction.}
+Table~\ref{tab:main_prediction_navigation}(a) summarizes autoregressive and
+direct prediction at the reported horizons.  The former evaluates rollout
+under feedback of generated observations, whereas the latter predicts a
+distant target without recursively consuming model outputs.  Because the two
+blocks use different datasets and the baseline rows are published references,
+we interpret each block independently and do not infer that one prediction
+mode is generally stronger than the other.  We make no quantitative ranking
+claim because OpenNWM measurements under the table-specific protocols are not
+yet available.
+
+\paragraph{Navigation planning.}
+Table~\ref{tab:main_prediction_navigation}(b) reports ATE and RPE.  For
+OpenNWM, this experiment tests whether generated observations provide a
+geometrically useful CEM planning signal.  The cited policy and world-model
+rows retain their published settings, including the CEM120/CEM80 difference
+noted above where applicable, and are contextual references unless an
+explicitly matched result is provided.
+
+\input{tables/lam_public_comparison}
+
+\paragraph{Visual reconstruction and generalization.}
+Table~\ref{tab:lam_reconstruction} shows that our standalone Pixel-LAM obtains
+the best PSNR and LPIPS among the evaluated models on both splits.  On the
+navigation-domain aggregate, it achieves 21.071\,dB PSNR and 0.505 LPIPS: a
+2.12\,dB gain over the public DreamDojo LAM and a 2.2\% relative LPIPS
+reduction compared with the strongest public LPIPS baseline, villa-X.  On Go
+Stanford, which is unseen by our model, it achieves 21.912\,dB and 0.472,
+improving over the public DreamDojo LAM by 1.199\,dB and reducing LPIPS by
+2.7\%.  The reconstruction advantage therefore persists on our held-out
+transfer domain.
+
+\subsection{Ablation Studies}
+
+\input{tables/nwm_pretraining_ablation_available}
+
+\paragraph{Pretraining and proxy conditioning.}
+Table~\ref{tab:pretraining_ablation_available} reports only the currently
+complete prediction rows under the earlier controlled protocol.  Relative to
+the aligned model trained without pretraining, action-free time-only
+pretraining improves all three metrics for single-step RECON prediction,
+1-FPS RECON rollout, and Go Stanford direct prediction, but not for the 4-FPS
+rollout.  Geometry conditioning does not consistently dominate time-only
+conditioning.  The original-setup NWM row is included only as a reference and
+is not a controlled comparison with the aligned rows.  Because the LatentPT
+row is not yet populated, these results do not establish an advantage for
+latent-action conditioning.
+
+\paragraph{LAM training-recipe comparison.}
+We study Pixel, Pixel+Action, Action-only, and DINO-feature reconstruction
+recipes.  Pixel minimizes RGB reconstruction error, Action-only decodes a
+three-dimensional relative-motion target, and DINO reconstructs frozen DINOv3
+ViT-L/16 patch features.  Pixel+Action uses
+\begin{equation}
+    \mathcal{L}_{\mathrm{P+A}}
+    = \mathcal{L}_{\mathrm{RGB}}
+    + \lambda_{\mathrm{act}}\mathcal{L}_{\mathrm{act}}
+    + 10^{-6}\mathcal{L}_{\mathrm{KL}},
+\end{equation}
+where the action term is masked on unlabeled examples.  Its mixed batches
+contain 75\% action-free video and 25\% labeled navigation video, and
+$\lambda_{\mathrm{act}}\approx0.172$ is calibrated once from the relative
+initial magnitudes of the pixel and action losses.  The available checkpoints
+do not form a strictly data-controlled objective ablation: Pixel and
+Pixel+Action use the action-free sources together with the three physical
+navigation datasets, whereas the audited Action-only and DINO checkpoints use
+only the three physical datasets.  We therefore treat this as a comparison of
+complete training recipes and do not attribute any difference solely to the
+supervision objective.
+
+\paragraph{Action-free data scale and label availability.}
+Separately from the 100k-step Pixel-LAM benchmark and the 13-source OpenNWM
+Stage-1 recipe, we conduct a controlled Pixel+Action data ablation on an
+expanded 15-source action-free pool.  We vary the retained fraction of
+trajectories as
+$U\in\{25,50,75,100\}\%$ with all physical-action labels visible, and compare
+$L\in\{0,50,100\}\%$ label availability at fixed $U=25\%$.  The $U$ subsets
+are nested and split by trajectory after removing a shared held-out set.  The
+$L$ setting changes only the action mask: RGB frames from RECON, HuRoN,
+and SCAND continue to contribute to pixel reconstruction at every value of
+$L$.
+
+All six models use eight GPUs, 48 examples per GPU (global batch 384), 62.5k
+optimizer steps, and therefore 24.0M sample presentations.  We use AdamW with
+learning rate $4\times10^{-5}$, an 8k-step warm-up, and cosine decay to 0.1 of
+the peak rate.  Checkpoints are evaluated every 10k steps and at 62.5k on
+held-out trajectories from all 15 action-free sources, Go Stanford, and
+TartanDrive.  Each dataset contributes 20 windows at offsets
+$\{-8,-6,-4,-2,0,2,4,6,8\}$; the primary PSNR, SSIM, and LPIPS aggregates
+exclude offset zero.  We defer empirical claims from this study until all six
+runs have complete results.

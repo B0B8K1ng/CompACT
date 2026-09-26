@@ -1,0 +1,75 @@
+\begin{table*}[t]
+  \centering
+  \caption{\textbf{Main visual-prediction and navigation comparison.}
+  Autoregressive prediction is evaluated on RECON, direct prediction on
+  SACSoN, and navigation on RECON.  Baseline numbers are published references
+  and are not all protocol-matched; see the text for the CEM settings.
+  A dash marks a value unavailable in the audited results and does not support
+  a ranking claim.  Lower is better for every reported metric.}
+  \label{tab:main_prediction_navigation}
+  \small
+  \setlength{\tabcolsep}{6pt}
+  \renewcommand{\arraystretch}{1.10}
+  \begin{tabular}{@{}lcccccc@{}}
+    \toprule
+    \multicolumn{7}{@{}l}{\textbf{(a) Visual prediction}} \\
+    \addlinespace[4pt]
+    \multirow{2}{*}{Method}
+      & \multicolumn{3}{c}{4\,s}
+      & \multicolumn{3}{c}{16\,s} \\
+    \cmidrule(lr){2-4}\cmidrule(lr){5-7}
+      & LPIPS$\downarrow$ & DreamSim$\downarrow$ & FID$\downarrow$
+      & LPIPS$\downarrow$ & DreamSim$\downarrow$ & FID$\downarrow$ \\
+    \midrule
+
+    \multicolumn{7}{@{}l}{\textit{Autoregressive on RECON}} \\
+    \addlinespace[2pt]
+    NWM~\cite{yang2026arforcing}
+      & 0.423 & 0.181 & 63.0
+      & 0.533 & 0.319 & 77.3 \\
+    AR Forcing~\cite{yang2026arforcing}
+      & 0.341 & 0.125 & 52.9
+      & 0.463 & 0.210 & 66.0 \\
+    \textbf{OpenNWM (Ours)}
+      & -- & -- & --
+      & -- & -- & -- \\
+
+    \addlinespace[6pt]
+    \multicolumn{7}{@{}l}{\textit{Direct on SACSoN}} \\
+    \addlinespace[2pt]
+    NWM~\cite{zhang2026raenwm}
+      & 0.407 & 0.229 & 26.15
+      & 0.470 & 0.281 & 33.06 \\
+    RAE-NWM~\cite{zhang2026raenwm}
+      & 0.303 & 0.145 & 15.09
+      & 0.349 & 0.171 & 15.90 \\
+    \textbf{OpenNWM (Ours)}
+      & -- & -- & --
+      & -- & -- & -- \\
+
+    \midrule
+    \multicolumn{7}{@{}l}{\textbf{(b) Navigation on RECON}} \\
+    \addlinespace[4pt]
+    Method
+      & \multicolumn{3}{c}{ATE $\downarrow$}
+      & \multicolumn{3}{c}{RPE $\downarrow$} \\
+    \midrule
+    GNM~\cite{bar2025navigation}
+      & \multicolumn{3}{c}{$1.87{\pm}0.00$}
+      & \multicolumn{3}{c}{$0.73{\pm}0.00$} \\
+    NoMaD~\cite{bar2025navigation}
+      & \multicolumn{3}{c}{$1.93{\pm}0.04$}
+      & \multicolumn{3}{c}{$0.52{\pm}0.00$} \\
+    NWM (published; CEM120)~\cite{bar2025navigation}
+      & \multicolumn{3}{c}{$1.13{\pm}0.02$}
+      & \multicolumn{3}{c}{$0.35{\pm}0.01$} \\
+    LAM~\cite{garrido2026latentaction}
+      & \multicolumn{3}{c}{1.40}
+      & \multicolumn{3}{c}{0.40} \\
+    \addlinespace[4pt]
+    \textbf{OpenNWM (Ours; CEM80)}
+      & \multicolumn{3}{c}{--}
+      & \multicolumn{3}{c}{--} \\
+    \bottomrule
+  \end{tabular}
+\end{table*}

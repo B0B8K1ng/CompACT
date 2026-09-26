@@ -386,6 +386,11 @@ class BaseDataset(Dataset):
         traj_path = os.path.join(self.data_folder, trajectory_name, "traj_data.pkl")
         with open(traj_path, "rb") as f:
             traj_data = pickle.load(f)
+        if self.dataset_name == "tum_rgbd":
+            from scripts.prepare_tum_camera_heading import heading_from_metadata
+            traj_data["yaw"] = heading_from_metadata(
+                os.path.join(self.data_folder, trajectory_name, "frame_metadata.jsonl")
+            ).copy()
         for k, v in traj_data.items():
             traj_data[k] = v.astype("float", copy=False)
         return traj_data

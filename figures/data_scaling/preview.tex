@@ -1,0 +1,14 @@
+% Compile from the repository root with:
+% pdflatex -output-directory=figures/data_scaling figures/data_scaling/preview.tex
+% Run twice to resolve references. This is a preview, not the ICLR template.
+\documentclass[10pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\begin{document}
+\input{scaling_ablation}
+\clearpage
+\appendix
+\input{scaling_ablation_appendix}
+\end{document}

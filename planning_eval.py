@@ -6,6 +6,7 @@
 #
 import logging
 import json
+import pickle
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -182,6 +183,19 @@ def get_dataset_eval(config, dataset_name, predefined_index=True):
         predefined_index=predefined_index,
         traj_names=data_config.get("navigation_traj_names", "rollout_traj_names.txt"),
     )
+    if config.get("planning_preserve_source_indices", False):
+        requested = config.get("planning_sample_indices")
+        if not predefined_index or requested is None:
+            raise ValueError("Preserving source indices requires a predefined split and explicit sample indices")
+        with open(predefined_index, "rb") as handle:
+            original_index = pickle.load(handle)
+        valid_entries = {tuple(dataset.index_to_data[i]) for i in range(len(dataset))}
+        for index in requested:
+            if not 0 <= int(index) < len(original_index) or tuple(original_index[int(index)]) not in valid_entries:
+                raise ValueError(f"{dataset_name}: original navigation index {index} is unavailable")
+        # The explicit Subset below accesses only validated rows, retaining the
+        # original sample IDs for RNG keys, saved files, and odometry audits.
+        dataset.index_to_data = original_index
     expected_count = data_config.get("navigation_sample_count", None)
     if expected_count is not None and len(dataset) != int(expected_count):
         raise ValueError(f"{dataset_name}: expected {expected_count} navigation windows, loaded {len(dataset)}")
@@ -588,13 +602,14 @@ class WM_Planning_Evaluator:
         deltas = torch.cat((deltas, delta_yaw.to(deltas.device)), dim=-1)
         deltas[:, -1, -1] += mu[:, -1] * np.pi
 
-        if self.config.save_preds or self.config.plot:
+        save_navigation_rollout = self.config.get("save_navigation_rollout", False)
+        if self.config.save_preds or self.config.plot or save_navigation_rollout:
             # Re-run the rollout with the final actions (fitted using topk actions)
             preds, pred_codes = self.autoregressive_rollout_without_intermediate_decoding(
                 obs_image,
                 deltas,
                 self.config.rollout_stride,
-                only_final=True,
+                only_final=not save_navigation_rollout,
                 return_codes=True,
                 sample_keys=[
                     f"{dataset_name}/navigation/sample={int(value.item())}/final"
@@ -602,6 +617,17 @@ class WM_Planning_Evaluator:
                 ],
                 noise_stream=f"{dataset_name}/navigation/final",
             )
+            if save_navigation_rollout:
+                for row, value in enumerate(idxs.flatten()):
+                    rollout_dir = os.path.join(dataset_save_output_dir, "navigation_rollouts", f"{int(value.item()):06d}")
+                    os.makedirs(rollout_dir, exist_ok=True)
+                    np.savez_compressed(
+                        os.path.join(rollout_dir, "rollout.npz"),
+                        predicted_rgb=preds[row].detach().float().cpu().numpy(),
+                        context_rgb=self.unnormalize_fn(obs_image[row]).detach().float().cpu().numpy(),
+                        planner_deltas=deltas[row].detach().float().cpu().numpy(),
+                    )
+                pred_codes = pred_codes[:, -1]
             preds = preds[:, -1]  # take the last predicted image
 
             loss = self.compute_cost(
@@ -771,10 +797,21 @@ class WM_Planning_Evaluator:
                 )
                 x_pred_latents = x_pred_latents.unsqueeze(1)
 
-                batch_obs_latents = torch.cat(
-                    (batch_obs_latents, x_pred_latents), dim=1
-                )  # append current prediction
-                batch_obs_latents = batch_obs_latents[:, 1:]  # remove first observation
+                if self.config.get("planning_image_feedback", False):
+                    if i + 1 < batch_deltas.shape[1]:
+                        feedback_rgb = self.vae.decode(
+                            x_pred_latents[:, 0], denormalize=True
+                        ).clamp(0, 1)
+                        mean = feedback_rgb.new_tensor(self.config.dataset.mean).view(1, -1, 1, 1)
+                        std = feedback_rgb.new_tensor(self.config.dataset.std).view(1, -1, 1, 1)
+                        feedback_rgb = (feedback_rgb - mean) / std
+                        batch_obs = torch.cat((batch_obs[:, 1:], feedback_rgb.unsqueeze(1)), dim=1)
+                        batch_obs_latents = self.vae.encode(batch_obs.flatten(0, 1)).unflatten(0, (B, self.num_cond))
+                else:
+                    batch_obs_latents = torch.cat(
+                        (batch_obs_latents, x_pred_latents), dim=1
+                    )
+                    batch_obs_latents = batch_obs_latents[:, 1:]
                 preds_latents.append(x_pred_latents)
 
             preds_latents = torch.cat(preds_latents, 1)
@@ -803,6 +840,8 @@ class WM_Planning_Evaluator:
     def get_eval_name(self):
         # Get evaluation name for logging. Should overwrite for specific experiments
         self.eval_name = f"CEM_N{self.config.num_samples}_K{self.config.topk}_RS{self.config.rollout_stride}_rep{self.config.num_repeat_eval}_OPT{self.config.opt_steps}_COST-{self.config.cost_fn}-RECON-{self.config.compute_cost_with_recon}"
+        if self.config.get("planning_image_feedback", False):
+            self.eval_name += "_PIXEL-FEEDBACK"
 
         if override := OmegaConf.select(
             self.config, "model.diffusion.eval_timestep_respacing", default=None
@@ -870,7 +909,9 @@ class WM_Planning_Evaluator:
                 )
                 if self.config.get("resume_planning_samples", True) and os.path.exists(
                     sample_metric_path
-                ):
+                ) and (not self.config.get("save_navigation_rollout", False) or os.path.exists(
+                    os.path.join(eval_save_output_dir, "navigation_rollouts", f"{sample_id:06d}", "rollout.npz")
+                )):
                     with open(sample_metric_path, encoding="utf-8") as metric_file:
                         sample_metrics = json.load(metric_file)
                     for metric_name, metric_value in sample_metrics.items():
@@ -892,6 +933,14 @@ class WM_Planning_Evaluator:
                         self.config.trajectory_eval_len_traj_pred,
                     )
                 for i in range(len(obs_image)):
+                    if self.config.get("save_planned_trajectories", False):
+                        trajectory_dir = os.path.join(eval_save_output_dir, "trajectories")
+                        os.makedirs(trajectory_dir, exist_ok=True)
+                        with open(os.path.join(trajectory_dir, f"{sample_id:06d}.json"), "w") as handle:
+                            json.dump({"sample_id": sample_id,
+                                       "predicted_xy_waypoint_units": pred_actions[i, :, :2].float().cpu().tolist(),
+                                       "gt_xy_waypoint_units": gt_actions[i, :, :2].float().cpu().tolist(),
+                                       "goal_pose_waypoint_units": goal_pos[i].float().cpu().tolist()}, handle, indent=2)
                     pred_traj_i = self.actions_to_traj(pred_actions[i, :, :2])
                     gt_traj_i = self.actions_to_traj(gt_actions[i, :, :2])
 

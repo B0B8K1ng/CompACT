@@ -318,6 +318,15 @@ def quaternion_yaw_xyzw(quaternion: np.ndarray) -> np.ndarray:
     return np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
 
 
+def quaternion_camera_forward_yaw(quaternion: np.ndarray) -> np.ndarray:
+    """TUM optical +Z, rather than image-right +X, is navigation forward."""
+    x, y, z, w = normalize_quaternions(quaternion).T
+    forward_x, forward_y = 2 * (x * z + w * y), 2 * (y * z - w * x)
+    if np.any(np.hypot(forward_x, forward_y) < 1e-6):
+        raise ValueError("Vertical optical axis has no planar heading")
+    return np.arctan2(forward_y, forward_x)
+
+
 def jpeg_bytes(image: Image.Image, *, quality: int = 95) -> bytes:
     output = io.BytesIO()
     image.convert("RGB").save(
@@ -864,7 +873,7 @@ def prepare_tum_hf_sequence(
         groundtruth[:, 4:8],
         selected_times,
     )
-    yaw = quaternion_yaw_xyzw(quaternions)
+    yaw = quaternion_camera_forward_yaw(quaternions)
 
     requested: dict[int, tuple[str, Path]] = {}
     for source_index in selected.tolist():
@@ -996,7 +1005,7 @@ def prepare_tum_sequence(
         groundtruth[:, 4:8],
         selected_times,
     )
-    yaw = quaternion_yaw_xyzw(quaternions)
+    yaw = quaternion_camera_forward_yaw(quaternions)
     name = f"tum_freiburg1_{sequence}"
     trajectory = output / name
     trajectory.mkdir(parents=True, exist_ok=True)

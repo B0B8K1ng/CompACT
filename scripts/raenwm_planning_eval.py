@@ -304,8 +304,14 @@ class Planner:
                         x_cond=current[:, :CONTEXT_SIZE],
                         rel_t=relative_time,
                     )[-1]
-                current = torch.cat((current[:, 1:], prediction.unsqueeze(1)), dim=1)
-            outputs.append(current[:, -1])
+                if getattr(self.args, "image_feedback", False):
+                    if step + 1 < action_batch.shape[1]:
+                        feedback_rgb = self.decode(prediction, (224, 224))
+                        encoded_rgb = self.encode(feedback_rgb.mul(2).sub(1))
+                        current = torch.cat((current[:, 1:], encoded_rgb.unsqueeze(1)), dim=1)
+                else:
+                    current = torch.cat((current[:, 1:], prediction.unsqueeze(1)), dim=1)
+            outputs.append(prediction)
         return torch.cat(outputs, dim=0)
 
     def lpips_cost(self, predictions: torch.Tensor, goal: torch.Tensor) -> torch.Tensor:
@@ -385,6 +391,13 @@ class Planner:
         predicted_yaw = final_yaw_deltas.sum()
 
         gt = ground_truth_actions[0, :, :2]
+        if getattr(self.args, "save_planned_trajectories", False):
+            atomic_json(self.args.output_root / dataset_name / RESULT_STEM / "trajectories" / f"{sample_id:06d}.json", {
+                "sample_id": sample_id,
+                "predicted_xy_waypoint_units": predicted_actions.float().cpu().tolist(),
+                "gt_xy_waypoint_units": gt.float().cpu().tolist(),
+                "goal_pose_waypoint_units": goal_position[0].float().cpu().tolist(),
+            })
         ate, rpe_trans = trajectory_metrics(gt, predicted_actions)
         final_goal = goal_position[0, 0]
         pos_diff = torch.linalg.vector_norm(predicted_actions[-1].cpu() - final_goal[:2])
@@ -512,6 +525,7 @@ def write_manifest(args: argparse.Namespace, world_size: int) -> None:
             "horizon_steps": HORIZON_STEPS,
             "cost": "lpips_alex_on_rae_reconstruction",
             "trajectory_sampler": "line_constant_delta",
+            **({"feedback": "decoded_image_reencoded"} if getattr(args, "image_feedback", False) else {}),
             "seed": args.seed,
             "sampler": f"{args.sampling_method}_ode",
             "sampling_steps": args.num_steps,
@@ -577,6 +591,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--save-planned-trajectories", action="store_true")
+    parser.add_argument("--image-feedback", action="store_true")
     args = parser.parse_args()
     if (args.num_samples, args.topk, args.opt_steps, args.num_repeat_eval) != (80, 5, 1, 3):
         raise ValueError("The registered navigation protocol is fixed at CEM N80/K5/OPT1/rep3")
@@ -593,7 +609,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    global RESULT_STEM
     args = parse_args()
+    if args.image_feedback:
+        RESULT_STEM += "_PIXEL-FEEDBACK"
     for field in (
         "source",
         "checkpoint",

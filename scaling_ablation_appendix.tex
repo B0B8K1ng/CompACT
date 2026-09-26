@@ -1,0 +1,25 @@
+% Include after the main manuscript's \appendix command.
+\section{Unlabeled-Data Scaling: Evaluation Details}
+\label{app:data_scaling}
+
+We evaluate the four $U\in\{25,50,75,100\}\%$ settings at fixed
+$L=100\%$ on the same 500 RECON windows. The direct 4\,s prediction
+protocol uses four context frames, $224\times224$ images, ground-truth
+action conditioning, EMA weights, 250 DDPM sampling steps, and evaluation
+seed 0. DreamSim uses the pretrained ensemble and is averaged over the
+500 predictions. Table~\ref{tab:data_scaling_recon_u} lists all four
+point estimates.
+
+All four checkpoints use the same stored downstream architecture and
+fine-tuning hyperparameters: CDiT-B/2 with a reset real-action adapter,
+1,042 adapter warm-up steps, and 10,417 joint fine-tuning steps.
+The upstream $U$ and $L$ settings refer to latent-action learning and
+should not be confused with downstream action-label availability.
+Here, fixed $L$ denotes a fixed action-label availability percentage;
+it is not a claim of a separately verified fixed absolute annotation
+budget across the upstream data subsets.
+Because the comparison has no independent training-seed repetitions,
+the point estimates do not establish the statistical significance of
+the observed differences.
+
+\input{figures/data_scaling/recon_u_results}

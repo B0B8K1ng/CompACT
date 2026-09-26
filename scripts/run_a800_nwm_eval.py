@@ -23,6 +23,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections import Counter, deque
 from datetime import datetime, timezone
@@ -400,6 +401,30 @@ def migrate_huron_population_contract(run_dir, recorded, current):
     return current
 
 
+def migrate_rae_loader_contract(run_dir, recorded, current):
+    name = "scripts/raenwm_infer.py"
+    before = "d46634574c18a78579d0f281f16233b4e5d1e3853c8f59afbee2d509c5c1783e"
+    after = "aecd6992f1b6a479f791c790396e3ab261a72f27b55f858f3d5a344867ebbc78"
+    if recorded.get("entrypoint_sha256", {}).get(name) != before or current["entrypoint_sha256"][name] != after:
+        return recorded
+    expected = copy.deepcopy(recorded)
+    expected["entrypoint_sha256"][name] = after
+    if expected != current:
+        return recorded
+    if any((run_dir / "predictions" / "rae-nwm" / "huron").rglob("*.png")):
+        raise RuntimeError("RAE Huron has prior images with unverified sample numbering; refusing automatic migration")
+    backup = run_dir / "contract.pre_rae_loader_fix.json"
+    if backup.exists() and read_json(backup) != recorded:
+        raise RuntimeError("RAE contract backup differs")
+    atomic_json(backup, recorded)
+    atomic_json(run_dir / "contract_rae_loader_migration.json", {
+        "at": now(), "before": before, "after": after,
+        "reason": "Huron uses pinned filtered sample IDs; Git trusts only the explicit RAE source directory",
+        "backup": str(backup)})
+    atomic_json(run_dir / "contract.json", current)
+    return current
+
+
 def prediction_sources(model, dataset, evaluation, c):
     """Only audited paths with a matching pinned checkpoint and protocol qualify."""
     if dataset == "huron":
@@ -755,6 +780,29 @@ def command_for(job, run_dir, batch):
     return cmd
 
 
+def startup_step(label, function, *args):
+    """Show liveness while mandatory startup reads wait on shared storage."""
+    started = time.monotonic()
+    finished = threading.Event()
+    print(f"[{now()}] startup: {label}", flush=True)
+
+    def heartbeat():
+        while not finished.wait(15):
+            print(f"[{now()}] startup: still waiting: {label}; "
+                  f"elapsed={time.monotonic() - started:.0f}s", flush=True)
+
+    thread = threading.Thread(target=heartbeat, daemon=True)
+    thread.start()
+    try:
+        result = function(*args)
+    finally:
+        finished.set()
+        thread.join()
+    print(f"[{now()}] startup: completed: {label}; "
+          f"elapsed={time.monotonic() - started:.1f}s", flush=True)
+    return result
+
+
 def preflight(gpus):
     if len(gpus) != 8 or len(set(gpus)) != 8:
         raise RuntimeError("Exactly eight distinct GPU IDs are required")
@@ -772,6 +820,7 @@ def preflight(gpus):
                                text=True, capture_output=True, check=True).stdout.strip()
     if processes and "No running processes found" not in processes:
         raise RuntimeError(f"GPU compute processes are active: {processes[:500]}")
+    print(f"[{now()}] startup: checking Python environments", flush=True)
     for python in (NWM_PYTHON, RAE_PYTHON):
         if not python.is_file():
             raise FileNotFoundError(python)
@@ -786,10 +835,11 @@ def preflight(gpus):
             raise FileNotFoundError(f"RAE {flag}: {path}")
     for model in MODELS_REQUESTED:
         path = Path(MODEL[model]["checkpoint"])
-        if sha(path) != MODEL[model]["sha256"]:
+        if startup_step(f"checkpoint SHA-256: {model}: {path}", sha, path) != MODEL[model]["sha256"]:
             raise RuntimeError(f"Checkpoint SHA-256 mismatch: {model}: {path}")
     for model in ADDED:
         prepare_model_view(model)
+    print(f"[{now()}] startup: checking dataset paths and split hashes", flush=True)
     for dataset in DATASETS:
         if not (DATA / DATASET_CONTRACTS[dataset]["data_name"]).is_dir():
             raise FileNotFoundError(DATA / DATASET_CONTRACTS[dataset]["data_name"])
@@ -812,6 +862,7 @@ def preflight(gpus):
                    NAS / "finalLAM_reset_checkpoint_sweep_20260922/predictions"]
     for watch in watch_roots:
         if watch.exists():
+            print(f"[{now()}] startup: checking recent writes under {watch}", flush=True)
             recent = subprocess.run(["find", str(watch), "-type", "f", "-mmin", "-2", "-print", "-quit"],
                                     text=True, capture_output=True, check=True).stdout.strip()
             if recent:
@@ -1012,13 +1063,17 @@ def refresh_active_items(run_dir, items, running):
 
 def metric_jobs(run_dir, items):
     jobs = []
+    grouped = {}
+    for key, value in items.items():
+        prefix = tuple(key.split("/")[:4])
+        grouped.setdefault(prefix, []).append(value)
     for model in MODELS_REQUESTED:
         for dataset in DATASETS:
             for evaluation in ("time", "rollout_1fps", "rollout_4fps"):
                 if dataset == "planetary_rover" and evaluation != "time":
                     continue
                 kind = "direct" if evaluation == "time" else "rollout"
-                relevant = [v for k, v in items.items() if k.startswith(f"{kind}/{model}/{dataset}/{evaluation}/")]
+                relevant = grouped.get((kind, model, dataset, evaluation), [])
                 if not relevant or any(v["status"] != "complete" for v in relevant):
                     continue
                 path = run_dir / "metrics" / model / f"{dataset}_{evaluation}.json"
@@ -1136,6 +1191,16 @@ def publish_state(run_dir, items, jobs, active=None, started=None, baseline=0):
     return state
 
 
+def audit_job_outputs(run_dir, items, jobs):
+    refresh_active_items(run_dir, items, {i: (job, None, {}) for i, job in enumerate(jobs)})
+    return metric_jobs(run_dir, items)
+
+
+def publish_progress(run_dir, items, jobs, active, started, baseline):
+    publish_state(run_dir, items, jobs, active=active, started=started, baseline=baseline)
+    write_report(run_dir, items)
+
+
 def coordinator(run_dir, gpus, lock_fd):
     # The launcher passes its already locked descriptor, keeping the lock held
     # continuously through the detached parent/child handoff.
@@ -1179,16 +1244,25 @@ def coordinator(run_dir, gpus, lock_fd):
                 staged_jobs.append(job)
         jobs = staged_jobs
         submitted_metrics = set()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(gpus)) as pool:
+        ready_image_metrics = metric_jobs(run_dir, items)
+        audit_future = report_future = None
+        audit_pending = []
+        last_audit = last_report = 0
+        with (concurrent.futures.ThreadPoolExecutor(max_workers=len(gpus)) as pool,
+              concurrent.futures.ThreadPoolExecutor(max_workers=1) as auditor,
+              concurrent.futures.ThreadPoolExecutor(max_workers=1) as reporter):
             free = list(gpus)
             running = {}
-            while gt_queue or running or any(
+            while gt_queue or running or audit_future is not None or audit_pending or any(
                 job["kind"] == "navigation" or
                 (gt_dependency(job) not in failed_gt and pending_gt[gt_dependency(job)] == 0)
                 for job in jobs
             ):
-                ready_image_metrics = metric_jobs(run_dir, items)
+                if audit_future is not None and audit_future.done():
+                    ready_image_metrics = audit_future.result()
+                    audit_future = None
                 reconstruction_pending = (bool(gt_queue) or bool(ready_image_metrics)
+                    or audit_future is not None or bool(audit_pending)
                     or any(j["kind"] in ("direct", "rollout") for j in jobs)
                     or any(is_gt or j["kind"] in ("direct", "rollout", "metric")
                            for j, _gpu, _state, is_gt in running.values()))
@@ -1229,13 +1303,11 @@ def coordinator(run_dir, gpus, lock_fd):
                         gpu = free.pop(0)
                         state = {"batch": 16}
                         running[pool.submit(run_job, job, run_dir, gpu, state)] = (job, gpu, state, False)
-                if not running:
+                if not running and audit_future is None and not audit_pending:
                     break
                 completed, _ = concurrent.futures.wait(running, timeout=10, return_when=concurrent.futures.FIRST_COMPLETED)
-                refresh_active_items(run_dir, items, {
-                    future: (job, gpu, state)
-                    for future, (job, gpu, state, is_gt) in running.items() if not is_gt
-                })
+                if not running and audit_future is not None:
+                    concurrent.futures.wait([audit_future], timeout=1)
                 for future in completed:
                     job, gpu, state, is_gt = running.pop(future)
                     free.append(gpu)
@@ -1276,13 +1348,27 @@ def coordinator(run_dir, gpus, lock_fd):
                     if pending_pilots.get((job["model"], job["kind"])) == job_name(job) and not (
                         entry["exit_code"] and job.get("retry_batch")):
                         pending_pilots.pop((job["model"], job["kind"]))
-                    items, _ = build_plan(run_dir)
-                    ensure_links(run_dir, items)
+                    # Release the GPU immediately. PNG verification and metric
+                    # discovery run on a CPU thread, never a full NAS rescan.
+                    audit_pending.append(job)
                     print(f"[{now()}] {entry['name']} exit={entry['exit_code']} complete={sum(i['status']=='complete' for i in items.values())}/{len(items)}", flush=True)
+                if audit_future is None and (audit_pending or (running and time.monotonic() - last_audit >= 30)):
+                    checks = audit_pending + [j for j, _g, _s, gt in running.values() if not gt]
+                    audit_pending = []
+                    audit_future = auditor.submit(audit_job_outputs, run_dir, items, checks)
+                    last_audit = time.monotonic()
                 active = [{"name": gt_job_name(job) if is_gt else job_name(job), "gpu": gpu}
                           for job, gpu, _state, is_gt in running.values()]
-                publish_state(run_dir, items, list(gt_queue) + jobs, active=active,
-                              started=started, baseline=baseline)
+                if report_future is not None and report_future.done():
+                    report_future.result()
+                    report_future = None
+                if report_future is None and time.monotonic() - last_report >= 10:
+                    snapshot = {key: value.copy() for key, value in items.items()}
+                    report_future = reporter.submit(publish_progress, run_dir, snapshot,
+                        list(gt_queue) + jobs, active, started, baseline)
+                    last_report = time.monotonic()
+            if report_future is not None:
+                report_future.result()
         items, remaining = build_plan(run_dir)
         aggregate_navigation(run_dir, items)
         metrics = metric_jobs(run_dir, items)
@@ -1578,6 +1664,7 @@ def main():
         raise RuntimeError("Start requires --l20-paused after the L20 benchmark writer has been paused")
     if args.action == "start" and (run_dir / "status.json").exists():
         raise RuntimeError("Run ID already has state; use resume")
+    print(f"[{now()}] startup: PID={os.getpid()}; acquiring run lock before validation", flush=True)
     run_dir.mkdir(parents=True, exist_ok=True)
     recorded_contract = read_json(run_dir / "contract.json")
     if args.action == "resume" and recorded_contract is None:
@@ -1589,10 +1676,12 @@ def main():
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise RuntimeError("A coordinator already holds this run lock") from exc
+        current_contract = startup_step("checkpoint/split/source contract", run_contract)
         if args.action == "resume" and recorded_contract is not None:
-            recorded_contract = refresh_failed_gt_contract(run_dir, recorded_contract, run_contract())
-            recorded_contract = migrate_huron_population_contract(run_dir, recorded_contract, run_contract())
-        if recorded_contract is not None and recorded_contract != run_contract():
+            recorded_contract = refresh_failed_gt_contract(run_dir, recorded_contract, current_contract)
+            recorded_contract = migrate_huron_population_contract(run_dir, recorded_contract, current_contract)
+            recorded_contract = migrate_rae_loader_contract(run_dir, recorded_contract, current_contract)
+        if recorded_contract is not None and recorded_contract != current_contract:
             raise RuntimeError("Run contract differs in checkpoint, split, sample IDs, or entrypoint hashes; use a new run ID")
         for record_path in (run_dir / "jobs").glob("*.json"):
             record = read_json(record_path) or {}
@@ -1603,12 +1692,13 @@ def main():
             except ProcessLookupError:
                 continue
             raise RuntimeError(f"Previous job process group is still active: PID={record['pid']} {record_path}")
-        checks = preflight(gpus)
+        checks = startup_step("GPU/environment/checkpoints/data/writer checks", preflight, gpus)
         if recorded_contract is None:
-            atomic_json(run_dir / "contract.json", run_contract())
-        # Avoid racing a second machine writing to one of the same prediction trees.
-        items, jobs = build_plan(run_dir)
-        atomic_json(run_dir / "preflight.json", {"at": now(), "checks": checks, "jobs": len(jobs)})
+            atomic_json(run_dir / "contract.json", current_contract)
+        # The coordinator reconciles artifacts once under this same inherited
+        # lock. Do not duplicate that NAS scan in the foreground launcher.
+        atomic_json(run_dir / "preflight.json", {"at": now(), "checks": checks,
+                    "artifact_verification": "deferred_to_locked_coordinator"})
         (run_dir / "finish.json").unlink(missing_ok=True)
         command = [str(NWM_PYTHON), str(Path(__file__).resolve()), "_coordinate", "--run-id", args.run_id,
                    "--gpus", args.gpus, "--lock-fd", str(lock.fileno())]

@@ -216,6 +216,75 @@ class A800EvalTest(unittest.TestCase):
             for kind in ("direct", "rollout", "metric"):
                 self.assertLess(ends[kind], starts["navigation"])
 
+    def test_eight_gpus_keep_dispatching_during_slow_audit_and_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fd = os.open(root / "coordinator.lock", os.O_CREAT | os.O_RDWR, 0o644)
+            jobs = [{"kind": "direct", "model": "nwm-release", "dataset": "recon",
+                     "evaluation": "time", "ids": [i], "endpoints": [1]} for i in range(16)]
+            done, devices = set(), set()
+            guard = threading.Lock()
+            audit_started, next_wave = threading.Event(), threading.Event()
+
+            def work(job, _root, gpu, state):
+                with guard:
+                    devices.add(gpu)
+                if job["ids"][0] >= 8:
+                    self.assertTrue(audit_started.wait(3))
+                    next_wave.set()
+                time.sleep(0.05)
+                with guard:
+                    done.add(job["ids"][0])
+                return {"name": runner.job_name(job), "exit_code": 0, "oom": False}
+
+            def slow_audit(*_):
+                audit_started.set()
+                self.assertTrue(next_wave.wait(3), "audit blocked GPU dispatch")
+                return []
+
+            def slow_report(*_, **__):
+                self.assertTrue(next_wave.wait(3), "report blocked GPU dispatch")
+
+            with (mock.patch.object(runner, "build_plan", side_effect=lambda _: ({}, [j for j in jobs if j["ids"][0] not in done])) as plan,
+                  mock.patch.object(runner, "gt_jobs", return_value=[]),
+                  mock.patch.object(runner, "run_job", side_effect=work),
+                  mock.patch.object(runner, "audit_job_outputs", side_effect=slow_audit),
+                  mock.patch.object(runner, "publish_progress", side_effect=slow_report),
+                  mock.patch.object(runner, "ensure_links"),
+                  mock.patch.object(runner, "publish_state"),
+                  mock.patch.object(runner, "metric_jobs", return_value=[]),
+                  mock.patch.object(runner, "aggregate_navigation"),
+                  mock.patch.object(runner, "write_report")):
+                runner.coordinator(root, list(map(str, range(8))), fd)
+                self.assertEqual(plan.call_count, 2)
+            self.assertEqual(len(done), 16)
+            self.assertEqual(devices, set(map(str, range(8))))
+
+    def test_rae_huron_filter_preserves_effective_sample_order(self):
+        import pickle
+        from scripts.raenwm_infer import filter_huron_rows
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "traj").mkdir()
+            (root / "traj" / "traj_data.pkl").write_bytes(pickle.dumps({"position": list(range(20))}))
+            rows = [("traj", 0, 1, 4), ("missing", 0, 1, 4),
+                    ("traj", 16, 1, 4), ("traj", 5, -6, 4), ("traj", 10, 1, 4)]
+            self.assertEqual(filter_huron_rows(rows, root), [rows[0], rows[4]])
+
+    def test_rae_contract_migration_is_exact_and_rejects_huron_images(self):
+        name = "scripts/raenwm_infer.py"
+        old = {"entrypoint_sha256": {name: "d46634574c18a78579d0f281f16233b4e5d1e3853c8f59afbee2d509c5c1783e"}, "seed": 0}
+        new = {"entrypoint_sha256": {name: "aecd6992f1b6a479f791c790396e3ab261a72f27b55f858f3d5a344867ebbc78"}, "seed": 0}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.assertEqual(runner.migrate_rae_loader_contract(root, old, {**new, "seed": 1}), old)
+            self.assertFalse((root / "contract.json").exists())
+            self.assertEqual(runner.migrate_rae_loader_contract(root, old, new), new)
+            self.assertEqual(runner.read_json(root / "contract.pre_rae_loader_fix.json"), old)
+            image(root / "predictions/rae-nwm/huron/time/0.png")
+            with self.assertRaisesRegex(RuntimeError, "sample numbering"):
+                runner.migrate_rae_loader_contract(root, old, new)
+
     def test_stop_refuses_unrelated_coordinator_pid(self):
         with tempfile.TemporaryDirectory() as directory:
             run = Path(directory)

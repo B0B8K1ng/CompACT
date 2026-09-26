@@ -1,0 +1,59 @@
+\begin{table*}[t]
+  \centering
+  \caption{\textbf{Available NWM pretraining-ablation results at 4\,s.}
+  Single-step and rollouts are evaluated on RECON; OOD direct prediction is
+  evaluated on Go Stanford.  The original-setup NWM row is a reference only;
+  the three aligned rows share a downstream recipe.  Values are
+  single-checkpoint point estimates.  The unfinished LatentPT and planning
+  entries are omitted rather than represented by empty cells.  DS denotes
+  DreamSim; bold denotes the best aligned result in each metric column.}
+  \label{tab:pretraining_ablation_available}
+  \footnotesize
+  \setlength{\tabcolsep}{2.8pt}
+  \renewcommand{\arraystretch}{1.15}
+  \resizebox{\linewidth}{!}{%
+    \begin{tabular}{@{}lcc*{12}{c}@{}}
+      \toprule
+      \multirow{3}{*}{Setup}
+        & \multirow{3}{*}{Pretrain}
+        & \multirow{3}{*}{Proxy}
+        & \multicolumn{9}{c}{RECON}
+        & \multicolumn{3}{c}{Go Stanford} \\
+      \cmidrule(lr){4-12}\cmidrule(l){13-15}
+        & &
+        & \multicolumn{3}{c}{Single-step}
+        & \multicolumn{3}{c}{Rollout (1\,FPS)}
+        & \multicolumn{3}{c}{Rollout (4\,FPS)}
+        & \multicolumn{3}{c}{Direct} \\
+      \cmidrule(lr){4-6}\cmidrule(lr){7-9}\cmidrule(lr){10-12}\cmidrule(l){13-15}
+        & &
+        & LPIPS$\downarrow$ & DS$\downarrow$ & PSNR$\uparrow$
+        & LPIPS$\downarrow$ & DS$\downarrow$ & PSNR$\uparrow$
+        & LPIPS$\downarrow$ & DS$\downarrow$ & PSNR$\uparrow$
+        & LPIPS$\downarrow$ & DS$\downarrow$ & PSNR$\uparrow$ \\
+      \midrule
+      NWM-Real (original setup) & No & N/A
+        & 0.325 & 0.120 & 15.357
+        & 0.385 & 0.152 & 14.579
+        & 0.450 & 0.214 & 13.314
+        & 0.653 & 0.462 & 11.202 \\
+      \midrule
+      Aligned & No  & N/A
+        & 0.457 & 0.257 & 12.839
+        & 0.454 & 0.254 & 13.198
+        & \textbf{0.461} & 0.257 & \textbf{13.174}
+        & 0.645 & 0.472 & 11.307 \\
+      Aligned & Yes & None
+        & \textbf{0.359} & \textbf{0.148} & \textbf{14.872}
+        & \textbf{0.417} & \textbf{0.182} & 13.975
+        & 0.488 & 0.258 & 12.555
+        & \textbf{0.635} & \textbf{0.435} & \textbf{11.842} \\
+      Aligned & Yes & Geometry
+        & 0.362 & 0.153 & 14.841
+        & \textbf{0.417} & 0.186 & \textbf{13.986}
+        & 0.475 & \textbf{0.250} & 13.051
+        & 0.639 & 0.439 & 11.587 \\
+      \bottomrule
+    \end{tabular}%
+  }
+\end{table*}

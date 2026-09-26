@@ -77,7 +77,7 @@ def source_revision(source: Path) -> str:
     import subprocess
 
     return subprocess.run(
-        ["git", "rev-parse", "HEAD"],
+        ["git", "-c", f"safe.directory={source.resolve()}", "rev-parse", "HEAD"],
         cwd=source,
         check=True,
         text=True,
@@ -170,6 +170,8 @@ def build_dataset(
     layout = DATASET_LAYOUTS[dataset_name]
     split_root = args.project_root / "data_splits" / layout["split"] / "test"
     split = split_root / f"{args.eval_type}.pkl"
+    if getattr(args, "split_file", None) is not None:
+        split = args.split_file
     if not split.is_file():
         raise FileNotFoundError(split)
     spacing = waypoint_spacing(args, dataset_name)
@@ -177,6 +179,18 @@ def build_dataset(
     # Official RAE-NWM reads its own config/data_config.yaml during construction.
     # Unknown OOD names use a known placeholder only for that lookup; explicit
     # paths and the measured spacing below remain the actual dataset contract.
+    if dataset_name == "tum_rgbd":
+        from scripts.prepare_tum_camera_heading import heading_from_metadata
+
+        class CameraForwardDataset(dataset_cls):
+            def _get_trajectory(self, trajectory_name):
+                trajectory = super()._get_trajectory(trajectory_name)
+                trajectory["yaw"] = heading_from_metadata(
+                    str(Path(self.data_folder) / trajectory_name / "frame_metadata.jsonl")
+                ).copy()
+                return trajectory
+
+        dataset_cls = CameraForwardDataset
     dataset = dataset_cls(
         data_folder=str(args.data_root / layout["data"]),
         data_split_folder=str(split_root),
@@ -198,6 +212,10 @@ def build_dataset(
             else "traj_names.txt"
         ),
     )
+    if dataset_name == "huron":
+        # Match CompACT's filtered sample numbering before applying ID subsets.
+        # The immutable pickle contains 500/150 raw rows, not 329/103 valid rows.
+        dataset.index_to_data = filter_huron_rows(dataset.index_to_data, args.data_root / layout["data"])
     dataset.dataset_name = dataset_name
     dataset.data_config = {"metric_waypoint_spacing": spacing}
     expected_count = expected_sample_count(args)
@@ -206,6 +224,22 @@ def build_dataset(
             f"Expected {expected_count} samples in {split}, found {len(dataset)}"
         )
     return dataset
+
+
+def filter_huron_rows(rows, data_folder):
+    import pickle
+
+    lengths = {}
+    filtered = []
+    for row in rows:
+        trajectory, current, lower, upper = row[:4]
+        if trajectory not in lengths:
+            path = data_folder / trajectory / "traj_data.pkl"
+            lengths[trajectory] = len(pickle.loads(path.read_bytes())["position"]) if path.is_file() else None
+        length = lengths[trajectory]
+        if length is not None and current + lower >= 0 and current + upper < length:
+            filtered.append(row)
+    return filtered
 
 
 def expected_sample_count(args: argparse.Namespace) -> int:
@@ -487,7 +521,7 @@ def write_manifest(args: argparse.Namespace, world_size: int) -> None:
     dataset_manifest = {}
     for name in args.datasets:
         layout = DATASET_LAYOUTS[name]
-        split = (
+        split = args.split_file or (
             args.project_root
             / "data_splits"
             / layout["split"]
@@ -499,6 +533,7 @@ def write_manifest(args: argparse.Namespace, world_size: int) -> None:
             "split": str(split.resolve()),
             "split_sha256": sha256_file(split),
             "metric_waypoint_spacing": waypoint_spacing(args, name),
+            "heading_convention": "camera_optical_z_projected_to_world_xy" if name == "tum_rgbd" else "source_yaw",
         }
     output = args.output_root / f"{args.eval_type}_inference_manifest.json"
     previous_datasets: dict[str, Any] = {}
@@ -580,6 +615,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--datasets", nargs="+", required=True)
     parser.add_argument("--eval-type", choices=("time", "rollout"), default="time")
     parser.add_argument("--horizons", nargs="+", type=int, default=list(HORIZONS))
+    parser.add_argument("--split-file", type=Path, default=None,
+                        help="Explicit immutable sample index for a custom rollout.")
     parser.add_argument("--rollout-fps", nargs="+", type=int, default=[1, 4])
     parser.add_argument(
         "--sample-indices",

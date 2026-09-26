@@ -20,8 +20,8 @@ FONT_PATH = Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
 IMAGE_SIZE = 224
 TITLE_HEIGHT = 36
 LABEL_HEIGHT = 28
-WIDTH = 2 * IMAGE_SIZE
-HEIGHT = TITLE_HEIGHT + 2 * (LABEL_HEIGHT + IMAGE_SIZE)
+WIDTH = 4 * IMAGE_SIZE
+HEIGHT = TITLE_HEIGHT + LABEL_HEIGHT + IMAGE_SIZE
 PANELS = (
     ("GT", "GT", "#23a6a0"),
     ("NWM", "nwm-release", "#5c8edb"),
@@ -53,18 +53,18 @@ def validate_video(path: Path, count: int, fps: int) -> None:
 
 def draw_frame(case: dict, case_dir: Path, step: int, title_font: ImageFont.FreeTypeFont,
                label_font: ImageFont.FreeTypeFont, initial_image: Path | None = None) -> bytes:
-    image = Image.new("RGB", (WIDTH, HEIGHT), "#111820")
+    image = Image.new("RGB", (WIDTH, HEIGHT), "white")
     draw = ImageDraw.Draw(image)
     count = case["seconds"] * case["fps"]
-    heading = (f"{case['group']}  {case['dataset']}/id_{case['sample_id']}"
-               f"   t={(step + 1) / case['fps']:.2f}s   {step + 1}/{count}")
-    draw.text((8, 8), heading, font=title_font, fill="white")
+    heading = f"t={(step + 1) / case['fps']:g}s"
+    if case['dataset'] == 'planetary_rover':
+        heading = 'Playback · ' + heading
+    draw.text((WIDTH // 2, 8), heading, anchor="mt", font=title_font, fill="black")
     for panel, (label, folder, color) in enumerate(PANELS):
-        row, col = divmod(panel, 2)
+        row, col = 0, panel
         x = col * IMAGE_SIZE
         y = TITLE_HEIGHT + row * (LABEL_HEIGHT + IMAGE_SIZE)
-        draw.rectangle((x, y, x + 5, y + LABEL_HEIGHT - 1), fill=color)
-        draw.text((x + 11, y + 4), label, font=label_font, fill="white")
+        draw.text((x + IMAGE_SIZE // 2, y + 4), label, anchor="mt", font=label_font, fill="black")
         frame = (initial_image if step < 0 else
                  case_dir / "frames" / folder / f"{step:03d}.png")
         if frame is None:
@@ -152,7 +152,7 @@ def main() -> None:
         raise RuntimeError("No cases in summary.json")
     index = [make_video(case, root, args.force) for case in cases]
     (root / "video_index.json").write_text(json.dumps({
-        "layout": "2x2: GT, NWM, RAE-NWM, OpenNWM",
+        "layout": "1x4: GT, NWM, RAE-NWM, OpenNWM",
         "encoder": "ffmpeg libx264 CRF 18 preset medium, yuv420p, no audio",
         "videos": index,
     }, indent=2) + "\n")

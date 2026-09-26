@@ -1,0 +1,30 @@
+{
+  "repository": "LittleBoss/NWM-Nav1-LatentPT-L20",
+  "platform": "ModelScope",
+  "network": "direct, requests trust_env=False, proxy variables removed",
+  "protocol": "direct_4s_v1",
+  "horizon_seconds": 4,
+  "input_fps": 4,
+  "context_frames": 4,
+  "image_size": 224,
+  "weight_key": "ema",
+  "sampler": "ddpm",
+  "sampling_steps": 250,
+  "seed": 0,
+  "sample_count": {
+    "recon": 500,
+    "scand": 500,
+    "tartan_drive": 500,
+    "huron": 329,
+    "go_stanford": 500
+  },
+  "huron_note": "Fixed split contains 500 rows; existing dataset loader filters absent/short trajectories, yielding 329 valid samples. No additional subsampling.",
+  "fid_implementation": "torcheval FrechetInceptionDistance, torchvision Inception-v3, feature_dim=2048",
+  "lpips": "alex",
+  "psnr": "mean of per-image RGB PSNR dB on saved uint8 PNGs",
+  "dreamsim": "pretrained ensemble",
+  "commands_directory": "/file_system/nas/algorithm/dujun.nie/nwm/results/nav1_u100l100_direct4s_20260926/jobs",
+  "notes": "Single-seed evaluation; FID is computed separately per dataset, not pooled.",
+  "checkpoint_sha256": "b23825b2c3991298f468d4ce2b32c31e4f3f1f93664556874ac4df35c74eca05",
+  "ground_truth_source": "/file_system/nas/algorithm/dujun.nie/nwm/results/nav1_l20_direct4s_20260924/gt"
+}

@@ -29,6 +29,7 @@ from train_utils import (
     validate_model_context_sizes,
 )
 from motion_condition import make_motion_group
+from scripts.rollout_actions import body_frame_rollout_actions
 from scripts.benchmark_reproducibility import (
     expand_sample_keys,
     samplewise_noise_schedule,
@@ -106,6 +107,8 @@ def get_dataset_eval(config, dataset_name, eval_type, predefined_index=True):
         predefined_index = f"data_splits/{split_name}/test/{eval_type}.pkl"
     else:
         predefined_index = None
+
+    predefined_index = data_config.get("predefined_index_path", predefined_index)
 
     dataset = EvalDataset(
         data_folder=data_config.data_folder,
@@ -392,7 +395,13 @@ def generate_rollout(
     """
     rollout_stride = config.input_fps // rollout_fps
     gt_image = gt_image[:, rollout_stride - 1 :: rollout_stride]
-    delta = delta.unflatten(1, (-1, rollout_stride)).sum(2)
+    delta = body_frame_rollout_actions(
+        delta, rollout_stride,
+        legacy_stats=None if config.get("motion_condition", {}).get("enabled", False)
+        else config.dataset.action_stats,
+    )
+    # Diagnostic override only; benchmark runs use the unmodified real action.
+    delta = delta * float(config.get("diagnostic_rollout_action_scale", 1.0))
     curr_obs = obs_image.clone().to(device)
 
     for i in range(gt_image.shape[1]):

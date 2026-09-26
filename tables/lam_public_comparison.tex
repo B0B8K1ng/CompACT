@@ -1,0 +1,42 @@
+\begin{table}[t]
+  \centering
+  \caption{\textbf{Standalone LAM RGB reconstruction.}
+  The navigation-domain split aggregates held-out RECON, HuRoN, and SCAND
+  (2,400 pairs); the Go Stanford transfer split contains 800 pairs and is
+  unseen by our model.  Every method uses the same record IDs and nonzero
+  signed offsets.  Bold and underline denote the best and second-best results.
+  Our entry is the independently trained Pixel-LAM, not OpenNWM's Pixel+Action
+  proxy.}
+  \label{tab:lam_reconstruction}
+  \small
+  \setlength{\tabcolsep}{3.5pt}
+  \renewcommand{\arraystretch}{1.08}
+  \resizebox{\columnwidth}{!}{%
+    \begin{tabular}{@{}lcccc@{}}
+      \toprule
+      \multirow{2}{*}{Method}
+        & \multicolumn{2}{c}{Navigation domain}
+        & \multicolumn{2}{c}{Go Stanford transfer} \\
+      \cmidrule(lr){2-3}\cmidrule(l){4-5}
+        & PSNR$\uparrow$ & LPIPS$\downarrow$
+        & PSNR$\uparrow$ & LPIPS$\downarrow$ \\
+      \midrule
+      DiLA LAM~\cite{zhang2026dila}
+                            & 13.180 & 0.5972 & 14.078 & 0.6211 \\
+      Public DreamDojo LAM~\cite{gao2026dreamdojo}
+                            & \underline{18.950} & 0.5292
+                            & \underline{20.713} & \underline{0.4852} \\
+      LARA/MoTo tokenizer~\cite{liu2026lara,chen2024moto}
+                            & 15.752 & 0.5381 & 17.742 & 0.5267 \\
+      Olaf-World LAM~\cite{jiang2026olaf}
+                            & 14.764 & 0.6349 & 16.599 & 0.6142 \\
+      villa-X LAM~\cite{chen2025villa0x0}
+                            & 15.327 & \underline{0.5163} & 17.560 & 0.5499 \\
+      \midrule
+      \textbf{Ours (Pixel-LAM)}
+                            & \textbf{21.071} & \textbf{0.5049}
+                            & \textbf{21.912} & \textbf{0.4721} \\
+      \bottomrule
+    \end{tabular}%
+  }
+\end{table}

@@ -1,0 +1,910 @@
+{
+  "source_sha256": "6d60b8ae29729ce641513094314a55a42447d6aeab11dbbcced9952d01cfe012",
+  "aggregation": "equal weight over five datasets; mean FID is not pooled FID",
+  "selection": "Manuscript analyzes only U scaling at L=100% on RECON DreamSim. All four U settings are retained. Complete U/L results remain in the local audit assets, outside the focused manuscript section.",
+  "uncertainty": "one checkpoint and one evaluation seed per setting; no repeated-training confidence intervals",
+  "trends": [
+    {
+      "axis": "U",
+      "dataset": "recon",
+      "metric": "lpips_alex",
+      "checkpoints": [
+        "u25l100",
+        "u50l100",
+        "u75l100",
+        "u100l100"
+      ],
+      "values": [
+        0.438449609041214,
+        0.43321841129660604,
+        0.4325735368132591,
+        0.427015715777874
+      ],
+      "strict_monotonic_improvement": true,
+      "endpoint_change": -0.01143389326333999
+    },
+    {
+      "axis": "U",
+      "dataset": "recon",
+      "metric": "dreamsim",
+      "checkpoints": [
+        "u25l100",
+        "u50l100",
+        "u75l100",
+        "u100l100"
+      ],
+      "values": [
+        0.20059422528743745,
+        0.19686050915718079,
+        0.19078477752208708,
+        0.18840071427822114
+      ],
+      "strict_monotonic_improvement": true,
+      "endpoint_change": -0.012193511009216312
+    },
+    {
+      "axis": "U",
+      "dataset": "recon",
+      "metric": "psnr",
+      "checkpoints": [
+        "u25l100",
+        "u50l100",
+        "u75l100",
+        "u100l100"
+      ],
+      "values": [
+        13.189300086021424,
+        13.35459096622467,
+        13.38178632068634,
+        13.463160482406616
+      ],
+      "strict_monotonic_improvement": true,
+      "endpoint_change": 0.2738603963851922
+    },
+    {
+      "axis": "U",
+      "dataset": "recon",
+      "metric": "fid",
+      "checkpoints": [
+        "u25l100",
+        "u50l100",
+        "u75l100",
+        "u100l100"
+      ],
+      "values": [
+        33.832977294921875,
+        34.80546569824219,
+        32.15226745605469,
+        31.926956176757812
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": -1.9060211181640625
+    },
+    {
+      "axis": "U",
+      "dataset": "scand",
+      "metric": "lpips_alex",
+      "checkpoints": [
+        "u25l100",
+        "u50l100",
+        "u75l100",
+        "u100l100"
+      ],
+      "values": [
+        0.448440941631794,
+        0.46406007212400435,
+        0.44897294783592223,
+        0.4393242004811764
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": -0.009116741150617613
+    },
+    {
+      "axis": "U",
+      "dataset": "scand",
+      "metric": "dreamsim",
+      "checkpoints": [
+        "u25l100",
+        "u50l100",
+        "u75l100",
+        "u100l100"
+      ],
+      "values": [
+        0.3288751564025879,
+        0.3461244297027588,
+        0.32704877388477327,
+        0.3170741844177246
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": -0.011800971984863295
+    },
+    {
+      "axis": "U",
+      "dataset": "scand",
+      "metric": "psnr",
+      "checkpoints": [
+        "u25l100",
+        "u50l100",
+        "u75l100",
+        "u100l100"
+      ],
+      "values": [
+        11.883181873321533,
+        11.560893636703492,
+        11.91978133392334,
+        12.109884112358094
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": 0.22670223903656073
+    },
+    {
+      "axis": "U",
+      "dataset": "scand",
+      "metric": "fid",
+      "checkpoints": [
+        "u25l100",
+        "u50l100",
+        "u75l100",
+        "u100l100"
+      ],
+      "values": [
+        57.10227966308594,
+        64.86767578125,
+        59.23091125488281,
+        57.664276123046875
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": 0.5619964599609375
+    },
+    {
+      "axis": "U",
+      "dataset": "tartan_drive",
+      "metric": "lpips_alex",
+      "checkpoints": [
+        "u25l100",
+        "u50l100",
+        "u75l100",
+        "u100l100"
+      ],
+      "values": [
+        0.4668471012115479,
+        0.4738001403212547,
+        0.46394264060258866,
+        0.4615371059775352
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": -0.005309995234012654
+    },
+    {
+      "axis": "U",
+      "dataset": "tartan_drive",
+      "metric": "dreamsim",
+      "checkpoints": [
+        "u25l100",
+        "u50l100",
+        "u75l100",
+        "u100l100"
+      ],
+      "values": [
+        0.2523865331411362,
+        0.2591668906211853,
+        0.2524060230255127,
+        0.24360490226745604
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": -0.00878163087368014
+    },
+    {
+      "axis": "U",
+      "dataset": "tartan_drive",
+      "metric": "psnr",
+      "checkpoints": [
+        "u25l100",
+        "u50l100",
+        "u75l100",
+        "u100l100"
+      ],
+      "values": [
+        12.7345642786026,
+        12.599486464500428,
+        12.85169264793396,
+        12.89322205066681
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": 0.15865777206420972
+    },
+    {
+      "axis": "U",
+      "dataset": "tartan_drive",
+      "metric": "fid",
+      "checkpoints": [
+        "u25l100",
+        "u50l100",
+        "u75l100",
+        "u100l100"
+      ],
+      "values": [
+        30.149444580078125,
+        33.010162353515625,
+        30.847763061523438,
+        30.027679443359375
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": -0.12176513671875
+    },
+    {
+      "axis": "U",
+      "dataset": "huron",
+      "metric": "lpips_alex",
+      "checkpoints": [
+        "u25l100",
+        "u50l100",
+        "u75l100",
+        "u100l100"
+      ],
+      "values": [
+        0.40353691605086744,
+        0.4214300784115371,
+        0.3987660608664834,
+        0.41554648689585977
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": 0.012009570844992323
+    },
+    {
+      "axis": "U",
+      "dataset": "huron",
+      "metric": "dreamsim",
+      "checkpoints": [
+        "u25l100",
+        "u50l100",
+        "u75l100",
+        "u100l100"
+      ],
+      "values": [
+        0.22830793252469558,
+        0.2467458168424009,
+        0.22305471194189008,
+        0.2443747036725192
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": 0.016066771147823622
+    },
+    {
+      "axis": "U",
+      "dataset": "huron",
+      "metric": "psnr",
+      "checkpoints": [
+        "u25l100",
+        "u50l100",
+        "u75l100",
+        "u100l100"
+      ],
+      "values": [
+        13.278380091067143,
+        13.095501682316279,
+        13.475305674648574,
+        13.13674937917831
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": -0.14163071188883336
+    },
+    {
+      "axis": "U",
+      "dataset": "huron",
+      "metric": "fid",
+      "checkpoints": [
+        "u25l100",
+        "u50l100",
+        "u75l100",
+        "u100l100"
+      ],
+      "values": [
+        59.97802734375,
+        65.49806213378906,
+        56.464080810546875,
+        61.06468200683594
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": 1.0866546630859375
+    },
+    {
+      "axis": "U",
+      "dataset": "go_stanford",
+      "metric": "lpips_alex",
+      "checkpoints": [
+        "u25l100",
+        "u50l100",
+        "u75l100",
+        "u100l100"
+      ],
+      "values": [
+        0.6567819046974183,
+        0.6619344041347504,
+        0.6467275947332383,
+        0.6455493779182434
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": -0.011232526779174856
+    },
+    {
+      "axis": "U",
+      "dataset": "go_stanford",
+      "metric": "dreamsim",
+      "checkpoints": [
+        "u25l100",
+        "u50l100",
+        "u75l100",
+        "u100l100"
+      ],
+      "values": [
+        0.4675638216733933,
+        0.4843809169530868,
+        0.45959491515159606,
+        0.45548999059200285
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": -0.01207383108139043
+    },
+    {
+      "axis": "U",
+      "dataset": "go_stanford",
+      "metric": "psnr",
+      "checkpoints": [
+        "u25l100",
+        "u50l100",
+        "u75l100",
+        "u100l100"
+      ],
+      "values": [
+        11.194555199623109,
+        10.963098238945006,
+        11.450869701385498,
+        11.413995056152343
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": 0.2194398565292346
+    },
+    {
+      "axis": "U",
+      "dataset": "go_stanford",
+      "metric": "fid",
+      "checkpoints": [
+        "u25l100",
+        "u50l100",
+        "u75l100",
+        "u100l100"
+      ],
+      "values": [
+        99.67465209960938,
+        113.87507629394531,
+        99.156982421875,
+        101.42034912109375
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": 1.745697021484375
+    },
+    {
+      "axis": "U",
+      "dataset": "macro",
+      "metric": "lpips_alex",
+      "checkpoints": [
+        "u25l100",
+        "u50l100",
+        "u75l100",
+        "u100l100"
+      ],
+      "values": [
+        0.48281129452656835,
+        0.49088862125763055,
+        0.4781965561702983,
+        0.47779457741013776
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": -0.005016717116430591
+    },
+    {
+      "axis": "U",
+      "dataset": "macro",
+      "metric": "dreamsim",
+      "checkpoints": [
+        "u25l100",
+        "u50l100",
+        "u75l100",
+        "u100l100"
+      ],
+      "values": [
+        0.29554553380585,
+        0.30665571265532254,
+        0.29057784030517186,
+        0.28978889904558475
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": -0.005756634760265278
+    },
+    {
+      "axis": "U",
+      "dataset": "macro",
+      "metric": "psnr",
+      "checkpoints": [
+        "u25l100",
+        "u50l100",
+        "u75l100",
+        "u100l100"
+      ],
+      "values": [
+        12.455996305727162,
+        12.314714197737976,
+        12.615887135715543,
+        12.603402216152435
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": 0.14740591042527385
+    },
+    {
+      "axis": "U",
+      "dataset": "macro",
+      "metric": "fid",
+      "checkpoints": [
+        "u25l100",
+        "u50l100",
+        "u75l100",
+        "u100l100"
+      ],
+      "values": [
+        56.14747619628906,
+        62.41128845214844,
+        55.57040100097656,
+        56.42078857421875
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": 0.27331237792968466
+    },
+    {
+      "axis": "L",
+      "dataset": "recon",
+      "metric": "lpips_alex",
+      "checkpoints": [
+        "u25l0",
+        "u25l50",
+        "u25l100"
+      ],
+      "values": [
+        0.43322260254621503,
+        0.444049728512764,
+        0.438449609041214
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": 0.005227006494998965
+    },
+    {
+      "axis": "L",
+      "dataset": "recon",
+      "metric": "dreamsim",
+      "checkpoints": [
+        "u25l0",
+        "u25l50",
+        "u25l100"
+      ],
+      "values": [
+        0.19333176124095916,
+        0.19705319809913635,
+        0.20059422528743745
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": 0.00726246404647829
+    },
+    {
+      "axis": "L",
+      "dataset": "recon",
+      "metric": "psnr",
+      "checkpoints": [
+        "u25l0",
+        "u25l50",
+        "u25l100"
+      ],
+      "values": [
+        13.280581135749816,
+        13.08760857963562,
+        13.189300086021424
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": -0.09128104972839246
+    },
+    {
+      "axis": "L",
+      "dataset": "recon",
+      "metric": "fid",
+      "checkpoints": [
+        "u25l0",
+        "u25l50",
+        "u25l100"
+      ],
+      "values": [
+        32.066986083984375,
+        32.178924560546875,
+        33.832977294921875
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": 1.7659912109375
+    },
+    {
+      "axis": "L",
+      "dataset": "scand",
+      "metric": "lpips_alex",
+      "checkpoints": [
+        "u25l0",
+        "u25l50",
+        "u25l100"
+      ],
+      "values": [
+        0.4483562768101692,
+        0.4598704407811165,
+        0.448440941631794
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": 8.466482162478028e-05
+    },
+    {
+      "axis": "L",
+      "dataset": "scand",
+      "metric": "dreamsim",
+      "checkpoints": [
+        "u25l0",
+        "u25l50",
+        "u25l100"
+      ],
+      "values": [
+        0.32671821367740633,
+        0.3342624571323395,
+        0.3288751564025879
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": 0.0021569427251815765
+    },
+    {
+      "axis": "L",
+      "dataset": "scand",
+      "metric": "psnr",
+      "checkpoints": [
+        "u25l0",
+        "u25l50",
+        "u25l100"
+      ],
+      "values": [
+        11.788524361610413,
+        11.538429324150085,
+        11.883181873321533
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": 0.09465751171111947
+    },
+    {
+      "axis": "L",
+      "dataset": "scand",
+      "metric": "fid",
+      "checkpoints": [
+        "u25l0",
+        "u25l50",
+        "u25l100"
+      ],
+      "values": [
+        59.575836181640625,
+        58.8785400390625,
+        57.10227966308594
+      ],
+      "strict_monotonic_improvement": true,
+      "endpoint_change": -2.4735565185546875
+    },
+    {
+      "axis": "L",
+      "dataset": "tartan_drive",
+      "metric": "lpips_alex",
+      "checkpoints": [
+        "u25l0",
+        "u25l50",
+        "u25l100"
+      ],
+      "values": [
+        0.4671144518852234,
+        0.47864419186115265,
+        0.4668471012115479
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": -0.0002673506736755038
+    },
+    {
+      "axis": "L",
+      "dataset": "tartan_drive",
+      "metric": "dreamsim",
+      "checkpoints": [
+        "u25l0",
+        "u25l50",
+        "u25l100"
+      ],
+      "values": [
+        0.25540203881263734,
+        0.2527923811674118,
+        0.2523865331411362
+      ],
+      "strict_monotonic_improvement": true,
+      "endpoint_change": -0.003015505671501162
+    },
+    {
+      "axis": "L",
+      "dataset": "tartan_drive",
+      "metric": "psnr",
+      "checkpoints": [
+        "u25l0",
+        "u25l50",
+        "u25l100"
+      ],
+      "values": [
+        12.717626899719239,
+        12.315510622978211,
+        12.7345642786026
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": 0.016937378883360665
+    },
+    {
+      "axis": "L",
+      "dataset": "tartan_drive",
+      "metric": "fid",
+      "checkpoints": [
+        "u25l0",
+        "u25l50",
+        "u25l100"
+      ],
+      "values": [
+        31.366912841796875,
+        29.996795654296875,
+        30.149444580078125
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": -1.21746826171875
+    },
+    {
+      "axis": "L",
+      "dataset": "huron",
+      "metric": "lpips_alex",
+      "checkpoints": [
+        "u25l0",
+        "u25l50",
+        "u25l100"
+      ],
+      "values": [
+        0.40852753926736607,
+        0.4025347312533022,
+        0.40353691605086744
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": -0.004990623216498624
+    },
+    {
+      "axis": "L",
+      "dataset": "huron",
+      "metric": "dreamsim",
+      "checkpoints": [
+        "u25l0",
+        "u25l50",
+        "u25l100"
+      ],
+      "values": [
+        0.23423301702574756,
+        0.22977674750209218,
+        0.22830793252469558
+      ],
+      "strict_monotonic_improvement": true,
+      "endpoint_change": -0.005925084501051975
+    },
+    {
+      "axis": "L",
+      "dataset": "huron",
+      "metric": "psnr",
+      "checkpoints": [
+        "u25l0",
+        "u25l50",
+        "u25l100"
+      ],
+      "values": [
+        13.36419747303322,
+        13.453420647734204,
+        13.278380091067143
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": -0.08581738196607702
+    },
+    {
+      "axis": "L",
+      "dataset": "huron",
+      "metric": "fid",
+      "checkpoints": [
+        "u25l0",
+        "u25l50",
+        "u25l100"
+      ],
+      "values": [
+        60.333984375,
+        59.81439208984375,
+        59.97802734375
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": -0.35595703125
+    },
+    {
+      "axis": "L",
+      "dataset": "go_stanford",
+      "metric": "lpips_alex",
+      "checkpoints": [
+        "u25l0",
+        "u25l50",
+        "u25l100"
+      ],
+      "values": [
+        0.6514244982004166,
+        0.6485203874111175,
+        0.6567819046974183
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": 0.005357406497001671
+    },
+    {
+      "axis": "L",
+      "dataset": "go_stanford",
+      "metric": "dreamsim",
+      "checkpoints": [
+        "u25l0",
+        "u25l50",
+        "u25l100"
+      ],
+      "values": [
+        0.47076251745224,
+        0.46265864729881284,
+        0.4675638216733933
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": -0.0031986957788467385
+    },
+    {
+      "axis": "L",
+      "dataset": "go_stanford",
+      "metric": "psnr",
+      "checkpoints": [
+        "u25l0",
+        "u25l50",
+        "u25l100"
+      ],
+      "values": [
+        11.377391945838928,
+        11.291388872146607,
+        11.194555199623109
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": -0.1828367462158198
+    },
+    {
+      "axis": "L",
+      "dataset": "go_stanford",
+      "metric": "fid",
+      "checkpoints": [
+        "u25l0",
+        "u25l50",
+        "u25l100"
+      ],
+      "values": [
+        103.5623779296875,
+        101.68740844726562,
+        99.67465209960938
+      ],
+      "strict_monotonic_improvement": true,
+      "endpoint_change": -3.887725830078125
+    },
+    {
+      "axis": "L",
+      "dataset": "macro",
+      "metric": "lpips_alex",
+      "checkpoints": [
+        "u25l0",
+        "u25l50",
+        "u25l100"
+      ],
+      "values": [
+        0.481729073741878,
+        0.48672389596389054,
+        0.48281129452656835
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": 0.0010822207846903353
+    },
+    {
+      "axis": "L",
+      "dataset": "macro",
+      "metric": "dreamsim",
+      "checkpoints": [
+        "u25l0",
+        "u25l50",
+        "u25l100"
+      ],
+      "values": [
+        0.2960895096417981,
+        0.29530868623995854,
+        0.29554553380585
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": -0.0005439758359480629
+    },
+    {
+      "axis": "L",
+      "dataset": "macro",
+      "metric": "psnr",
+      "checkpoints": [
+        "u25l0",
+        "u25l50",
+        "u25l100"
+      ],
+      "values": [
+        12.505664363190323,
+        12.337271609328946,
+        12.455996305727162
+      ],
+      "strict_monotonic_improvement": false,
+      "endpoint_change": -0.04966805746316183
+    },
+    {
+      "axis": "L",
+      "dataset": "macro",
+      "metric": "fid",
+      "checkpoints": [
+        "u25l0",
+        "u25l50",
+        "u25l100"
+      ],
+      "values": [
+        57.381219482421876,
+        56.51121215820312,
+        56.14747619628906
+      ],
+      "strict_monotonic_improvement": true,
+      "endpoint_change": -1.233743286132814
+    }
+  ],
+  "macro_means": {
+    "u25l100": {
+      "lpips_alex": 0.48281129452656835,
+      "dreamsim": 0.29554553380585,
+      "psnr": 12.455996305727162,
+      "fid": 56.14747619628906
+    },
+    "u50l100": {
+      "lpips_alex": 0.49088862125763055,
+      "dreamsim": 0.30665571265532254,
+      "psnr": 12.314714197737976,
+      "fid": 62.41128845214844
+    },
+    "u75l100": {
+      "lpips_alex": 0.4781965561702983,
+      "dreamsim": 0.29057784030517186,
+      "psnr": 12.615887135715543,
+      "fid": 55.57040100097656
+    },
+    "u100l100": {
+      "lpips_alex": 0.47779457741013776,
+      "dreamsim": 0.28978889904558475,
+      "psnr": 12.603402216152435,
+      "fid": 56.42078857421875
+    },
+    "u25l0": {
+      "lpips_alex": 0.481729073741878,
+      "dreamsim": 0.2960895096417981,
+      "psnr": 12.505664363190323,
+      "fid": 57.381219482421876
+    },
+    "u25l50": {
+      "lpips_alex": 0.48672389596389054,
+      "dreamsim": 0.29530868623995854,
+      "psnr": 12.337271609328946,
+      "fid": 56.51121215820312
+    }
+  }
+}
